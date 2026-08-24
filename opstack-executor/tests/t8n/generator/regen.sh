@@ -42,7 +42,7 @@
 set -euo pipefail
 OPGETH="${OPGETH:-/Users/octopus/octo/code/blockchain-impl/op-geth}"
 PIN="e8800cffe53d459cde8a07c8e8f1de9d86e79e07"
-GEN_DIR="$(cd "$(dirname "$0")" && pwd)"
+GEN_DIR="$(cd "$(dirname "$0")" && pwd -P)"
 T8N_DIR="$(dirname "$GEN_DIR")"
 REPO_ROOT="$(git -C "$GEN_DIR" rev-parse --show-toplevel)"
 SCRATCH="$OPGETH/cmd/opt8n-ref"
