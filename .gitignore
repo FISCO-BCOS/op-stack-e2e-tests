@@ -1,0 +1,13 @@
+# --- e2e runtime/local artifacts ---
+__pycache__/
+*.pyc
+*.log
+
+# --- t8n reference vectors: regenerated on demand (see
+# opstack-executor/tests/t8n/generator/regen.sh) and by CI. Only the
+# non-generated contract files (manifest.txt, *.md, SHA256SUMS) and the
+# generator itself are tracked. ---
+opstack-executor/tests/t8n/cases/
+opstack-executor/tests/t8n/vectors/*.json
+opstack-executor/tests/t8n/golden/engine/*.golden.json
+opstack-executor/tests/t8n/golden/engine/chained/*.json
