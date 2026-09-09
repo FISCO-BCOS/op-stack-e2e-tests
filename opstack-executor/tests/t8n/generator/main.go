@@ -98,6 +98,7 @@ func main() {
 		probeWrap      = flag.Bool("probe-genesis-number", false, "dev probe: attempt Genesis.Number=8191 (ring-wrap feasibility) and report")
 		probeSpec      = flag.Bool("probe-spec", false, "dev probe: build representative chainConfigSpec values through buildChainConfigSpec and print each activation timeline (verifies the Task-0 upgrade-boundary interface), then exit")
 		probePrecomp   = flag.String("probe-precompile", "", "dev probe: verify every precompile valid-input helper against the real op-geth precompile Run (core/vm.PrecompiledContractsOsaka), then build+generate the bn256-add probe frame and dump its receipts (line-B Task 0 infra), then exit")
+		probeReg       = flag.Bool("probe-regolith", false, "dev probe: run minimal Regolith and Canyon frames through the self-contained op-geth pipeline (Bedrock 0x015d8eb9 attributes layout end-to-end), then exit")
 		goldenOutput   = flag.String("golden-output", "", "Task 2 (engine gate golden ritual): also emit blockHash/transactionsRoot/extraData/excessBlobGas/rawTransactions/encodedHeaderHex for this vector to this path (vectors/ itself is untouched)")
 		chainOutputDir = flag.String("chain-output-dir", "", "Task 2 Step 2: generate the off-line 1->2 chained golden pair (GenerateChainWithGenesis n=2, InsertChain-validated) into this directory and exit")
 		// Task 3 corrupt/static modes: independent of --write-cases (they take
@@ -120,6 +121,11 @@ func main() {
 		}
 	case *probePrecomp != "":
 		if err := probePrecompile(*probePrecomp); err != nil {
+			fmt.Fprintf(os.Stderr, "opt8n-ref: %v\n", err)
+			os.Exit(1)
+		}
+	case *probeReg:
+		if err := probeRegolithCanyon(); err != nil {
 			fmt.Fprintf(os.Stderr, "opt8n-ref: %v\n", err)
 			os.Exit(1)
 		}
@@ -586,6 +592,26 @@ func buildChainConfig(fork string) (*params.ChainConfig, error) {
 		conf.IsthmusTime = nil
 		conf.JovianTime = nil
 		conf.PragueTime = nil
+	case "canyon":
+		conf.EcotoneTime = nil
+		conf.FjordTime = nil
+		conf.GraniteTime = nil
+		conf.HoloceneTime = nil
+		conf.IsthmusTime = nil
+		conf.JovianTime = nil
+		conf.PragueTime = nil // ETH twin: PragueTime == IsthmusTime
+		conf.CancunTime = nil // ETH twin: CancunTime == EcotoneTime
+	case "regolith":
+		conf.CanyonTime = nil
+		conf.ShanghaiTime = nil // ETH twin: ShanghaiTime == CanyonTime
+		conf.EcotoneTime = nil
+		conf.FjordTime = nil
+		conf.GraniteTime = nil
+		conf.HoloceneTime = nil
+		conf.IsthmusTime = nil
+		conf.JovianTime = nil
+		conf.PragueTime = nil // ETH twin: PragueTime == IsthmusTime
+		conf.CancunTime = nil // ETH twin: CancunTime == EcotoneTime
 	case "ecotone":
 		conf.FjordTime = nil
 		conf.GraniteTime = nil
@@ -594,7 +620,7 @@ func buildChainConfig(fork string) (*params.ChainConfig, error) {
 		conf.JovianTime = nil
 		conf.PragueTime = nil
 	default:
-		return nil, fmt.Errorf("unknown hardfork %q (want ecotone|fjord|granite|holocene|isthmus|jovian)", fork)
+		return nil, fmt.Errorf("unknown hardfork %q (want regolith|canyon|ecotone|fjord|granite|holocene|isthmus|jovian)", fork)
 	}
 	if err := conf.CheckOptimismValidity(); err != nil {
 		return nil, fmt.Errorf("chain config invalid: %w", err)
@@ -683,12 +709,15 @@ func probeChainConfigSpec() error {
 		label string
 		spec  chainConfigSpec
 	}{
+		{"pure regolith", chainConfigSpec{base: "regolith"}},
+		{"pure canyon", chainConfigSpec{base: "canyon"}},
 		{"pure ecotone", chainConfigSpec{base: "ecotone"}},
 		{"pure fjord", chainConfigSpec{base: "fjord"}},
 		{"pure granite", chainConfigSpec{base: "granite"}},
 		{"pure holocene", chainConfigSpec{base: "holocene"}},
 		{"pure isthmus", chainConfigSpec{base: "isthmus"}},
 		{"pure jovian", chainConfigSpec{base: "jovian"}},
+		{"upgrade canyon->ecotone @1005", chainConfigSpec{base: "canyon", activations: map[string]uint64{"ecotone": 1005}}},
 		{"upgrade ecotone->fjord @1005", chainConfigSpec{base: "ecotone", activations: map[string]uint64{"fjord": 1005}}},
 		{"upgrade fjord->granite @1005", chainConfigSpec{base: "fjord", activations: map[string]uint64{"granite": 1005}}},
 		{"upgrade granite->holocene @1005", chainConfigSpec{base: "granite", activations: map[string]uint64{"holocene": 1005}}},
@@ -715,6 +744,38 @@ func ptrOrNil(p *uint64) string {
 		return "nil"
 	}
 	return fmt.Sprintf("%d", *p)
+}
+
+// probeRegolithCanyon is the S4 Task-6 dev probe (--probe-regolith): assembles
+// a minimal Regolith and a minimal Canyon frame (attributes deposit + one
+// funded transfer) and drives each through probeReceiptFields, the
+// self-contained op-geth pipeline. This exercises the whole Bedrock path at
+// the pin WITHOUT registering a corpus case (Task 7 owns those):
+// buildChainConfig(regolith|canyon), the 260B 0x015d8eb9 attributes calldata
+// (attributesData), the Bedrock slot seeding (l1BlockStorage: slots 1/5/6),
+// l1BlockRuntimeCodeBedrock execution, assertL1BlockConsistency's Bedrock
+// branch, and the receipt L1 field dump.
+func probeRegolithCanyon() error {
+	for _, fork := range []string{"regolith", "canyon"} {
+		cfg, err := buildChainConfig(fork)
+		if err != nil {
+			return fmt.Errorf("probe %s: %w", fork, err)
+		}
+		fmt.Printf("probe %s: regolith=%s canyon=%s shanghai=%s (CanyonTime %s)\n",
+			fork, ptrOrNil(cfg.RegolithTime), ptrOrNil(cfg.CanyonTime), ptrOrNil(cfg.ShanghaiTime),
+			map[string]string{"regolith": "nil", "canyon": "0"}[fork])
+		fp := defaultFeeParams()
+		c := caseFrame(fork, "probe", fmt.Sprintf("S4 Task-6 probe frame (%s Bedrock layout)", fork), fp, 10_000_000)
+		fund(&c, 1, eth(100))
+		c.Transactions = append(c.Transactions, transferTx(1, 0, recA, eth(1), 100_000, nil))
+		if err := assertL1BlockConsistency(cfg, &c); err != nil {
+			return fmt.Errorf("probe %s consistency: %w", fork, err)
+		}
+		if err := probeReceiptFields(&c); err != nil {
+			return fmt.Errorf("probe %s pipeline: %w", fork, err)
+		}
+	}
+	return nil
 }
 
 // probePrecompile is the line-B Task 0 dev probe (--probe-precompile <fork>).
@@ -1386,7 +1447,7 @@ func processChainPair(fork string) (outputVector, outputVector, *goldenRecord, *
 	beaconRoot := common.HexToHash("0x0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c")
 	senderAddr := addrOfKey(1)
 	genesisPre := types.GenesisAlloc{
-		l1BlockAddr:       {Balance: big.NewInt(0), Nonce: 1, Code: l1BlockRuntimeCode, Storage: fp.l1BlockStorage(fork)},
+		l1BlockAddr:       {Balance: big.NewInt(0), Nonce: 1, Code: l1BlockCodeFor(fork), Storage: fp.l1BlockStorage(fork)},
 		messagePasserAddr: {Balance: big.NewInt(0), Nonce: 1},
 		senderAddr:        {Balance: eth(100)},
 	}
@@ -1649,7 +1710,7 @@ func processScalarChangePair(fork string) (outputVector, outputVector, *goldenRe
 	beaconRoot := common.HexToHash("0x0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d")
 	senderAddr := addrOfKey(1)
 	genesisPre := types.GenesisAlloc{
-		l1BlockAddr:       {Balance: big.NewInt(0), Nonce: 1, Code: l1BlockRuntimeCode, Storage: fp0.l1BlockStorage(fork)},
+		l1BlockAddr:       {Balance: big.NewInt(0), Nonce: 1, Code: l1BlockCodeFor(fork), Storage: fp0.l1BlockStorage(fork)},
 		messagePasserAddr: {Balance: big.NewInt(0), Nonce: 1},
 		senderAddr:        {Balance: eth(100)},
 	}
@@ -1886,7 +1947,7 @@ func generateChainN(fork string, n int) (*chainOutput, *chainContext, error) {
 	beaconRoot := common.HexToHash("0x0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c")
 	senderAddr := addrOfKey(1)
 	genesisPre := types.GenesisAlloc{
-		l1BlockAddr:       {Balance: big.NewInt(0), Nonce: 1, Code: l1BlockRuntimeCode, Storage: fp.l1BlockStorage(fork)},
+		l1BlockAddr:       {Balance: big.NewInt(0), Nonce: 1, Code: l1BlockCodeFor(fork), Storage: fp.l1BlockStorage(fork)},
 		messagePasserAddr: {Balance: big.NewInt(0), Nonce: 1},
 		senderAddr:        {Balance: eth(100)},
 	}
@@ -3279,9 +3340,9 @@ func writeInvalidVector(outDir, stem string, doc invalidVectorDoc, opGethCommit 
 
 // blockFork returns the fork that governs a block at the given time under cfg:
 // the latest activated OP fork (jovian > isthmus > holocene > granite > fjord
-// > ecotone). For pure fork-at-0 recipes this equals the case's hardfork; for
-// upgrade-boundary specs (Task 3) it is the BLOCK-TIME fork, which is what
-// decides the L1-attributes byte layout.
+// > ecotone > canyon > regolith). For pure fork-at-0 recipes this equals the
+// case's hardfork; for upgrade-boundary specs (Task 3) it is the BLOCK-TIME
+// fork, which is what decides the L1-attributes byte layout.
 func blockFork(cfg *params.ChainConfig, blockTime uint64) string {
 	switch {
 	case cfg.IsJovian(blockTime):
@@ -3294,8 +3355,15 @@ func blockFork(cfg *params.ChainConfig, blockTime uint64) string {
 		return "granite"
 	case cfg.IsFjord(blockTime):
 		return "fjord"
-	default:
+	case cfg.IsEcotone(blockTime):
 		return "ecotone"
+	case cfg.IsCanyon(blockTime):
+		return "canyon"
+	default:
+		// Regolith (the first modeled fork) or the unmodeled pre-Regolith
+		// stretch: every corpus config activates Regolith at 0, so this is
+		// Regolith in practice.
+		return "regolith"
 	}
 }
 
@@ -3362,6 +3430,28 @@ func assertL1BlockConsistency(cfg *params.ChainConfig, in *inputCase) error {
 	}
 
 	switch {
+	case layout == layoutBedrock:
+		// Regolith/Canyon: exactly 260B (4 + 32*8) with the Bedrock selector.
+		// The Pre-Ecotone cost function reads args 2/6/7, mirrored to slots
+		// 1/5/6 (op-geth L1BaseFeeSlot/OverheadSlot/ScalarSlot) -- the same
+		// words the l1BlockRuntimeCodeBedrock genesis predeploy SSTOREs.
+		if len(data) != 4+32*8 {
+			return fmt.Errorf("Bedrock attributes must be %d bytes, got %d", 4+32*8, len(data))
+		}
+		if !bytes.Equal(data[0:4], types.BedrockL1AttributesSelector) {
+			return fmt.Errorf("Bedrock attributes selector mismatch: got %x", data[0:4])
+		}
+		if !bytes.Equal(slot1[:], data[68:100]) {
+			return fmt.Errorf("slot1 (l1BaseFee) %x != calldata[68:100] %x", slot1, data[68:100])
+		}
+		slot5, slot6 := slot(5), slot(6)
+		if !bytes.Equal(slot5[:], data[196:228]) {
+			return fmt.Errorf("slot5 (overhead) %x != calldata[196:228] %x", slot5, data[196:228])
+		}
+		if !bytes.Equal(slot6[:], data[228:260]) {
+			return fmt.Errorf("slot6 (scalar) %x != calldata[228:260] %x", slot6, data[228:260])
+		}
+		return nil
 	case jovianCfg && len(data) == types.IsthmusL1AttributesLen:
 		// Jovian config + Isthmus-length calldata = "first Jovian block"
 		// form (case 12): deposits only, slot-8 DA bytes zero, skip [176:178].

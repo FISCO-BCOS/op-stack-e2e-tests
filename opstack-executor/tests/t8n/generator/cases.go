@@ -40,6 +40,28 @@ import (
 // code.
 var l1BlockRuntimeCode = common.FromHex("0x6004361060255760003560e01c63098999be14602b5760003560e01c633db6be2b14602b575b60006000fd5b6000358060c01c63ffffffff1660601b60003560a01c63ffffffff1660401b176003555060243560015560443560075560a03560c01c63ffffffff1660401b60a03560801c67ffffffffffffffff161760b03560f01c61ffff1660601b1760085560006000f3")
 
+// l1BlockRuntimeCodeBedrock is the Bedrock-era sibling (gen_l1block.py, same
+// tool): selector-dispatches setL1BlockValues(uint64,uint64,uint256,bytes32,
+// uint32,bytes32,uint32,uint32) at 0x015d8eb9 (op-geth
+// types.BedrockL1AttributesSelector), calldata 4 + 32*8, and writes the
+// Pre-Ecotone fee slots FISCO's loadOpFeeParams reads: slot 1 = l1BaseFee =
+// calldata arg 2, slot 5 = overhead = arg 6, slot 6 = scalar = arg 7 (op-geth
+// L1BaseFeeSlot / OverheadSlot / ScalarSlot). Whole-word SSTOREs -- no
+// bit-masking needed for these slots. Same contract as the Ecotone-family
+// code above: reverts on calldatasize<4 or unknown selector.
+var l1BlockRuntimeCodeBedrock = common.FromHex("0x6004361060165760003560e01c63015d8eb914601c575b60006000fd5b60443560015560c43560055560e43560065560006000f3")
+
+// l1BlockCodeFor selects the L1Block runtime matching the fork's L1-attributes
+// layout: Regolith/Canyon execute the Bedrock selector (0x015d8eb9) and must
+// NOT be handed the Isthmus/Jovian-dispatching bytecode (it would revert the
+// attributes deposit); Ecotone+ keep the shared 146B predeploy.
+func l1BlockCodeFor(fork string) []byte {
+	if forkLayout(fork) == layoutBedrock {
+		return l1BlockRuntimeCodeBedrock
+	}
+	return l1BlockRuntimeCode
+}
+
 // ---------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------
@@ -329,14 +351,23 @@ const (
 	layoutEcotone l1AttributesLayout = iota // 164B, selector 0x440a5e20, no operator-fee/DA segment
 	layoutIsthmus                           // 176B, selector 0x098999be, + operatorFeeScalar/Constant [164:176]
 	layoutJovian                            // 178B, selector 0x3db6be2b, + daFootprintGasScalar [176:178]
+	// layoutBedrock is appended as a named const (NOT in the iota run) so the
+	// existing Ecotone-family values stay stable: Regolith/Canyon use the
+	// Bedrock setL1BlockValues form -- 260B (4 + 32*8), selector 0x015d8eb9,
+	// l1BaseFee = arg2 [68:100], overhead = arg6 [196:228], scalar = arg7
+	// [228:260] (extractL1GasParamsPreEcotone reads exactly these three).
+	layoutBedrock = 3
 )
 
 // forkLayout maps a hardfork name to its L1-attributes layout. The four
 // Ecotone-family forks (ecotone/fjord/granite/holocene) are byte-identical for
 // L1 attributes -- op-geth only branches on the Ecotone selector, and
 // extractL1GasParamsPostEcotone hard-rejects any non-164-byte payload.
+// Regolith/Canyon predate Ecotone: they carry the Bedrock 260B form.
 func forkLayout(fork string) l1AttributesLayout {
 	switch fork {
+	case "regolith", "canyon":
+		return layoutBedrock
 	case "ecotone", "fjord", "granite", "holocene":
 		return layoutEcotone
 	case "isthmus":
@@ -350,6 +381,9 @@ func forkLayout(fork string) l1AttributesLayout {
 
 // feeParams is the single source for BOTH the L1Block storage pre-seeding and
 // the L1-attributes deposit calldata (iron rule: field-for-field identical).
+// overhead/scalar are the Bedrock-era L1 fee parameters (slots 5/6, calldata
+// args 6/7 of the 0x015d8eb9 form); they are ignored by the Ecotone-family
+// layouts, which carry the scalars in slot 3 instead.
 type feeParams struct {
 	l1BaseFee         *big.Int
 	blobBaseFee       *big.Int
@@ -358,7 +392,9 @@ type feeParams struct {
 	opFeeScalar       uint32
 	opFeeConstant     uint64
 	daScalar          uint16
-	isthmusLayout     bool // force 176B Isthmus-selector calldata under a Jovian config (activation form)
+	isthmusLayout     bool   // force 176B Isthmus-selector calldata under a Jovian config (activation form)
+	overhead          *big.Int // Bedrock L1 fee overhead (slot 5)
+	scalar            *big.Int // Bedrock L1 fee scalar (slot 6)
 }
 
 func defaultFeeParams() feeParams {
@@ -367,6 +403,11 @@ func defaultFeeParams() feeParams {
 		blobBaseFee:       big.NewInt(1_000_000),
 		baseFeeScalar:     1368,
 		blobBaseFeeScalar: 810949,
+		// op-geth test-typical non-zero Bedrock values: overhead 2100, scalar
+		// 1e6 (scalar/1e6 == 1.0x multiplier) -- the same values the FISCO
+		// OpFeeParams unit tests pin (iron rule: calldata and slots share them).
+		overhead: big.NewInt(2100),
+		scalar:   big.NewInt(1_000_000),
 	}
 }
 
@@ -374,6 +415,20 @@ func (fp feeParams) attributesData(fork string) hexutil.Bytes {
 	layout := forkLayout(fork)
 	if layout == layoutJovian && fp.isthmusLayout {
 		layout = layoutIsthmus // Jovian activation form: Isthmus-length/selector calldata (case 12)
+	}
+	if layout == layoutBedrock {
+		// setL1BlockValues(uint64,uint64,uint256,bytes32,uint32,bytes32,uint32,uint32)
+		// -- 4 + 32*8 bytes (extractL1GasParamsPreEcotone: len(data) < 4+32*8 rejects).
+		// Arg words: 0 number, 1 timestamp, 2 l1BaseFee, 3 hash, 4 sequenceNumber,
+		// 5 batcherHash, 6 overhead, 7 scalar. The cost function reads only args
+		// 2/6/7; number/timestamp/hash/sequenceNumber/batcherHash stay zero (same
+		// rationale as the zeroed Ecotone fields -- not read, not slot-mirrored).
+		buf := make([]byte, 4+32*8)
+		copy(buf[0:4], types.BedrockL1AttributesSelector)
+		fp.bedrockL1BaseFee().FillBytes(buf[68:100])
+		fp.bedrockOverhead().FillBytes(buf[196:228])
+		fp.bedrockScalar().FillBytes(buf[228:260])
+		return buf
 	}
 	var size int
 	var selector []byte
@@ -384,6 +439,8 @@ func (fp feeParams) attributesData(fork string) hexutil.Bytes {
 		size, selector = types.IsthmusL1AttributesLen, types.IsthmusL1AttributesSelector
 	case layoutJovian:
 		size, selector = types.JovianL1AttributesLen, types.JovianL1AttributesSelector
+	default:
+		panic(fmt.Sprintf("unhandled L1-attributes layout %d", layout))
 	}
 	buf := make([]byte, size)
 	copy(buf[0:4], selector)
@@ -407,8 +464,39 @@ func (fp feeParams) attributesData(fork string) hexutil.Bytes {
 	return buf
 }
 
+// bedrockL1BaseFee / bedrockOverhead / bedrockScalar are nil-safe accessors:
+// every feeParams literal must flow through defaultFeeParams(), but these keep
+// a half-initialized literal from panicking FillBytes deep in generation.
+func (fp feeParams) bedrockL1BaseFee() *big.Int {
+	if fp.l1BaseFee != nil {
+		return fp.l1BaseFee
+	}
+	return big.NewInt(0)
+}
+func (fp feeParams) bedrockOverhead() *big.Int {
+	if fp.overhead != nil {
+		return fp.overhead
+	}
+	return big.NewInt(2100)
+}
+func (fp feeParams) bedrockScalar() *big.Int {
+	if fp.scalar != nil {
+		return fp.scalar
+	}
+	return big.NewInt(1_000_000)
+}
+
 func (fp feeParams) l1BlockStorage(fork string) map[common.Hash]common.Hash {
 	st := map[common.Hash]common.Hash{}
+	if forkLayout(fork) == layoutBedrock {
+		// Pre-Ecotone slots (op-geth L1BaseFeeSlot/OverheadSlot/ScalarSlot =
+		// 1/5/6): the whole-word fee triple FISCO's loadOpFeeParams reads.
+		// Slots 3/7/8 stay unseeded -- they are Ecotone+ concepts.
+		st[types.L1BaseFeeSlot] = common.BigToHash(fp.bedrockL1BaseFee())
+		st[types.OverheadSlot] = common.BigToHash(fp.bedrockOverhead())
+		st[types.ScalarSlot] = common.BigToHash(fp.bedrockScalar())
+		return st
+	}
 	st[types.L1BaseFeeSlot] = common.BigToHash(fp.l1BaseFee)
 	st[types.L1BlobBaseFeeSlot] = common.BigToHash(fp.blobBaseFee)
 	var slot3 common.Hash
@@ -537,7 +625,7 @@ func caseFrame(fork, name, desc string, fp feeParams, gasLimit uint64) inputCase
 	// under the op-geth-anchored differential gate). Nonce 1 + code keeps the
 	// account non-empty under EIP-158.
 	pre := types.GenesisAlloc{
-		l1BlockAddr:       {Balance: big.NewInt(0), Nonce: 1, Code: l1BlockRuntimeCode, Storage: fp.l1BlockStorage(fork)},
+		l1BlockAddr:       {Balance: big.NewInt(0), Nonce: 1, Code: l1BlockCodeFor(fork), Storage: fp.l1BlockStorage(fork)},
 		messagePasserAddr: {Balance: big.NewInt(0), Nonce: 1},
 	}
 	return inputCase{

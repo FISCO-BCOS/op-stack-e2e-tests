@@ -75,3 +75,33 @@ dispatch[35] = BODY_POS         # Jovian setL1BlockValues -> body
 final = bytes(dispatch) + b'\x5b' + bytes(body)  # body JUMPDEST at BODY_POS
 print("L1BLOCK_CODE=0x" + final.hex())
 print("len:", len(final))
+
+# ---------------------------------------------------------------------------
+# Bedrock variant: l1BlockRuntimeCodeBedrock — setL1BlockValues(uint64,uint64,
+# uint256,bytes32,uint32,bytes32,uint32,uint32), selector 0x015d8eb9 (op-geth
+# types.BedrockL1AttributesSelector), calldata 4 + 32*8. Whole-word SSTOREs —
+# no bit-masking: FISCO loadOpFeeParams reads slot1 = l1BaseFee = calldata
+# arg index 2 ([68:100]), slot5 = overhead = arg index 6 ([196:228]), slot6 =
+# scalar = arg index 7 ([228:260]) (op-geth L1BaseFeeSlot/OverheadSlot/
+# ScalarSlot; specs.optimism.io/protocol exec-engine Pre-Ecotone layout).
+bedrock_body = bytearray()
+bedrock_body += p1(0x44) + b'\x35' + p1(0x01) + b'\x55'   # SSTORE(1, calldata[68:100])
+bedrock_body += p1(0xC4) + b'\x35' + p1(0x05) + b'\x55'   # SSTORE(5, calldata[196:228])
+bedrock_body += p1(0xE4) + b'\x35' + p1(0x06) + b'\x55'   # SSTORE(6, calldata[228:260])
+bedrock_body += p1(0x00) + p1(0x00) + b'\xf3'             # return empty
+
+bedrock_dispatch = bytearray()
+bedrock_dispatch += p1(0x04) + b'\x36' + b'\x10' + p1(0x00) + b'\x57'  # cd < 4 -> revert
+bedrock_dispatch += p1(0x00) + b'\x35' + p1(0xE0) + b'\x1c'
+bedrock_dispatch += p4(0x015d8eb9) + b'\x14' + p1(0x00) + b'\x57'      # Bedrock selector
+bedrock_dispatch += b'\x5b' + p1(0x00) + p1(0x00) + b'\xfd'            # JUMPDEST REVERT
+
+B_REVERT_POS = len(bedrock_dispatch) - 6  # JUMPDEST before PUSH1 0 PUSH1 0 REVERT
+B_BODY_POS = len(bedrock_dispatch)        # body JUMPDEST appended after dispatch
+bedrock_dispatch[5] = B_REVERT_POS        # size guard -> revert block
+bedrock_dispatch[20] = B_BODY_POS         # Bedrock setL1BlockValues -> body
+
+bedrock = bytes(bedrock_dispatch) + b'\x5b' + bytes(bedrock_body)
+assert bedrock[B_REVERT_POS] == 0x5b and bedrock[B_BODY_POS] == 0x5b  # JUMPDEST sanity
+print("L1BLOCK_CODE_BEDROCK=0x" + bedrock.hex())
+print("bedrock len:", len(bedrock))
