@@ -237,3 +237,19 @@ runInvalidVector -32603 分支）先投 canonical（VALID 写 SYS_NUMBER_2_HASH 
 抛 OpExecutionInternalError。
 
 **处置**：FISCO 侧保留该行为（PBFT 单一权威链语义），记为结构性差异，不修。
+
+---
+
+## S4 扩展（Regolith→Holocene，2026-09-09）
+
+S4 把 corpus 从 Isthmus/Jovian 扩到全 Regolith→Holocene 档（deposit_only / transfer_basic /
+deposit_mint × 6 档 + l1fee_edge × 5 档）。与 op-geth `e8800cffe` 的对拍沿用同一判据
+（stateRoot / receiptsRoot / `_op_*` 字段），以下为该扩展中的已知表示差异与覆盖边界：
+
+| 项 | FISCO | op-geth / corpus | 判定 |
+|---|---|---|---|
+| Bedrock `L1FeeScalar` | `OpReceiptMeta::l1_fee_scalar` 存 RAW slot-6 标量（uint256）；replay 比对时 /1e6 | 收据 `FeeScalar = scalar/1e6`（big.Float）；向量发射 scaled 值（corpus 标量恒为 1e6 的倍数 → 精确整数） | 事实达成（值域等价，表示不同；若未来 corpus 用非 1e6 倍数标量，浮点余数不可对拍，需先扩展表示） |
+| Ecotone 激活块 | S4 只测合成稳态块（attributes 164B/`0x440a5e20`、新槽非零）；激活块仍调 `setL1BlockValues` 的 spec 边界归 S7 | spec（ecotone/l1-attributes）：激活块必须仍走 Pre-Ecotone 公式 | 已知分叉（覆盖边界，非行为分叉；Task 4 单元测试钉零槽回退） |
+| Granite fee 向量 | 无独立 `granite_l1fee_edge`：Granite 的 L1 fee 公式与 Fjord 相同（FastLZ），EL 唯一差异是 bn256Pairing 输入上限，由 `granite_precompile_bn256pair_overcap` 覆盖 | 同 | 事实达成（不假装测过 Fjord 切换；Fjord 切换边界归 Task 8 `boundary_fjord_first`） |
+| pre-Cancun 头字段 | Regolith（London）头无 withdrawalsRoot（seal 零哈希=缺席）；Canyon（Shanghai）起为空 trie 根；blobGasUsed 从 Ecotone 起 | op-geth 头字段随 fork 出现/缺席，与 spec 一致 | 等价 |
+| Regolith deposit 收据 | `deposit_nonce` 有、`deposit_receipt_version` 缺席（共识 RLP 不含 version）；Canyon+ 为 1 | deposits spec 同 | 等价 |

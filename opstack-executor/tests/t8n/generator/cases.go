@@ -808,14 +808,21 @@ var bScopeSpecs = map[string]bool{}
 
 var bothForks = []string{"isthmus", "jovian"}
 
+// historyForks are the S4 pre-Isthmus + mid forks (S4 plan Task 7): the corpus
+// now covers the full Regolith→Holocene EL stretch. Granite gets the three
+// standard stems (its only EL delta vs Fjord is the bn256Pairing input cap,
+// covered by the precompile_bn256pair_* cases) but no l1fee_edge -- its L1 fee
+// formula is Fjord's FastLZ; see vectors/DIVERGENCES.md.
+var historyForks = []string{"regolith", "canyon", "ecotone", "fjord", "granite", "holocene"}
+
 var caseSpecs = []caseSpec{
-	{"deposit_only", bothForks, func(fork string) inputCase {
+	{"deposit_only", append(append([]string{}, bothForks...), historyForks...), func(fork string) inputCase {
 		return caseFrame(fork, "deposit_only",
 			"L1 attributes deposit only; header commitments over an otherwise empty block",
 			defaultFeeParams(), 10_000_000)
 	}},
 
-	{"transfer_basic", bothForks, func(fork string) inputCase {
+	{"transfer_basic", []string{"isthmus", "jovian", "regolith", "canyon", "holocene"}, func(fork string) inputCase {
 		c := caseFrame(fork, "transfer_basic",
 			"attributes + one EIP-1559 value transfer",
 			defaultFeeParams(), 10_000_000)
@@ -855,7 +862,7 @@ var caseSpecs = []caseSpec{
 		return c
 	}},
 
-	{"deposit_mint", bothForks, func(fork string) inputCase {
+	{"deposit_mint", append(append([]string{}, bothForks...), historyForks...), func(fork string) inputCase {
 		c := caseFrame(fork, "deposit_mint",
 			"attributes + user deposit with mint and value to an EOA",
 			defaultFeeParams(), 10_000_000)
@@ -1476,6 +1483,58 @@ var caseSpecs = []caseSpec{
 		fund(&c, 1, eth(100))
 		c.Transactions = append(c.Transactions, transferTx(1, 0, recA, eth(1), 100_000, junkData("fjord_transfer_basic", 200)))
 		return c
+	}},
+
+	// ----- S4 Task 7: L1-fee edge cases per fork (plan §Task 7) -----
+	// One spec, per-fork bodies: each body builds the envelope that
+	// discriminates ITS fork's fee formula, with the L1Block slots and the
+	// deposit calldata still coming from ONE feeParams (iron rule 2).
+	// Granite is deliberately absent: its L1 fee formula is Fjord's FastLZ
+	// (its only EL delta is the bn256Pairing input cap) -- DIVERGENCES.md.
+	{"l1fee_edge", []string{"regolith", "canyon", "ecotone", "fjord", "holocene"}, func(fork string) inputCase {
+		switch fork {
+		case "regolith", "canyon":
+			// Bedrock formula edge: mixed zero/nonzero calldata pins the
+			// zeroes*4 + ones*16 accounting (zero bytes cost 4, not 0 or 16),
+			// on top of the non-zero overhead/scalar from defaultFeeParams
+			// (slots 5/6). First half zeros, second half deterministic
+			// non-zeros.
+			c := caseFrame(fork, "l1fee_edge",
+				"Bedrock L1 fee edge: transfer with half-zero/half-nonzero calldata (pins zeroes*4 + ones*16 under overhead 2100 / scalar 1e6)",
+				defaultFeeParams(), 10_000_000)
+			fund(&c, 1, eth(100))
+			edge := make([]byte, 96)
+			for i := 48; i < len(edge); i++ {
+				edge[i] = byte(i*7 + 1)
+			}
+			c.Transactions = append(c.Transactions, transferTx(1, 0, recA, eth(1), 100_000, edge))
+			return c
+		case "ecotone":
+			// Ecotone formula edge: zero-calldata transfer -- the Ecotone
+			// calldataGas formula has NO minimum-size floor (unlike Fjord's
+			// estimatedDaSizeScaled 100-byte clamp), so a data-less envelope
+			// prices purely on the envelope's zero/nonzero bytes; blob
+			// scalars are non-zero (slots 3/7 live, no Bedrock fallback).
+			c := caseFrame(fork, "l1fee_edge",
+				"Ecotone L1 fee edge: zero-calldata transfer (no min-size floor; non-zero blob scalars keep the Ecotone formula live)",
+				defaultFeeParams(), 10_000_000)
+			fund(&c, 1, eth(100))
+			c.Transactions = append(c.Transactions, transferTx(1, 0, recA, eth(1), 21_000, nil))
+			return c
+		case "fjord", "holocene":
+			// FastLZ edge: a 900-byte all-zero calldata compresses to a
+			// handful of bytes, so estimatedDaSizeScaled lands near the
+			// 100-byte clamp -- raw byte counting (the Ecotone formula would
+			// charge 900*4) and FastLZ diverge by an order of magnitude.
+			c := caseFrame(fork, "l1fee_edge",
+				"FastLZ L1 fee edge: 900-zero-byte calldata (FastLZ compresses to the clamp floor; byte-count formulas would charge ~900 gas units)",
+				defaultFeeParams(), 10_000_000)
+			fund(&c, 1, eth(100))
+			c.Transactions = append(c.Transactions,
+				transferTx(1, 0, recA, eth(1), 100_000, make([]byte, 900)))
+			return c
+		}
+		panic(fmt.Sprintf("l1fee_edge: unhandled fork %q", fork))
 	}},
 
 	{"contract_create", []string{"fjord"}, func(fork string) inputCase {

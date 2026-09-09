@@ -181,3 +181,25 @@ isthmus_deposit_basefee_observer.json
 isthmus_gaslimit_observer.json
 jovian_deposit_basefee_observer.json
 jovian_gaslimit_observer.json
+
+# Phase-3 enhanced corpus (Task 6): corrupt 12 + static 10 + invalid-tx 18 + chain 6 + legacy 2 = 48 vectors (idempotent; §4c item 3/12 excluded — loader 不可表达)
+canyon_deposit_mint.json
+canyon_deposit_only.json
+canyon_l1fee_edge.json
+canyon_transfer_basic.json
+ecotone_deposit_mint.json
+ecotone_deposit_only.json
+ecotone_l1fee_edge.json
+fjord_deposit_mint.json
+fjord_deposit_only.json
+fjord_l1fee_edge.json
+granite_deposit_mint.json
+granite_deposit_only.json
+holocene_deposit_mint.json
+holocene_deposit_only.json
+holocene_l1fee_edge.json
+holocene_transfer_basic.json
+regolith_deposit_mint.json
+regolith_deposit_only.json
+regolith_l1fee_edge.json
+regolith_transfer_basic.json

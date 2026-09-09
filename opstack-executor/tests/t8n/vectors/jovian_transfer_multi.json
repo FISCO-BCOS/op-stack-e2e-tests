@@ -17,7 +17,7 @@
       "currentBaseFee": "0x3a699d00",
       "currentRandom": "0x0",
       "parentBeaconBlockRoot": "0x0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
-      "parentHash": "0x95769446a4501f4ac720ed01b8c3c668768a22ca893dc8cab06b1fe8d8cfd0d5"
+      "parentHash": "0x610e5783e764811a127c01d8715fb6c85256ec074dc81e3de41038db9b146917"
     },
     "pre": {
       "0x2b5ad5c4795c026514f8317c7a215e218dccd6cf": {
@@ -28,7 +28,7 @@
       "0x4200000000000000000000000000000000000015": {
         "balance": "0x0",
         "nonce": "0x1",
-        "code": "0x",
+        "code": "0x6004361060255760003560e01c63098999be14602b5760003560e01c633db6be2b14602b575b60006000fd5b6000358060c01c63ffffffff1660601b60003560a01c63ffffffff1660401b176003555060243560015560443560075560a03560c01c63ffffffff1660401b60a03560801c67ffffffffffffffff161760b03560f01c61ffff1660601b1760085560006000f3",
         "storage": {
           "0x0000000000000000000000000000000000000000000000000000000000000001": "0x00000000000000000000000000000000000000000000000000000006fc23ac00",
           "0x0000000000000000000000000000000000000000000000000000000000000003": "0x0000000000000000000000000000000000000558000c5fc50000000000000000",
@@ -146,6 +146,7 @@
         "balance": "0x98cb8c52800"
       },
       "0x4200000000000000000000000000000000000015": {
+        "code": "0x6004361060255760003560e01c63098999be14602b5760003560e01c633db6be2b14602b575b60006000fd5b6000358060c01c63ffffffff1660601b60003560a01c63ffffffff1660401b176003555060243560015560443560075560a03560c01c63ffffffff1660401b60a03560801c67ffffffffffffffff161760b03560f01c61ffff1660601b1760085560006000f3",
         "storage": {
           "0x0000000000000000000000000000000000000000000000000000000000000001": "0x00000000000000000000000000000000000000000000000000000006fc23ac00",
           "0x0000000000000000000000000000000000000000000000000000000000000003": "0x0000000000000000000000000000000000000558000c5fc50000000000000000",
@@ -191,20 +192,20 @@
     },
     "_op_expected": {
       "header": {
-        "gasUsed": "0x1f504",
-        "receiptsRoot": "0xda19a2e3ebdbd78a9bc21b3d6e6532b2b91e53accf8c2982abbdb00afa676a7a",
+        "gasUsed": "0x2130a",
+        "receiptsRoot": "0x5f7dcfd4c953d2bc237ddd7ad13e2b5ea164fbec1e8382d21879f1ff3d48b83d",
         "logsBloom": "0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
         "withdrawalsRoot": "0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421",
         "requestsHash": "0xe3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         "blobGasUsed": "0x0",
-        "stateRoot": "0x10746d22982bbf546f740288caa9f508e4c1e454f10c4ed455ca23fa9b2ebe63"
+        "stateRoot": "0x654311c64f004bc95edb07a9a3b59e128e3a31d288fd0a92ad627d31aab3634d"
       },
       "receipts": [
         {
           "type": "0x7e",
           "status": "0x1",
-          "gasUsed": "0x5adc",
-          "cumulativeGasUsed": "0x5adc",
+          "gasUsed": "0x78e2",
+          "cumulativeGasUsed": "0x78e2",
           "logsCount": 0,
           "output": "0x",
           "_op_deposit_nonce": "0x0",
@@ -214,7 +215,7 @@
           "type": "0x2",
           "status": "0x1",
           "gasUsed": "0x5208",
-          "cumulativeGasUsed": "0xace4",
+          "cumulativeGasUsed": "0xcaea",
           "logsCount": 0,
           "output": "0x",
           "_op_l1_fee": "0xf4eb688f4",
@@ -230,7 +231,7 @@
           "type": "0x2",
           "status": "0x1",
           "gasUsed": "0x5208",
-          "cumulativeGasUsed": "0xfeec",
+          "cumulativeGasUsed": "0x11cf2",
           "logsCount": 0,
           "output": "0x",
           "_op_l1_fee": "0xf4eb688f4",
@@ -246,7 +247,7 @@
           "type": "0x2",
           "status": "0x1",
           "gasUsed": "0x5208",
-          "cumulativeGasUsed": "0x150f4",
+          "cumulativeGasUsed": "0x16efa",
           "logsCount": 0,
           "output": "0x",
           "_op_l1_fee": "0xf4eb688f4",
@@ -262,7 +263,7 @@
           "type": "0x2",
           "status": "0x1",
           "gasUsed": "0x5208",
-          "cumulativeGasUsed": "0x1a2fc",
+          "cumulativeGasUsed": "0x1c102",
           "logsCount": 0,
           "output": "0x",
           "_op_l1_fee": "0xf4eb688f4",
@@ -278,7 +279,7 @@
           "type": "0x2",
           "status": "0x1",
           "gasUsed": "0x5208",
-          "cumulativeGasUsed": "0x1f504",
+          "cumulativeGasUsed": "0x2130a",
           "logsCount": 0,
           "output": "0x",
           "_op_l1_fee": "0xf4eb688f4",

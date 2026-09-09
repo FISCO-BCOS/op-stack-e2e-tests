@@ -340,7 +340,10 @@ func TestChain3Blocks(t *testing.T) {
 			// postState (Task 1 handoff contract -- replaySingleBlockInto reads
 			// them with .at(), missing = out_of_range).
 			h := blk.OpExpected.Header
-			if h.GasUsed == "" || h.ReceiptsRoot == "" || h.StateRoot == "" || h.WithdrawalsRoot == "" {
+			// chain vectors are isthmus/jovian (Shanghai+): withdrawalsRoot is
+			// always present; the pointer is nil only on pre-Shanghai (Regolith)
+			// single-block vectors, which processChainN never builds.
+			if h.GasUsed == "" || h.ReceiptsRoot == "" || h.StateRoot == "" || h.WithdrawalsRoot == nil || *h.WithdrawalsRoot == "" {
 				t.Fatalf("%s block %d: incomplete header expectation %+v", fork, i, h)
 			}
 			if len(blk.OpExpected.Receipts) != 2 {

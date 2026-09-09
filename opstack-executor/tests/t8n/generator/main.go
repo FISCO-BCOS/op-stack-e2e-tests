@@ -409,13 +409,19 @@ type outputBlock struct {
 }
 
 type expectedHeader struct {
-	GasUsed         string  `json:"gasUsed"`
-	ReceiptsRoot    string  `json:"receiptsRoot"`
-	LogsBloom       string  `json:"logsBloom"`
-	WithdrawalsRoot string  `json:"withdrawalsRoot"`
+	GasUsed      string  `json:"gasUsed"`
+	ReceiptsRoot string  `json:"receiptsRoot"`
+	LogsBloom    string  `json:"logsBloom"`
+	// WithdrawalsRoot: Shanghai+ headers only (EIP-4895); Regolith (London)
+	// headers carry none -> omitted. Shanghai+ blocks always have it (empty
+	// list -> the empty-trie root).
+	WithdrawalsRoot *string `json:"withdrawalsRoot,omitempty"`
 	RequestsHash    *string `json:"requestsHash,omitempty"` // nil pre-Prague (ecotone/fjord/granite/holocene): op-geth t8n omits it
-	BlobGasUsed     string  `json:"blobGasUsed"`
-	StateRoot       string  `json:"stateRoot"`
+	// BlobGasUsed: Cancun+ headers only (EIP-4844); Regolith/Canyon (London/
+	// Shanghai) headers carry none -> omitted. Ecotone+ emits 0x0 for
+	// blob-less blocks.
+	BlobGasUsed *string `json:"blobGasUsed,omitempty"`
+	StateRoot   string  `json:"stateRoot"`
 }
 
 type expectedReceipt struct {
@@ -438,6 +444,7 @@ type expectedReceipt struct {
 	OpL1GasUsed            *string `json:"_op_l1_gas_used,omitempty"`
 	OpL1BaseFeeScalar      *string `json:"_op_l1_base_fee_scalar,omitempty"`
 	OpL1BlobBaseFeeScalar  *string `json:"_op_l1_blob_base_fee_scalar,omitempty"`
+	OpL1FeeScalar          *string `json:"_op_l1_fee_scalar,omitempty"`
 	OpOperatorFeeScalar    *string `json:"_op_operator_fee_scalar,omitempty"`
 	OpOperatorFeeConstant  *string `json:"_op_operator_fee_constant,omitempty"`
 	OpDaFootprintGasScalar *string `json:"_op_da_footprint_gas_scalar,omitempty"`
@@ -997,8 +1004,13 @@ func processBlockVector(in *inputCase, id string) (json.RawMessage, *goldenRecor
 		}()
 		db, blocks, receiptsAll = core.GenerateChainWithGenesis(genesis, engine, 1, func(i int, b *core.BlockGen) {
 			b.SetCoinbase(in.Coinbase)
-			b.SetExtra(blockExtra)                          // iron rule 1(ii): InsertChain verifyHeader rejects otherwise
-			b.SetParentBeaconRoot(in.ParentBeaconBlockRoot) // iron rule 4: 4788 build/replay symmetry
+			b.SetExtra(blockExtra) // iron rule 1(ii): InsertChain verifyHeader rejects otherwise
+			// iron rule 4: 4788 build/replay symmetry -- but EIP-4788 ships with
+			// Cancun, so pre-Cancun blocks (Regolith/Canyon) must carry NO beacon
+			// root; InsertChain verifyHeader rejects a non-nil one there.
+			if cfg.IsCancun(big.NewInt(1), blockTime) { // single-block generation: number 1
+				b.SetParentBeaconRoot(in.ParentBeaconBlockRoot)
+			}
 			for _, tx := range txs {
 				b.AddTx(tx) // L1CostFunc/OperatorCostFunc wired inside NewEVMBlockContext (core/evm.go)
 			}
@@ -1122,8 +1134,13 @@ func probeReceiptFields(in *inputCase) error {
 		}()
 		db, blocks, receiptsAll = core.GenerateChainWithGenesis(genesis, engine, 1, func(i int, b *core.BlockGen) {
 			b.SetCoinbase(in.Coinbase)
-			b.SetExtra(blockExtra)                          // iron rule 1(ii): InsertChain verifyHeader rejects otherwise
-			b.SetParentBeaconRoot(in.ParentBeaconBlockRoot) // iron rule 4: 4788 build/replay symmetry
+			b.SetExtra(blockExtra) // iron rule 1(ii): InsertChain verifyHeader rejects otherwise
+			// iron rule 4: 4788 build/replay symmetry -- but EIP-4788 ships with
+			// Cancun, so pre-Cancun blocks (Regolith/Canyon) must carry NO beacon
+			// root; InsertChain verifyHeader rejects a non-nil one there.
+			if cfg.IsCancun(big.NewInt(1), blockTime) { // single-block generation: number 1
+				b.SetParentBeaconRoot(in.ParentBeaconBlockRoot)
+			}
 			for _, tx := range txs {
 				b.AddTx(tx) // L1CostFunc/OperatorCostFunc wired inside NewEVMBlockContext (core/evm.go)
 			}
@@ -1309,8 +1326,17 @@ func assembleOutput(in *inputCase, cfg *params.ChainConfig, signer types.Signer,
 	// holocene) have no requests (chain_makers.collectRequests returns nil), so
 	// the header's RequestsHash stays nil and is emitted absent, mirroring
 	// op-geth's own t8n (requestsHash,omitempty).
-	if header.WithdrawalsHash == nil || header.BlobGasUsed == nil {
-		return outputVector{}, nil, fmt.Errorf("generated header missing WithdrawalsHash/BlobGasUsed")
+	// Header-field presence is fork-gated: WithdrawalsRoot ships with Shanghai
+	// (EIP-4895), BlobGasUsed with Cancun (EIP-4844). Regolith (London) headers
+	// carry neither; Canyon carries only withdrawals; requiring both uniformly
+	// was valid for the Cancun+-only corpus and is now conditional.
+	isShanghai := cfg.IsShanghai(big.NewInt(1), header.Time)
+	isCancun := cfg.IsCancun(big.NewInt(1), header.Time)
+	if isShanghai && header.WithdrawalsHash == nil {
+		return outputVector{}, nil, fmt.Errorf("generated Shanghai+ header missing WithdrawalsHash")
+	}
+	if isCancun && header.BlobGasUsed == nil {
+		return outputVector{}, nil, fmt.Errorf("generated Cancun+ header missing BlobGasUsed")
 	}
 	if header.MixDigest != (common.Hash{}) {
 		return outputVector{}, nil, fmt.Errorf("generated header MixDigest expected zero, got %s", header.MixDigest)
@@ -1324,7 +1350,10 @@ func assembleOutput(in *inputCase, cfg *params.ChainConfig, signer types.Signer,
 			CurrentGasLimit:       hexutil.EncodeUint64(header.GasLimit),
 			CurrentBaseFee:        hexutil.EncodeBig(header.BaseFee),
 			CurrentRandom:         "0x0", // header.MixDigest is zero (asserted above)
-			ParentBeaconBlockRoot: header.ParentBeaconRoot.Hex(),
+			// Pre-Cancun headers have no beacon root (nil): emit the zero hash
+			// so the env schema stays complete -- the replayer's EVM never reads
+			// it below Cancun.
+			ParentBeaconBlockRoot: parentBeaconRootOrZero(header.ParentBeaconRoot),
 			ParentHash:            header.ParentHash.Hex(),
 		},
 		Pre:       emitPre(in.Pre),
@@ -1332,12 +1361,18 @@ func assembleOutput(in *inputCase, cfg *params.ChainConfig, signer types.Signer,
 		PostState: postState,
 	}
 	expHeader := expectedHeader{
-		GasUsed:         hexutil.EncodeUint64(header.GasUsed),
-		ReceiptsRoot:    header.ReceiptHash.Hex(),
-		LogsBloom:       hexutil.Encode(header.Bloom[:]),
-		WithdrawalsRoot: header.WithdrawalsHash.Hex(),
-		BlobGasUsed:     hexutil.EncodeUint64(*header.BlobGasUsed),
-		StateRoot:       header.Root.Hex(),
+		GasUsed:      hexutil.EncodeUint64(header.GasUsed),
+		ReceiptsRoot: header.ReceiptHash.Hex(),
+		LogsBloom:    hexutil.Encode(header.Bloom[:]),
+		StateRoot:    header.Root.Hex(),
+	}
+	if header.WithdrawalsHash != nil {
+		s := header.WithdrawalsHash.Hex()
+		expHeader.WithdrawalsRoot = &s
+	}
+	if header.BlobGasUsed != nil {
+		s := hexutil.EncodeUint64(*header.BlobGasUsed)
+		expHeader.BlobGasUsed = &s
 	}
 	if header.RequestsHash != nil {
 		s := header.RequestsHash.Hex()
@@ -1383,8 +1418,14 @@ type goldenRecord struct {
 
 func buildGoldenRecord(block *types.Block, txs []*types.Transaction) (*goldenRecord, error) {
 	header := block.Header()
-	if header.ExcessBlobGas == nil || *header.ExcessBlobGas != 0 {
-		return nil, fmt.Errorf("expected header.ExcessBlobGas == 0 (no-blob OP chain), got %v", header.ExcessBlobGas)
+	// ExcessBlobGas ships with Cancun (EIP-4844): nil on Regolith/Canyon
+	// headers is valid (no field). Cancun+ must still be the no-blob 0.
+	excessBlobGas := "0x0" // pre-Cancun golden record keeps the schema key; no Engine consumer reads pre-Cancun goldens in S4
+	if header.ExcessBlobGas != nil {
+		if *header.ExcessBlobGas != 0 {
+			return nil, fmt.Errorf("expected header.ExcessBlobGas == 0 (no-blob OP chain), got %v", header.ExcessBlobGas)
+		}
+		excessBlobGas = hexutil.EncodeUint64(*header.ExcessBlobGas)
 	}
 	rawTxs := make([]string, len(txs))
 	for i, tx := range txs {
@@ -1402,7 +1443,7 @@ func buildGoldenRecord(block *types.Block, txs []*types.Transaction) (*goldenRec
 		BlockHash:        block.Hash().Hex(),
 		TransactionsRoot: header.TxHash.Hex(),
 		ExtraData:        hexutil.Encode(header.Extra),
-		ExcessBlobGas:    hexutil.EncodeUint64(*header.ExcessBlobGas),
+		ExcessBlobGas:    excessBlobGas,
 		RawTransactions:  rawTxs,
 		EncodedHeaderHex: hexutil.Encode(headerRLP),
 	}, nil
@@ -3367,6 +3408,16 @@ func blockFork(cfg *params.ChainConfig, blockTime uint64) string {
 	}
 }
 
+// parentBeaconRootOrZero renders a header's beacon root for the outputEnv:
+// pre-Cancun headers carry nil (no EIP-4788); the env schema field is
+// mandatory, so nil renders as the zero hash.
+func parentBeaconRootOrZero(h *common.Hash) string {
+	if h == nil {
+		return common.Hash{}.Hex()
+	}
+	return h.Hex()
+}
+
 func assertL1BlockConsistency(cfg *params.ChainConfig, in *inputCase) error {
 	if len(in.Transactions) == 0 {
 		return fmt.Errorf("case has no transactions (needs the L1 attributes deposit)")
@@ -4167,6 +4218,19 @@ func buildExpectedReceipts(cfg *params.ChainConfig, in *inputCase, txs []*types.
 			if r.L1BlobBaseFeeScalar != nil {
 				s := hexutil.EncodeUint64(*r.L1BlobBaseFeeScalar)
 				er.OpL1BlobBaseFeeScalar = &s
+			}
+			// Pre-Ecotone only (op-geth leaves FeeScalar nil from Ecotone on).
+			// op-geth's FeeScalar is the Bedrock scalar divided by 1e6 as a
+			// big.Float; the corpus pins it as a hex quantity of that SCALED
+			// value, which is exact whenever the scalar is a multiple of 1e6
+			// (every corpus config uses 1e6). FISCO's OpReceiptMeta carries the
+			// raw slot-6 scalar; its replayer divides by 1e6 before comparing
+			// (vectors/DIVERGENCES.md, S4 Task 7).
+			if r.FeeScalar != nil {
+				if scaled, acc := r.FeeScalar.Int(nil); acc == big.Exact {
+					s := hexutil.EncodeBig(scaled)
+					er.OpL1FeeScalar = &s
+				}
 			}
 			if r.OperatorFeeScalar != nil {
 				s := hexutil.EncodeUint64(*r.OperatorFeeScalar)
