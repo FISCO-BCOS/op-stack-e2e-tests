@@ -646,7 +646,7 @@ func caseFrame(fork, name, desc string, fp feeParams, gasLimit uint64) inputCase
 // must also fire granite+holocene, otherwise the block's extraData stays empty
 // (pre-Holocene) instead of the mandatory 9-byte Holocene form. The base fork
 // itself and all forks before it stay at 0 (already active at genesis).
-var opForkOrder = []string{"ecotone", "fjord", "granite", "holocene", "isthmus", "jovian"}
+var opForkOrder = []string{"regolith", "canyon", "ecotone", "fjord", "granite", "holocene", "isthmus", "jovian"}
 
 // upgradeFrame assembles the upgrade-boundary skeleton (spec A2, Task 3):
 // genesis in baseFork, single block (timestamp = genesis+10 = 1010) crossing
@@ -1595,6 +1595,56 @@ var caseSpecs = []caseSpec{
 		c.Transactions = append(c.Transactions, transferTx(1, 0, recA, eth(1), 100_000, junkData("upgrade_isthmus_activation", 64)))
 		return c
 	}},
+
+	// ----- S4 Task 8: mandatory boundary vectors (plan §Task 8) -----
+	// upgradeFrame CAN now express canyon bases (opForkOrder carries regolith/
+	// canyon), but a fork-period block (activation STRICTLY AFTER the block
+	// timestamp) is built by hand: caseFrame + a future activation in
+	// _info.activations. buildConfigForCase routes those through
+	// buildChainConfigSpec; the block itself executes under the genesis fork.
+
+	{"boundary_canyon_last", []string{"canyon"}, func(fork string) inputCase {
+		// Canyon fork-period block: genesis Canyon, EcotoneTime=2000 > block
+		// time 1010 -- Shanghai EVM, Bedrock attributes (260B 0x015d8eb9) and
+		// the Bedrock L1 formula on slots 1/5/6. The "last Canyon block"
+		// semantic: the next fork is scheduled but has not fired yet.
+		fp := defaultFeeParams()
+		c := caseFrame(fork, "boundary_canyon_last",
+			"Canyon last-block boundary: genesis Canyon, EcotoneTime=2000 in the future (block 1010 < 2000) -- Shanghai + Bedrock attributes/formula",
+			fp, 10_000_000)
+		c.Info.Activations = map[string]uint64{"ecotone": 2000}
+		return c
+	}},
+
+	{"boundary_ecotone_synth", []string{"canyon"}, func(fork string) inputCase {
+		// SYNTHETIC steady-state Ecotone block (plan: NOT the spec activation
+		// block, which must still call setL1BlockValues -- that is S7): genesis
+		// Canyon, the single block crosses EcotoneTime=1005, and the
+		// attributes arrive in the NEW Ecotone form (164B 0x440a5e20, slots
+		// 3/7 non-zero) with the Ecotone formula live. upgradeFrame rebuilds
+		// the L1Block seeding + attributes calldata under the target fork.
+		fp := defaultFeeParams()
+		c := upgradeFrame("canyon", "boundary_ecotone_synth",
+			"synthetic Ecotone steady-state boundary: genesis Canyon, single block crosses EcotoneTime; NEW-format attributes (164B, new slots non-zero) with the Ecotone calldata formula (spec activation-block shape is S7)",
+			fp, 10_000_000, "ecotone", 1005)
+		return c
+	}},
+
+	{"boundary_ecotone_last", []string{"ecotone"}, func(fork string) inputCase {
+		// Ecotone fork-period block, paired with the existing
+		// upgrade_fjord_activation (= fjord FIRST block): genesis Ecotone,
+		// FjordTime=2000 in the future -- calldataGas formula still governs.
+		fp := defaultFeeParams()
+		c := caseFrame(fork, "boundary_ecotone_last",
+			"Ecotone last-block boundary: genesis Ecotone, FjordTime=2000 in the future (block 1010 < 2000) -- calldataGas formula still governs before FastLZ",
+			fp, 10_000_000)
+		c.Info.Activations = map[string]uint64{"fjord": 2000}
+		return c
+	}},
+
+	// boundary_fjord_first is the EXISTING upgrade_fjord_activation (genesis
+	// Ecotone, block crosses FjordTime=1005 -> FastLZ first block); not
+	// duplicated here (plan: don't rebuild what exists).
 
 	{"upgrade_jovian_activation", []string{"isthmus"}, func(fork string) inputCase {
 		// DA fields appear: genesis Isthmus, single block crosses JovianTime.
