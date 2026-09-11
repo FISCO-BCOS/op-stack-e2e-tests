@@ -1,15 +1,15 @@
 {
   "comment": "C2 e2e pinned version manifest. Future e2e runs must use this baseline. setup_c2.sh collects OBSERVED versions into $C2/versions.json at the end of every run and diffs them against this file: the monorepo commit and on-chain contract versions are ENFORCED (mismatch aborts; escape hatch SKIP_VERSION_CHECK=1), anvil/go versions warn only, the FISCO-BCOS EL commit is recorded not enforced (it moves with active development).",
   "op_monorepo": {
-    "commit": "5f90f749caea14398554afb75062f7111b1fc554",
-    "describe": "v1.19.2-1-g5f90f749ca",
+    "commit": "da197e45ed44b9fca258b3b0d0709e8dfca1c7cd",
+    "describe": "v1.19.2",
     "go": "go1.26.4",
     "build_targets": {
       "op-node": "./op-node/cmd",
       "op-batcher": "./op-batcher/cmd",
-      "op-deployer": "./op-deployer/cmd/op-deployer"
+      "op-deployer": "./op-deployer"
     },
-    "note": "op-deployer embeds contracts-bedrock forge artifacts (mktar from packages/contracts-bedrock, justfile copy-contract-artifacts semantics) — the monorepo commit therefore pins the deployed contract bytecode too."
+    "note": "op-deployer embeds contracts-bedrock forge artifacts (mktar from packages/contracts-bedrock, justfile copy-contract-artifacts semantics) \u2014 the monorepo commit therefore pins the deployed contract bytecode too. Build it with `just build` in ./op-deployer: a plain `go build` omits artifacts.tzst and op-deployer apply fails at runtime (see tools/.ci/c2-e2e.sh)."
   },
   "l1_contracts": {
     "source": "embedded contracts-bedrock at the monorepo commit above (pre-U20 form: classic fault games, SystemConfig v3)",

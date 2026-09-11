@@ -21,11 +21,10 @@
 #   - [rpc] listen_port(不是 rpc_listen_port)
 #   - [web3] chain_id 决定 eth_chainId;套件签名用 CHAIN_ID=11155111
 #   - without_tars_framework=true 需要 conf/tars_proxy.ini 存在
-#   - B3: enable_single_node_consensus=true + op_engine_rpc.enable=false(被动出块;
-#     本分支 OP 模式由 SingleNodeConsensus 驱动块生产,两者与 engine RPC 互斥
-#     "both drive the same EngineService"(NodeConfig.cpp);PBFT 不在 OP 模式初始化)
-#   - B3a: enable_single_node_consensus=false + op_engine_rpc.enable=true(FCU 驱动,
-#     与 a1_active 套件配合;步骤 6 clone sed 自动翻转这两个 flag)
+#   - B3 (passive): enable_single_node_consensus=false + op_engine_rpc.enable=true
+#     executor v3 拒绝内置 SingleNodeConsensus;B3 仅提供 genesis RPC(被动,tier-1)
+#   - B3a (active): 同 B3 但 produce_empty_blocks=false + 端口 8563/8564(FCU 驱动,
+#     与 a1_active 套件配合)
 #   - 注意:旧分支 worktree-op-alignment 上两者可共存且必须开 true——那是旧线
 #     行为,在旧线的 84b3be0d 回归修复有记录;两条分支的配置契约不同
 #   - [eth_genesis_header] 22 字段必须存在(feature_l2_ethereum_compat 强制,
@@ -43,7 +42,14 @@ L2CONTRACTS="$ROOT/bcos-l2-contracts"                          # L2 合约
 OPGEN="$ROOT/tools/opstack-genesis"                            # genesis 工具
 OP_PIN="$L2CONTRACTS/op-fork-pin.toml"                         # OP 版本 pin
 OP_DIR="$WORK/op"                                              # OP 上游 clone 目标
-SECP_PKG="$ROOT/vcpkg/packages/secp256k1_arm64-osx"           # vcpkg secp256k1
+SECP_PKG="${SECP_PKG:-$ROOT/vcpkg/packages/secp256k1_arm64-osx}"           # vcpkg secp256k1
+# Fallback: worktrees link against the main repo's vcpkg_installed.
+for _secp_try in "$ROOT/../../build/vcpkg_installed/arm64-osx" \
+                 "$ROOT/../build/vcpkg_installed/arm64-osx"; do
+  if [ ! -f "$SECP_PKG/lib/libsecp256k1.a" ] && [ -f "$_secp_try/lib/libsecp256k1.a" ]; then
+    SECP_PKG="$_secp_try"
+  fi
+done
 SIGN_SECP_SRC="$ROOT/tools/op-e2e/sign_secp.c"                 # sign_secp 源码(已入库)
 # OP 链参数 —— 套件签名固定用 11155111,group 名决定存储路径 data/<group>
 CHAIN_ID="${CHAIN_ID:-11155111}"
@@ -109,9 +115,9 @@ if step_run 3; then
   if [ "$missing" -eq 0 ]; then
     log "OP-fork artifacts 已存在(vendored),跳过 clone"
   else
-    log "OP-fork artifacts 缺失 → clone ethereum-optimism/optimism @ $(grep '^commit' "$OP_PIN" | awk '{print $3}')"
-    commit=$(grep '^commit' "$OP_PIN" | awk '{print $3}')
-    tag=$(grep '^tag' "$OP_PIN" | awk '{print $3}')
+    log "OP-fork artifacts 缺失 → clone ethereum-optimism/optimism @ $(grep 'op_contracts_commit' "$OP_PIN" | awk '{print $3}' | tr -d '"')"
+    commit=$(grep 'op_contracts_commit' "$OP_PIN" | awk '{print $3}' | tr -d '"')
+    tag=$(grep 'op_contracts_tag' "$OP_PIN" | awk '{print $3}' | tr -d '"')
     if [ ! -d "$OP_DIR" ]; then
       git clone --quiet --depth 1 --branch "$tag" --single-branch \
         https://github.com/ethereum-optimism/optimism.git "$OP_DIR" || die "OP clone 失败(需网络)"
@@ -236,7 +242,7 @@ if step_run 5; then
     block_tx_count_limit=1000
     leader_period=1
     node.0=$NODE_ID
-    enable_single_node_consensus=true
+    enable_single_node_consensus=false
     block_interval=1000
     produce_empty_blocks=true
     fee_recipient=$FEE_RECIPIENT
@@ -248,6 +254,7 @@ if step_run 5; then
     is_auth_check=false
     is_serial_execute=true
     version=3
+    evm_revision=prague
     evm_revision_forks=0:prague
     auth_admin_account=$AUTH_ADMIN
 [features]
@@ -265,7 +272,7 @@ $(cat "$ETH_HEADER")
     listen_ip=127.0.0.1
     listen_port=$B3_WEB3
 [op_engine_rpc]
-    enable=false
+    enable=true
     listen_ip=127.0.0.1
     listen_port=$B3_ENGINE
     jwt_secret_file=jwt.hex
@@ -311,8 +318,6 @@ if step_run 6; then
       -e "s/listen_port=$B3_WEB3/listen_port=$B3A_WEB3/" \
       -e "s/listen_port=$B3_ENGINE/listen_port=$B3A_ENGINE/" \
       -e "s/listen_port=$B3_P2P/listen_port=$B3A_P2P/" \
-      -e "s/enable_single_node_consensus=true/enable_single_node_consensus=false/" \
-      -e "s/enable=false/enable=true/" \
       -e "s/produce_empty_blocks=true/produce_empty_blocks=false/" \
       "$B3A/config.genesis"
   rm -f "$B3A/config.genesis.bak"
@@ -324,6 +329,8 @@ if step_run 6; then
 set -u
 cd "$(dirname "$0")"
 BINARY=${BINARY:-@BINARY@}
+# Large OP genesis (4k+ allocs) needs a bigger stack during first init.
+ulimit -s 65520 2>/dev/null || ulimit -s unlimited 2>/dev/null || true
 [ -f node.pid ] && kill "$(cat node.pid)" 2>/dev/null
 sleep 2
 nohup "$BINARY" -c config.genesis -g config.genesis > nohup.out 2>&1 &

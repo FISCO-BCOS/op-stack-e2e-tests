@@ -115,6 +115,22 @@ def cast(*args):
     return r.stdout.strip()
 
 
+_CAST_SEND_DATA_FLAG = None
+
+
+def cast_send_with_data(to, calldata, *rest):
+    """cast send with raw calldata — 1.7+ uses --data; 1.2.x takes positional hex."""
+    global _CAST_SEND_DATA_FLAG
+    if _CAST_SEND_DATA_FLAG is None:
+        help_out = subprocess.run(["cast", "send", "--help"],
+                                  capture_output=True, text=True).stdout
+        _CAST_SEND_DATA_FLAG = "--data" in help_out
+    if _CAST_SEND_DATA_FLAG:
+        cast("send", to, "--data", calldata, *rest)
+    else:
+        cast("send", to, calldata, *rest)
+
+
 def contracts():
     s = json.load(open(STATE))
     oc = s["opChainDeployments"][0]
@@ -153,6 +169,12 @@ def decode_message_passed(log):
 
 def withdrawal_from_receipt(tx_hash):
     r = rpc(L2_WEB3, "eth_getTransactionReceipt", [tx_hash])
+    if not r:
+        raise SystemExit(f"no receipt for {tx_hash}")
+    if r.get("status") != "0x1":
+        raise SystemExit(
+            f"withdrawal tx failed (status={r.get('status')}, gasUsed={r.get('gasUsed')}); "
+            "MessagePassed is only emitted on success — check L2 balance covers value + gas")
     for log in r["logs"]:
         if log["topics"][0] != MESSAGE_PASSED_TOPIC:
             continue
@@ -356,7 +378,7 @@ def prove_withdrawal(portal, w, game_index, orp, proof):
                       portal, "--data", calldata, "--from", PROPOSER_ADDR,
                       "--rpc-url", L1):
         raise SystemExit("prove not callable within 120s")
-    cast("send", portal, "--data", calldata, "--private-key", PROPOSER_KEY,
+    cast_send_with_data(portal, calldata, "--private-key", PROPOSER_KEY,
          "--rpc-url", L1)
     return tx, calldata
 
@@ -604,7 +626,7 @@ def main():
     if not wait_until("prove (game-creation block passed)", 120,
                       portal, "--data", calldata, "--rpc-url", L1):
         raise SystemExit("prove not callable within 120s")
-    cast("send", portal, "--data", calldata, "--private-key", PROPOSER_KEY,
+    cast_send_with_data(portal, calldata, "--private-key", PROPOSER_KEY,
          "--rpc-url", L1)
     print("proven")
     lifecycle("portal records the proof (game + timestamp)",
@@ -633,7 +655,7 @@ def main():
                       'finalizeWithdrawalTransaction((uint256,address,address,'
                       'uint256,uint256,bytes))', tx,
                       "--from", PROPOSER_ADDR, "--rpc-url", L1):
-        raise SystemExit("finalize not callable within 300s")
+        raise SystemExit("finalize not callable within 600s (proof maturity + finality delay)")
     fin = cast("send", portal,
         'finalizeWithdrawalTransaction((uint256,address,address,uint256,'
         'uint256,bytes))', tx, "--private-key", PROPOSER_KEY,

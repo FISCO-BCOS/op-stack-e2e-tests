@@ -43,13 +43,53 @@ if [ "$PORTAL_BAL" -lt 2000000000000000000 ] 2>/dev/null; then
   echo "portal funded with 2 ETH (was $PORTAL_BAL wei)"
 fi
 
+# deposit_e2e credits exactly 1 ETH on L2; value=1ether also needs gas headroom on
+# chains where DEV1 has no genesis L2 prefund. Use python for uint256 compares.
+WITHDRAW_WEI=1000000000000000000
+GAS_HEADROOM_WEI=100000000000000000
+L2_BAL=$(cast balance "$DEV1" --rpc-url "$L2")
+if ! python3 - "$L2_BAL" "$WITHDRAW_WEI" "$GAS_HEADROOM_WEI" <<'PY'
+import sys
+bal, need, head = map(int, sys.argv[1:4])
+raise SystemExit(0 if bal >= need + head else 1)
+PY
+then
+  echo "L2 gas headroom: depositing 0.1 ETH to DEV1 (balance $L2_BAL wei)"
+  cast send "$PORTAL" --value 0.1ether --private-key "$KEY" --rpc-url "$L1" > /dev/null
+  python3 - "$L2" "$DEV1" "$L2_BAL" <<'PY'
+import json, sys, time, urllib.request
+l2, dev1, before = sys.argv[1], sys.argv[2], int(sys.argv[3])
+def rpc(m, p):
+    req = urllib.request.Request(l2, data=json.dumps(
+        {"jsonrpc": "2.0", "method": m, "params": p, "id": 1}).encode(),
+        headers={"Content-Type": "application/json"})
+    return json.load(urllib.request.urlopen(req, timeout=5))["result"]
+deadline = time.time() + 300
+while time.time() < deadline:
+    bal = int(rpc("eth_getBalance", [dev1, "latest"]), 16)
+    if bal >= before + 10**17:
+        print(f"L2 headroom credited: {before} -> {bal} wei")
+        sys.exit(0)
+    time.sleep(3)
+raise SystemExit("L2 headroom deposit not credited within 300s")
+PY
+fi
+
 L1_BEFORE=$(cast balance "$DEV1" --rpc-url "$L1")
 echo "DEV1 L1 before: $L1_BEFORE"
+GAS_EST=$(cast estimate 0x4200000000000000000000000000000000000016 \
+  "initiateWithdrawal(address,uint256,bytes)" "$DEV1" 100000 0x --value 1ether \
+  --from "$DEV1" --rpc-url "$L2")
+# shellcheck source=l2_gas.sh
+source "$(dirname "$0")/l2_gas.sh"
+GAS_LIMIT=$(l2_padded_gas "$GAS_EST")
 TX=$(cast send 0x4200000000000000000000000000000000000016 \
   "initiateWithdrawal(address,uint256,bytes)" "$DEV1" 100000 0x --value 1ether \
-  --private-key "$KEY" --rpc-url "$L2" --chain-id "$CHAIN_ID" --json \
+  --private-key "$KEY" --rpc-url "$L2" --chain-id "$CHAIN_ID" --gas-limit "$GAS_LIMIT" --json \
   | python3 -c 'import json,sys; print(json.load(sys.stdin)["transactionHash"])')
-echo "withdrawal tx: $TX"
+echo "withdrawal tx: $TX (gas limit $GAS_LIMIT, estimate $GAS_EST)"
+assert_l2_receipt_ok "$TX" "$L2"
+echo "withdrawal receipt OK"
 
 python3 withdraw_claim.py "$TX" --wait-finalized 2400
 

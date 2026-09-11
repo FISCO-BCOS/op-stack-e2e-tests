@@ -88,7 +88,7 @@ while time.time() < deadline:
             print(f"[dep] !! {e}", file=sys.stderr)
             sys.exit(1)
     time.sleep(3)
-print("[dep] !! deposit not credited within 180s", file=sys.stderr)
+print("[dep] !! deposit not credited within 300s", file=sys.stderr)
 sys.exit(1)
 PY
 

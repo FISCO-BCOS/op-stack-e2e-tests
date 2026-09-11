@@ -186,10 +186,19 @@ bash "$HERE/withdraw_e2e.sh"
 # ── phase 3: adversarial dispute scenarios ─────────────────────────────────
 if [ "${CONTEST:-1}" = "1" ]; then
   log "running adversarial dispute scenarios"
+  # shellcheck source=l2_gas.sh
+  source "$HERE/l2_gas.sh"
+  GAS_EST=$(cast estimate 0x4200000000000000000000000000000000000016 \
+    "initiateWithdrawal(address,uint256,bytes)" "$DEV1" 100000 0x --value 1ether \
+    --from "$DEV1" --rpc-url "$C2_L2_WEB3")
+  GAS_LIMIT=$(l2_padded_gas "$GAS_EST")
   TX=$(cast send 0x4200000000000000000000000000000000000016 \
     "initiateWithdrawal(address,uint256,bytes)" "$DEV1" 100000 0x --value 1ether \
-    --private-key "$KEY" --rpc-url "$C2_L2_WEB3" --chain-id "$CHAIN_ID" --json \
+    --private-key "$KEY" --rpc-url "$C2_L2_WEB3" --chain-id "$CHAIN_ID" \
+    --gas-limit "$GAS_LIMIT" --json \
     | python3 -c 'import json,sys; print(json.load(sys.stdin)["transactionHash"])')
+  log "contest withdrawal tx: $TX (gas limit $GAS_LIMIT, estimate $GAS_EST)"
+  assert_l2_receipt_ok "$TX" "$C2_L2_WEB3"
   python3 "$HERE/withdraw_claim.py" "$TX" --wait-finalized 2400 --contest abandoned
   # dishonest reuses the same withdrawal: its precheck never proves (the fake
   # root provably rejects the real proof), so no interference with the

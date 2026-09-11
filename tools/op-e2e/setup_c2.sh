@@ -28,14 +28,27 @@
 #   - eth_genesis_header.timestamp 用秒(L1 时间戳;C++ 侧 ×1000 存内部毫秒)
 #   - [features] feature_op_jovian=true(否则 9B extraData,op-node 拒绝)
 #   - op-node: --l1.beacon.ignore + --rollup.l1-chain-config(anvil 需 cancunTime)
-set -eu
+set -euo pipefail
+
+# Repo root from this script's own location (tools/op-e2e) so the defaults below work
+# on any checkout. Every path stays env-overridable.
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# This harness lives in its OWN repo (FISCO-BCOS/op-stack-e2e-tests); REPO_ROOT is the
+# harness checkout. Everything from the FISCO-BCOS monorepo (node binary, genesis
+# tooling, contracts) comes from FISCO_REPO — set it to a FISCO-BCOS checkout, or let
+# the default find a sibling checkout (the CI wires it explicitly via tools/.ci/c2-e2e.sh).
+REPO_ROOT="${REPO_ROOT:-$(cd "${SELF_DIR}/.." && pwd)}"
+FISCO_REPO="${FISCO_REPO:-$(cd "${SELF_DIR}/../../FISCO-BCOS" 2>/dev/null && pwd)}"
+: "${FISCO_REPO:?FISCO_REPO must point at a FISCO-BCOS checkout (it provides
+  tools/opstack-genesis, bcos-l2-contracts and build/fisco-bcos-air/fisco-bcos)}"
 
 # ---------- 可调参数 ----------
 C2="${C2:-/tmp/c2}"
-MONOREPO="${MONOREPO:-/Users/octopus/octo/code/blockchain-impl/optimism}"
-FISCO_BIN="${FISCO_BIN:-/Users/octopus/octo/code/FISCO-BCOS/build/fisco-bcos-air/fisco-bcos}"
-OPGEN="${OPGEN:-/Users/octopus/octo/code/FISCO-BCOS/tools/opstack-genesis}"
-L2CONTRACTS="${L2CONTRACTS:-/Users/octopus/octo/code/FISCO-BCOS/bcos-l2-contracts}"
+# MONOREPO 是 optimism 克隆,不在仓库内;默认值对齐 c2-e2e.sh 的 OP_MONOREPO。
+MONOREPO="${MONOREPO:-${OP_MONOREPO:-${REPO_ROOT}/.ci-op-monorepo}}"
+FISCO_BIN="${FISCO_BIN:-${FISCO_REPO}/build/fisco-bcos-air/fisco-bcos}"
+OPGEN="${OPGEN:-${FISCO_REPO}/tools/opstack-genesis}"
+L2CONTRACTS="${L2CONTRACTS:-${FISCO_REPO}/bcos-l2-contracts}"
 
 # 端口(可 env 覆盖——隔离实例用: 见文件头"独立目录"说明; 默认值不变)
 ANVIL_PORT="${ANVIL_PORT:-8549}"; ANVIL_CHAIN="${ANVIL_CHAIN:-900900}"
@@ -225,7 +238,13 @@ if step_run 3; then
   step 3 "allocs.ini + eth_genesis_header"
   python3 -c "import yaml" 2>/dev/null || die "pyyaml 未安装"
   NEW_HASH=$(sha256sum "$C2/l2genesis.json" | awk '{print $1}')
-  sed -i '' "s/base_allocs_sha256:.*/base_allocs_sha256: \"$NEW_HASH\"/" "$OPGEN/chain-config-c2.yaml"
+  # GNU sed takes `-i` suffix-less; BSD sed requires an explicit '' — branch like the
+  # rest of the repo (tools/engine_integration_test.sh) so the Linux e2e path works.
+  if [ "$(uname)" = "Darwin" ]; then
+    sed -i '' "s/base_allocs_sha256:.*/base_allocs_sha256: \"$NEW_HASH\"/" "$OPGEN/chain-config-c2.yaml"
+  else
+    sed -i "s/base_allocs_sha256:.*/base_allocs_sha256: \"$NEW_HASH\"/" "$OPGEN/chain-config-c2.yaml"
+  fi
   python3 "$OPGEN/build-allocs.py" \
     --config "$OPGEN/chain-config-c2.yaml" \
     --contracts "$L2CONTRACTS" \
@@ -302,6 +321,7 @@ if step_run 4; then
     is_auth_check=false
     is_serial_execute=true
     version=3
+    evm_revision=prague
     evm_revision_forks=0:prague
     auth_admin_account=$AUTH_ADMIN
 [features]
@@ -458,7 +478,10 @@ req = urllib.request.Request('http://127.0.0.1:$FISCO_WEB3',
 print(json.loads(urllib.request.urlopen(req, timeout=10).read())['result'])
 ")
   log "op-node 启动(PID $(cat "$C2/op-node.pid"),L2 block=$BN)"
-  [ "$BN" != "0x0" ] && log "✅ C2 出块中!deposit/withdraw 闭环可用"
+  if [ "$BN" = "0x0" ] || [ "$BN" = "0" ]; then
+    die "op-node 未推进 L2 出块(eth_blockNumber=$BN);检查 op-node.log / FISCO engine RPC"
+  fi
+  log "✅ C2 出块中!deposit/withdraw 闭环可用"
 fi
 
 # ---------- 7. op-batcher ----------
@@ -466,7 +489,7 @@ fi
 # The batcher key must match SystemConfig.batcherAddr (op-deployer default = anvil #2).
 if step_run 7; then
   step 7 "op-batcher start"
-  OP_MONOREPO="${OP_MONOREPO:-/Users/octopus/octo/code/blockchain-impl/optimism}"
+  OP_MONOREPO="${OP_MONOREPO:-$MONOREPO}"
   if [ ! -x "$C2/op-batcher" ]; then
     (cd "$OP_MONOREPO" && go build -o "$C2/op-batcher" ./op-batcher/cmd) \
       || die "op-batcher build failed (needs monorepo + go)"
@@ -503,9 +526,7 @@ if [ -z "${SKIP_VERSION_CHECK:-}" ]; then
   # set -e: a failing command substitution inside an assignment would kill the script
   # silently, so resolve the repo root defensively (the script has cd'd to $C2 by now,
   # a relative $0 no longer resolves).
-  FISCO_REPO="${FISCO_REPO:-$( (cd "$(dirname "$0")/../.." 2>/dev/null && pwd) || true )}"
-  FISCO_REPO="${FISCO_REPO:-/Users/octopus/octo/code/FISCO-BCOS}"
-  VERSIONS_MANIFEST="$FISCO_REPO/tools/op-e2e/versions.json"
+  VERSIONS_MANIFEST="${VERSIONS_MANIFEST:-${SELF_DIR}/versions.json}"
   if [ -f "$VERSIONS_MANIFEST" ]; then
     echo
     echo "==== version manifest check ===="

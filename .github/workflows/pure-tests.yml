@@ -1,0 +1,22 @@
+name: op-e2e pure tests
+
+on:
+  pull_request:
+    paths: ["tools/op-e2e/**"]
+  push:
+    branches: [main]
+
+jobs:
+  pure-tests:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install deps
+        # eth-hash / trie / rlp are the independent oracle the pure tests
+        # cross-check withdraw_claim's ABI/Merkle decoding against.
+        run: python3 -m pip install 'eth-hash[pycryptodome]' trie rlp pyyaml
+      - name: Run pure tests
+        run: python3 -m unittest discover -s tools/op-e2e/tests -v

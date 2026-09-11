@@ -110,16 +110,30 @@ def _known_error_check(name, e):
 
 def a1_engine_surface(erpc):
     print("A.1 engine surface")
-    # Version-adaptive (08-18): the old line advertises the V4 trio; the scheduler line only
-    # V3 (FCU V4 -> -38005, docs/2026-08-18-opstack-scheduler-e2e-verification.md). Pin that a
-    # coherent trio exists at the line's version — the exact gates are covered by
-    # OpNewPayloadRpcE2eTest and a1_active's other-version loop.
+    # Accept every valid engine surface shape, not only a same-version trio:
+    #   A) same-V trio (V4 or V3) — the eth / scheduler lines
+    #      (docs/2026-08-18-opstack-scheduler-e2e-verification.md).
+    #   B) OP lane (Isthmus+): FCU stays at V3 (FCU V4 is unimplemented -> -38005) while
+    #      newPayload advances to V4 and getPayload to V4/V5 — exactly what op-geth's
+    #      OP-stack advertises and what OpEngineReviewFixTest pins. The three families are
+    #      NOT expected to agree on one version here.
     caps = erpc.call("engine_exchangeCapabilities")
-    trio = next((v for v in (4, 3)
-                 if all(f"engine_{m}V{v}" in caps
-                        for m in ["newPayload", "forkchoiceUpdated", "getPayload"])), None)
-    check(f"exchangeCapabilities has a coherent trio (V{trio or '?'})", trio is not None, str(caps))
-    check("newPayload method reachable", True)
+    same_v = next((v for v in (4, 3)
+                   if all(f"engine_{m}V{v}" in caps
+                          for m in ["newPayload", "forkchoiceUpdated", "getPayload"])), None)
+    op_lane = ("engine_forkchoiceUpdatedV3" in caps and "engine_newPayloadV4" in caps and
+               any(f"engine_getPayloadV{v}" in caps for v in (4, 5)))
+    shape = (f"V{same_v}" if same_v else
+             ("OP(FCU V3 + newPayload V4 + getPayload V4/V5)" if op_lane else None))
+    check(f"exchangeCapabilities advertises a drivable engine surface ({shape or '?'})",
+        shape is not None, str(caps))
+    # Real reachability gate: the web3 surface must expose the engine methods this
+    # matrix drives. A surface without them answers -32601 to every engine call below,
+    # so fail here instead of recording dozens of vacuous passes.
+    check("engine methods exposed on the web3 surface",
+        any(f"engine_{m}V{v}" in caps
+            for m in ["newPayload", "forkchoiceUpdated"] for v in (3, 4)),
+        f"{sorted(c for c in caps if c.startswith('engine_'))[:4]}...")
 
 
 # ---- A.2 eth_* ----
@@ -141,14 +155,35 @@ def a2_chain(rpc):
           gp is not None and lb is not None and
           int(gp, 16) >= int(lb["baseFeePerGas"], 16),
           f"gasPrice={gp} baseFee={lb and lb.get('baseFeePerGas')}")
-    # B1 (08-18): pin the current eth_maxPriorityFeePerGas. op-geth's is dynamic
-    # (SuggestOptimismPriorityFee >= 1e6 wei, gasprice/optimism-gasprice.go:38);
-    # FISCO's is the constant 0x0 (EthEndpoint.cpp:943) — divergence D-GP-2, see
-    # docs/2026-08-18-rpc-parity-gasprice-withdrawals.md.
+    # eth_maxPriorityFeePerGas on the Ethereum/OP lane must suggest a non-zero tip (OP floors
+    # at 1e6 wei, op-geth's --gpo.minsuggestedpriorityfee); the legacy FISCO lane keeps 0x0.
+    # The C2 devnet is an OP L2, so the floor applies.
     mpf = rpc.call("eth_maxPriorityFeePerGas")
-    check("maxPriorityFeePerGas returns 0x0 (FISCO constant)", mpf == "0x0", str(mpf))
+    check("maxPriorityFeePerGas suggests a non-zero OP tip (>= 1e6 wei)",
+          mpf is not None and int(mpf, 16) >= 1_000_000, str(mpf))
     syncing = rpc.call("eth_syncing")
     check("syncing false", syncing is False, str(syncing))
+    # EIP-7910 eth_config: the node's fork configuration. A missing method answers -32601,
+    # which rpc.call turns into a loud failure here — the method must be registered.
+    cfg = rpc.call("eth_config")
+    cur = cfg.get("current") if isinstance(cfg, dict) else None
+    check("eth_config has current", isinstance(cur, dict), str(cfg)[:120])
+    if isinstance(cur, dict):
+        check("eth_config.current.chainId == chainId",
+              int(cur.get("chainId", "0x0"), 16) == int(cid, 16),
+              f"cfg={cur.get('chainId')} chainId={cid}")
+        fid = cur.get("forkId")
+        check("eth_config.current.forkId is a 4-byte 0x-hex",
+              isinstance(fid, str) and fid.startswith("0x") and len(fid) == 10, str(fid))
+        pcs = cur.get("precompiles") or {}
+        check("eth_config.current.precompiles includes ECREC",
+              isinstance(pcs, dict) and "ECREC" in pcs, str(list(pcs)[:6]))
+        scs = cur.get("systemContracts") or {}
+        # The C2 devnet is an OP L2 (feature_l2_ethereum_compat): beacon roots + history.
+        check("eth_config.current.systemContracts includes BEACON_ROOTS_ADDRESS",
+              isinstance(scs, dict) and "BEACON_ROOTS_ADDRESS" in scs, str(scs))
+    check("eth_config.next is null", isinstance(cfg, dict) and cfg.get("next") is None, "")
+    check("eth_config.last is null", isinstance(cfg, dict) and cfg.get("last") is None, "")
 
 
 def a2_blocks(rpc):
