@@ -121,6 +121,12 @@ func main() {
 		// GenerateChainWithGenesis) for the case's fork and dump the raw engine
 		// response JSON. Takes --input + --output like the vector path.
 		engineGetPayload = flag.Bool("engine-getpayload", false, "P2 Task 1 probe: build the case's fork through ForkchoiceUpdated+GetPayload<version> and write the raw engine response JSON to --output, then exit")
+		// engineFork overrides the case's _info.hardfork for the engine-getpayload
+		// path only. Needed for karst, which has no cases/*.in.json of its own
+		// (the corpus has no karst case): the karst cell reuses the jovian case
+		// body (same 17-byte Jovian extraData + minBaseFee shape) with the karst
+		// chain config. Empty means "use the case's own hardfork".
+		engineFork = flag.String("engine-fork", "", "P2 Task 1: override the getPayload cell's fork (only with --engine-getpayload), e.g. karst reusing cases/jovian_transfer_basic.in.json")
 	)
 	flag.Parse()
 
@@ -178,7 +184,7 @@ func main() {
 			os.Exit(1)
 		}
 	case *engineGetPayload:
-		if err := runEngineGetPayload(*inputPath, *outputPath); err != nil {
+		if err := runEngineGetPayload(*inputPath, *outputPath, *engineFork); err != nil {
 			fmt.Fprintf(os.Stderr, "opt8n-ref: %v\n", err)
 			os.Exit(1)
 		}
@@ -188,7 +194,7 @@ func main() {
 			os.Exit(1)
 		}
 	default:
-		fmt.Fprintln(os.Stderr, "usage: opt8n-ref --write-cases <dir> | --probe-receipt-fields <case.in.json> | --probe-spec | --probe-genesis-number | --probe-precompile <fork> | --input <case.in.json> --output <vector.json> [--golden-output <golden.json>] [--op-geth-commit <sha>] | --input <case.in.json> --output <engine-response.json> --engine-getpayload | --chain-output-dir <dir> [--op-geth-commit <sha>] | --mode corrupt|static|invalid-tx --base <stem> --out-dir <dir> [--op-geth-commit <sha>] | --mode chain:<N>[:fork|:break] --out-dir <dir> [--op-geth-commit <sha>]")
+		fmt.Fprintln(os.Stderr, "usage: opt8n-ref --write-cases <dir> | --probe-receipt-fields <case.in.json> | --probe-spec | --probe-genesis-number | --probe-precompile <fork> | --input <case.in.json> --output <vector.json> [--golden-output <golden.json>] [--op-geth-commit <sha>] | --input <case.in.json> --output <engine-response.json> --engine-getpayload [--engine-fork <fork>] | --chain-output-dir <dir> [--op-geth-commit <sha>] | --mode corrupt|static|invalid-tx --base <stem> --out-dir <dir> [--op-geth-commit <sha>] | --mode chain:<N>[:fork|:break] --out-dir <dir> [--op-geth-commit <sha>]")
 		os.Exit(2)
 	}
 }
@@ -598,6 +604,17 @@ func buildChainConfig(fork string) (*params.ChainConfig, error) {
 	conf := *params.OptimismTestConfig
 	conf.ChainID = big.NewInt(8453) // 0x2105, Base mainnet, matches the plan's schema example
 	switch fork {
+	case "karst":
+		// Karst is the OP fork after Jovian. OptimismTestConfig nils both
+		// KarstTime and OsakaTime; Karst activates the Osaka EL ruleset in this
+		// pin, which is what GetPayloadV5 gates on (eth/catalyst/api.go:497 ->
+		// getPayload(..., forks.Osaka, forks.BPO1..BPO5); params/config.go:1371
+		// LatestFork returns Osaka when OsakaTime is set and PragueTime <= time).
+		// The EL twin coupling (Prague==Isthmus) already holds from JovianTime.
+		// BlobScheduleConfig stays nil: the OP-Stack short-circuit in
+		// consensus/misc/eip4844 (CalcExcessBlobGas/CalcBlobFee) requires exactly that.
+		conf.KarstTime = uint64Ptr(0)
+		conf.OsakaTime = uint64Ptr(0)
 	case "jovian":
 		// OptimismTestConfig already sets JovianTime = 0 (Regolith..Jovian at 0).
 	case "isthmus":
@@ -645,7 +662,7 @@ func buildChainConfig(fork string) (*params.ChainConfig, error) {
 		conf.JovianTime = nil
 		conf.PragueTime = nil
 	default:
-		return nil, fmt.Errorf("unknown hardfork %q (want regolith|canyon|ecotone|fjord|granite|holocene|isthmus|jovian)", fork)
+		return nil, fmt.Errorf("unknown hardfork %q (want regolith|canyon|ecotone|fjord|granite|holocene|isthmus|jovian|karst)", fork)
 	}
 	if err := conf.CheckOptimismValidity(); err != nil {
 		return nil, fmt.Errorf("chain config invalid: %w", err)
@@ -1547,7 +1564,12 @@ func startEngineEthService(genesis *core.Genesis) (*node.Node, *geth.Ethereum, e
 // runEngineGetPayload builds one case's fork through the engine API and writes
 // the raw ExecutionPayloadEnvelope JSON to outputPath. See the header comment
 // above for why this is a separate path from run()/processBlockVector.
-func runEngineGetPayload(inputPath, outputPath string) error {
+//
+// forkOverride (--engine-fork), when non-empty, replaces the case's
+// _info.hardfork for this run only -- used by the karst@V5 cell, which reuses
+// the jovian case body. Upgrade-boundary cases (with _info.activations) are
+// rejected under an override: the override names a single pure-fork config.
+func runEngineGetPayload(inputPath, outputPath, forkOverride string) error {
 	if inputPath == "" || outputPath == "" {
 		return fmt.Errorf("--engine-getpayload requires --input and --output")
 	}
@@ -1560,11 +1582,22 @@ func runEngineGetPayload(inputPath, outputPath string) error {
 		return fmt.Errorf("parsing %s: %w", inputPath, err)
 	}
 	fork := in.Info.Hardfork
+	if forkOverride != "" {
+		if len(in.Info.Activations) > 0 {
+			return fmt.Errorf("--engine-fork %s: case %s carries _info.activations; a fork override is only valid for pure-fork cells", forkOverride, inputPath)
+		}
+		fork = forkOverride
+	}
 	version, err := getPayloadVersionForFork(fork)
 	if err != nil {
 		return err
 	}
-	cfg, err := buildConfigForCase(&in)
+	var cfg *params.ChainConfig
+	if forkOverride != "" {
+		cfg, err = buildChainConfig(fork)
+	} else {
+		cfg, err = buildConfigForCase(&in)
+	}
 	if err != nil {
 		return err
 	}
