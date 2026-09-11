@@ -1,0 +1,12 @@
+{
+  "note": "Cells where FISCO intentionally diverges from the pin-derived expectation. Values are FULL engine method names (what the artifact carries). Every entry MUST cite the design decision log row; an entry whose cell no longer diverges makes the matrix fail (stale deviation).",
+  "deviations": [
+    {
+      "fork": "karst",
+      "method": "getPayload",
+      "expected_from_pin": "engine_getPayloadV4",
+      "implemented": "engine_getPayloadV5",
+      "decision": "docs/2026-09-09-s3-engine-api-versions-design.md §4.2/§9: Karst adds getPayloadV5 (op-node at pin has no Karst/KarstTime, so it cannot adjudicate)"
+    }
+  ]
+}
