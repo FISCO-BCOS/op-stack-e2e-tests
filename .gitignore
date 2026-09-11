@@ -11,5 +11,6 @@ opstack-executor/tests/t8n/cases/
 opstack-executor/tests/t8n/vectors/*.json
 opstack-executor/tests/t8n/golden/engine/*.golden.json
 opstack-executor/tests/t8n/golden/engine/chained/*.json
+opstack-executor/tests/t8n/golden/engine/getpayload/*.json
 opstack-executor/tests/t8n/matrix/caps.json
 opstack-executor/tests/t8n/matrix/engine_api_windows.json

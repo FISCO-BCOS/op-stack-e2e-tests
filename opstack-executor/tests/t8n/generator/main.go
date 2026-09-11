@@ -38,6 +38,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/ecdsa"
 	"encoding/binary"
 	"encoding/json"
@@ -49,7 +50,9 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
+	"github.com/ethereum/go-ethereum/beacon/engine"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/common/math"
@@ -63,7 +66,13 @@ import (
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/crypto"
+	geth "github.com/ethereum/go-ethereum/eth"
+	"github.com/ethereum/go-ethereum/eth/catalyst"
+	"github.com/ethereum/go-ethereum/eth/ethconfig"
 	"github.com/ethereum/go-ethereum/ethdb"
+	"github.com/ethereum/go-ethereum/miner"
+	"github.com/ethereum/go-ethereum/node"
+	"github.com/ethereum/go-ethereum/p2p"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/ethereum/go-ethereum/trie"
@@ -108,6 +117,10 @@ func main() {
 		invalidMode = flag.String("mode", "", "corrupt|static|invalid-tx: emit invalid vectors from a base case stem; chain:<N>[:fork|:break]: emit a linear chain / fork / break vector")
 		baseStem    = flag.String("base", "isthmus_transfer_basic", "base case stem for --mode=corrupt/static (e.g. isthmus_transfer_basic)")
 		invalidOut  = flag.String("out-dir", "", "output dir for --mode=corrupt/static invalid vectors")
+		// P2 Task 1 probe: drive the real miner/engine getPayload path (not
+		// GenerateChainWithGenesis) for the case's fork and dump the raw engine
+		// response JSON. Takes --input + --output like the vector path.
+		engineGetPayload = flag.Bool("engine-getpayload", false, "P2 Task 1 probe: build the case's fork through ForkchoiceUpdated+GetPayload<version> and write the raw engine response JSON to --output, then exit")
 	)
 	flag.Parse()
 
@@ -164,13 +177,18 @@ func main() {
 			fmt.Fprintf(os.Stderr, "opt8n-ref: %v\n", err)
 			os.Exit(1)
 		}
+	case *engineGetPayload:
+		if err := runEngineGetPayload(*inputPath, *outputPath); err != nil {
+			fmt.Fprintf(os.Stderr, "opt8n-ref: %v\n", err)
+			os.Exit(1)
+		}
 	case *inputPath != "" && *outputPath != "":
 		if err := run(*inputPath, *outputPath, *opGethCommit, *goldenOutput); err != nil {
 			fmt.Fprintf(os.Stderr, "opt8n-ref: %v\n", err)
 			os.Exit(1)
 		}
 	default:
-		fmt.Fprintln(os.Stderr, "usage: opt8n-ref --write-cases <dir> | --probe-receipt-fields <case.in.json> | --probe-spec | --probe-genesis-number | --probe-precompile <fork> | --input <case.in.json> --output <vector.json> [--golden-output <golden.json>] [--op-geth-commit <sha>] | --chain-output-dir <dir> [--op-geth-commit <sha>] | --mode corrupt|static|invalid-tx --base <stem> --out-dir <dir> [--op-geth-commit <sha>] | --mode chain:<N>[:fork|:break] --out-dir <dir> [--op-geth-commit <sha>]")
+		fmt.Fprintln(os.Stderr, "usage: opt8n-ref --write-cases <dir> | --probe-receipt-fields <case.in.json> | --probe-spec | --probe-genesis-number | --probe-precompile <fork> | --input <case.in.json> --output <vector.json> [--golden-output <golden.json>] [--op-geth-commit <sha>] | --input <case.in.json> --output <engine-response.json> --engine-getpayload | --chain-output-dir <dir> [--op-geth-commit <sha>] | --mode corrupt|static|invalid-tx --base <stem> --out-dir <dir> [--op-geth-commit <sha>] | --mode chain:<N>[:fork|:break] --out-dir <dir> [--op-geth-commit <sha>]")
 		os.Exit(2)
 	}
 }
@@ -1456,6 +1474,226 @@ func writeJSON(path string, v any) error {
 	}
 	b = append(b, '\n')
 	return os.WriteFile(path, b, 0o644)
+}
+
+// ---------------------------------------------------------------------
+// P2 Task 1 probe: getPayload golden through the real miner/engine path.
+//
+// The existing --golden-output path (buildGoldenRecord, above) drives
+// core.GenerateChainWithGenesis and never touches the Engine API. The
+// getPayload golden must instead come out of the pipeline op-node talks to:
+// eth.New -> catalyst.ForkchoiceUpdated<v>(attrs) -> GetPayload<v>(id).
+// This probe adds exactly that for one (fork, version) cell at a time; the
+// 9-cell spread is deliberately NOT done here (plan §2 cost checkpoint).
+//
+// Determinism is the whole point:
+//   - NoTxPool=true makes miner.buildPayload build synchronously from the
+//     provided attributes.Transactions (no background recommit goroutine, no
+//     txpool ordering). The hash-derived payloadID never appears in the dumped
+//     envelope, so it cannot leak into the artifact.
+//   - Every response field is a pure function of genesis + attrs: timestamp
+//     comes from the case (genesis+10), prevRandao is zeroed, coinbase is the
+//     case coinbase. No wall-clock input.
+// ---------------------------------------------------------------------
+
+// getPayloadVersionForFork returns the engine_getPayload version legal for
+// each OP fork, mirroring matrix/engine_api_windows.json (op-node's own
+// selection). Karst is the one registered deviation: op-node emits V4, while
+// this op-geth pin implements GetPayloadV5 (params/config.go:519 KarstTime,
+// eth/catalyst/api.go:498).
+func getPayloadVersionForFork(fork string) (int, error) {
+	switch fork {
+	case "regolith", "canyon":
+		return 2, nil
+	case "ecotone", "fjord", "granite", "holocene":
+		return 3, nil
+	case "isthmus", "jovian":
+		return 4, nil
+	case "karst":
+		return 5, nil
+	default:
+		return 0, fmt.Errorf("unknown hardfork %q for getPayload golden", fork)
+	}
+}
+
+// startEngineEthService builds the in-memory node the engine API needs. It is
+// the non-test analogue of eth/catalyst/api_test.go:438
+// (startEthServiceWithConfigFn) with the same config the op-geth tests use.
+func startEngineEthService(genesis *core.Genesis) (*node.Node, *geth.Ethereum, error) {
+	n, err := node.New(&node.Config{P2P: p2p.Config{ListenAddr: "127.0.0.1:0", NoDiscovery: true, MaxPeers: 0}})
+	if err != nil {
+		return nil, nil, fmt.Errorf("node.New: %w", err)
+	}
+	ethcfg := &ethconfig.Config{
+		Genesis:        genesis,
+		SyncMode:       ethconfig.FullSync,
+		TrieTimeout:    time.Minute,
+		TrieDirtyCache: 256,
+		TrieCleanCache: 256,
+		Miner:          miner.DefaultConfig,
+	}
+	svc, err := geth.New(n, ethcfg)
+	if err != nil {
+		n.Close()
+		return nil, nil, fmt.Errorf("eth.New: %w", err)
+	}
+	if err := n.Start(); err != nil {
+		n.Close()
+		return nil, nil, fmt.Errorf("node.Start: %w", err)
+	}
+	return n, svc, nil
+}
+
+// runEngineGetPayload builds one case's fork through the engine API and writes
+// the raw ExecutionPayloadEnvelope JSON to outputPath. See the header comment
+// above for why this is a separate path from run()/processBlockVector.
+func runEngineGetPayload(inputPath, outputPath string) error {
+	if inputPath == "" || outputPath == "" {
+		return fmt.Errorf("--engine-getpayload requires --input and --output")
+	}
+	raw, err := os.ReadFile(inputPath)
+	if err != nil {
+		return err
+	}
+	var in inputCase
+	if err := json.Unmarshal(raw, &in); err != nil {
+		return fmt.Errorf("parsing %s: %w", inputPath, err)
+	}
+	fork := in.Info.Hardfork
+	version, err := getPayloadVersionForFork(fork)
+	if err != nil {
+		return err
+	}
+	cfg, err := buildConfigForCase(&in)
+	if err != nil {
+		return err
+	}
+	if err := assertL1BlockConsistency(cfg, &in); err != nil {
+		return fmt.Errorf("L1Block slot<->calldata consistency: %w", err)
+	}
+	if err := assertDepositsFirst(in.Transactions); err != nil {
+		return err
+	}
+
+	// Genesis + transactions: the verbatim front half of processBlockVector.
+	// The single block is built by the miner below, not by GenerateChainWithGenesis.
+	genesisTime := uint64(in.Genesis.Timestamp)
+	blockTime := genesisTime + 10 // chain_makers.makeHeader: parent+10; miner forceTime keeps it exact
+	denom := uint64(in.Genesis.EIP1559Denominator)
+	elasticity := uint64(in.Genesis.EIP1559Elasticity)
+	var minBaseFee *uint64
+	if cfg.IsJovian(blockTime) {
+		if in.Genesis.MinBaseFee == nil {
+			return fmt.Errorf("jovian case must set genesis.minBaseFee")
+		}
+		v := uint64(*in.Genesis.MinBaseFee)
+		minBaseFee = &v
+	}
+	var genesisBaseFee *big.Int
+	if in.Genesis.BaseFee != nil {
+		genesisBaseFee = (*big.Int)(in.Genesis.BaseFee)
+	}
+	genesis := &core.Genesis{
+		Config:     cfg,
+		Timestamp:  genesisTime,
+		GasLimit:   uint64(in.Genesis.GasLimit),
+		BaseFee:    genesisBaseFee,
+		Difficulty: big.NewInt(0),
+		ExtraData:  eip1559.EncodeOptimismExtraData(cfg, genesisTime, denom, elasticity, minBaseFee),
+		Alloc:      in.Pre,
+	}
+	signer := types.MakeSigner(cfg, big.NewInt(1), blockTime)
+	rawTxs := make([][]byte, 0, len(in.Transactions))
+	for i := range in.Transactions {
+		tx, _, err := buildTx(&in.Transactions[i], signer, cfg)
+		if err != nil {
+			return fmt.Errorf("tx %d: %w", i, err)
+		}
+		b, err := tx.MarshalBinary()
+		if err != nil {
+			return fmt.Errorf("tx %d MarshalBinary: %w", i, err)
+		}
+		rawTxs = append(rawTxs, b)
+	}
+
+	// PayloadAttributes, fork-gated exactly like checkOptimismPayloadAttributes.
+	gasLimit := uint64(in.Genesis.GasLimit)
+	attrs := &engine.PayloadAttributes{
+		Timestamp:             blockTime,
+		Random:                common.Hash{},
+		SuggestedFeeRecipient: in.Coinbase,
+		GasLimit:              &gasLimit,
+		Transactions:          rawTxs,
+		NoTxPool:              true,
+	}
+	if cfg.IsCanyon(blockTime) {
+		attrs.Withdrawals = []*types.Withdrawal{} // Shanghai twin: non-nil, empty
+	}
+	if cfg.IsCancun(big.NewInt(1), blockTime) {
+		br := in.ParentBeaconBlockRoot
+		attrs.BeaconRoot = &br
+	}
+	if cfg.IsHolocene(blockTime) {
+		attrs.EIP1559Params = eip1559.EncodeHolocene1559Params(denom, elasticity)
+	}
+	attrs.MinBaseFee = minBaseFee
+
+	n, ethsvc, err := startEngineEthService(genesis)
+	if err != nil {
+		return err
+	}
+	defer n.Close()
+	api := catalyst.NewConsensusAPI(ethsvc)
+	ctx := context.Background()
+	fcState := engine.ForkchoiceStateV1{HeadBlockHash: ethsvc.BlockChain().CurrentBlock().Hash()}
+
+	var resp engine.ForkChoiceResponse
+	switch {
+	case version == 2 && fork == "regolith":
+		resp, err = api.ForkchoiceUpdatedV1(ctx, fcState, attrs)
+	case version == 2:
+		resp, err = api.ForkchoiceUpdatedV2(ctx, fcState, attrs)
+	default:
+		resp, err = api.ForkchoiceUpdatedV3(ctx, fcState, attrs)
+	}
+	if err != nil {
+		return fmt.Errorf("forkchoiceUpdated: %w", err)
+	}
+	if resp.PayloadStatus.Status != engine.VALID {
+		return fmt.Errorf("forkchoiceUpdated status %q (want VALID)", resp.PayloadStatus.Status)
+	}
+	if resp.PayloadID == nil {
+		return fmt.Errorf("forkchoiceUpdated returned nil payloadID")
+	}
+	var env *engine.ExecutionPayloadEnvelope
+	switch version {
+	case 2:
+		env, err = api.GetPayloadV2(*resp.PayloadID)
+	case 3:
+		env, err = api.GetPayloadV3(*resp.PayloadID)
+	case 4:
+		env, err = api.GetPayloadV4(*resp.PayloadID)
+	case 5:
+		env, err = api.GetPayloadV5(*resp.PayloadID)
+	default:
+		return fmt.Errorf("unsupported getPayload version V%d", version)
+	}
+	if err != nil {
+		return fmt.Errorf("getPayload V%d: %w", version, err)
+	}
+	if env == nil || env.ExecutionPayload == nil {
+		return fmt.Errorf("getPayload V%d returned no payload", version)
+	}
+	if env.ExecutionPayload.ParentHash != fcState.HeadBlockHash {
+		return fmt.Errorf("payload parent %s != head %s", env.ExecutionPayload.ParentHash, fcState.HeadBlockHash)
+	}
+	if err := writeJSON(outputPath, env); err != nil {
+		return err
+	}
+	fmt.Fprintf(os.Stderr, "opt8n-ref: getPayload V%d %s -> %s (block %s, %d txs, gas %d)\n",
+		version, fork, outputPath, env.ExecutionPayload.BlockHash.Hex(),
+		len(env.ExecutionPayload.Transactions), env.ExecutionPayload.GasUsed)
+	return nil
 }
 
 // ---------------------------------------------------------------------
