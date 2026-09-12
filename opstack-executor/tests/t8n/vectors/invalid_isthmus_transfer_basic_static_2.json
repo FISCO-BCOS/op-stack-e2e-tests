@@ -64,7 +64,7 @@
     },
     "_op_expected": {
       "reject": {
-        "op_geth": "withdrawals must be present and empty on the OP path",
+        "op_geth": "non-empty withdrawals post-Canyon",
         "fisco": {
           "consumer": "engine",
           "classification": "INVALID",

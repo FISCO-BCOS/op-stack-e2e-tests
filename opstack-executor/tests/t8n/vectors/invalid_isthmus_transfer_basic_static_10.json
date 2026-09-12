@@ -57,7 +57,7 @@
     },
     "_op_expected": {
       "reject": {
-        "op_geth": "extraData must be exactly 9 bytes on the OP path (Isthmus)",
+        "op_geth": "holocene extraData should be 9 bytes",
         "fisco": {
           "consumer": "engine",
           "classification": "INVALID",
