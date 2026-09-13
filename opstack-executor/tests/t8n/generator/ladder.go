@@ -253,11 +253,13 @@ func ladderUserDeposit(label string) inputTx {
 var ladderCreateInitCode = hexutil.MustDecode("0x600160005560006000f3")
 
 // shouldEmitPostState 采样点（设计 v2 §3.4）：首块、末块、激活块 ±1、每 100 块。
-func shouldEmitPostState(i, total int, activationBlocks []int) bool {
+// activationIdxs 是 0-based 块索引（不是 ladderActivation.Block 的 1-based
+// 块号）；调用方负责转换。
+func shouldEmitPostState(i, total int, activationIdxs []int) bool {
 	if i == 0 || i == total-1 {
 		return true
 	}
-	for _, fb := range activationBlocks {
+	for _, fb := range activationIdxs {
 		if i >= fb-1 && i <= fb+1 {
 			return true
 		}

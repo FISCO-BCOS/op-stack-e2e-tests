@@ -394,26 +394,29 @@ func generateLadderChain(spec ladderSpec, n int) (*chainOutput, error) {
 
 // generateLadderChainSampled = generateLadderChain + 导出层采样。内部 postState
 // 全量保留（块间 Pre 链与 assertL1BlockConsistency 依赖前块 postState），
-// 只在导出前把未采样块置 nil。
-func generateLadderChainSampled(spec ladderSpec, n int) (*chainOutput, []int, error) {
+// 只在导出前把未采样块置 nil。采样集只以 out.SampledBlocks 为唯一真相。
+func generateLadderChainSampled(spec ladderSpec, n int) (*chainOutput, error) {
 	out, err := generateLadderChain(spec, n)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	var activationBlocks []int
+	// ladderActivation.Block 是 1-based 块号（Timestamp = ladderGenesisTime +
+	// ladderBlockInterval*Block），而 out.Blocks 是 0-based 索引：block i 的
+	// 时间是 genesis+10*(i+1)，故激活块 Block 对应索引 Block-1。
+	var activationIdxs []int
 	for _, a := range spec.Activations {
 		if a.Block > 0 {
-			activationBlocks = append(activationBlocks, a.Block)
+			activationIdxs = append(activationIdxs, a.Block-1)
 		}
 	}
 	var sampled []int
 	for i := range out.Blocks {
-		if shouldEmitPostState(i, n, activationBlocks) {
+		if shouldEmitPostState(i, n, activationIdxs) {
 			sampled = append(sampled, i)
 		} else {
 			out.Blocks[i].PostState = nil
 		}
 	}
 	out.SampledBlocks = sampled
-	return out, sampled, nil
+	return out, nil
 }

@@ -414,11 +414,15 @@ func TestLadderCreateProbeSmoke(t *testing.T) {
 func TestLadderPostStateSampling(t *testing.T) {
 	// 采样点（设计 v2 §3.4）：首块、末块、激活块±1、每 100 块。
 	// 注意 ladder 必须落在同一 L1Block 布局族内（当前仅 regolith..canyon 可生成）。
+	//
+	// ladderActivation.Block 是 1-based 块号（canyon@50 => Timestamp=1500），
+	// block i 的时间是 genesis+10*(i+1)，故激活块 = 索引 49：48 是激活前一块、
+	// 49 是激活块、50 是激活后一块。采样集应为 {0,48,49,50,100,119}。
 	spec, err := parseLadderFlag("0:regolith,50:canyon", 120)
 	if err != nil {
 		t.Fatal(err)
 	}
-	out, sampled, err := generateLadderChainSampled(spec, 120)
+	out, err := generateLadderChainSampled(spec, 120)
 	if err != nil {
 		t.Fatalf("generateLadderChainSampled: %v", err)
 	}
@@ -426,13 +430,15 @@ func TestLadderPostStateSampling(t *testing.T) {
 		t.Fatalf("want 120 blocks, got %d", len(out.Blocks))
 	}
 	sampledSet := map[int]bool{}
-	for _, s := range sampled {
+	for _, s := range out.SampledBlocks {
 		sampledSet[s] = true
 	}
-	for _, must := range []int{0, 49, 50, 51, 100, 119} {
-		if !sampledSet[must] {
-			t.Fatalf("block %d must be sampled", must)
-		}
+	// 精确采样集（升序）：0/119 首末，48/49/50 激活窗口（48=激活前一块、
+	// 49=激活块、50=激活后一块），100 每百。精确相等才能同时抓出窗口左移
+	// （漏 48）与右移（多 51）。
+	wantSampled := []int{0, 48, 49, 50, 100, 119}
+	if !reflect.DeepEqual(out.SampledBlocks, wantSampled) {
+		t.Fatalf("sampled blocks: want %v, got %v", wantSampled, out.SampledBlocks)
 	}
 	if sampledSet[1] {
 		t.Fatalf("block 1 must NOT be sampled (not a boundary, not %%100)")
@@ -444,15 +450,38 @@ func TestLadderPostStateSampling(t *testing.T) {
 			t.Fatalf("block %d: sampled=%v but postState-empty=%v", i, sampledSet[i], empty)
 		}
 	}
-	if len(out.SampledBlocks) != len(sampled) {
-		t.Fatalf("SampledBlocks mismatch: %d vs %d", len(out.SampledBlocks), len(sampled))
+
+	// 内部全量链未被采样破坏：全量版每块 postState 非空；逐块除 PostState 外
+	// 与采样版 DeepEqual；每个采样块的 postState 与全量版对应块相等。这锚定
+	// 了块间 Pre 链（采样在 generateLadderChain 返回后才置 nil）。
+	full, err := generateLadderChain(spec, 120)
+	if err != nil {
+		t.Fatalf("generateLadderChain: %v", err)
+	}
+	if len(full.Blocks) != 120 {
+		t.Fatalf("full: want 120 blocks, got %d", len(full.Blocks))
+	}
+	for i := range full.Blocks {
+		if len(full.Blocks[i].PostState) == 0 {
+			t.Fatalf("full chain block %d has empty postState", i)
+		}
+	}
+	for i := range out.Blocks {
+		if sampledSet[i] && !reflect.DeepEqual(out.Blocks[i].PostState, full.Blocks[i].PostState) {
+			t.Fatalf("sampled block %d postState differs from full chain", i)
+		}
+		sb, fb := out.Blocks[i], full.Blocks[i]
+		sb.PostState = fb.PostState // the ONLY intended difference
+		if !reflect.DeepEqual(sb, fb) {
+			t.Fatalf("block %d differs from full chain outside postState", i)
+		}
 	}
 }
 
 func TestLadderWithdrawalReceiptCarriesLogs(t *testing.T) {
 	// canyon 段的 withdrawal 会产生 MessagePassed 事件 → 回执 logs 必须被导出，
-	// 且地址必须是全小写 hex（Go 的 Address.Hex() 是 EIP-55 混合大小写，
-	// FISCO 侧 bcos::toHex 全小写——不归一化会导致对拍必红）。
+	// 且 address/topics/data 必须是全小写 hex（Go 的 Address.Hex() 是 EIP-55
+	// 混合大小写，FISCO 侧 bcos::toHex 全小写——不归一化会导致对拍必红）。
 	spec, err := parseLadderFlag("0:regolith,2:canyon", 4)
 	if err != nil {
 		t.Fatal(err)
@@ -462,20 +491,25 @@ func TestLadderWithdrawalReceiptCarriesLogs(t *testing.T) {
 		t.Fatalf("generateLadderChain: %v", err)
 	}
 	wantAddr := "0x" + common.Bytes2Hex(messagePasserAddr.Bytes())
-	found := false
+	// MessagePassed(address,address,uint256,uint256,bytes) 事件签名 hash，
+	// 全链常量（实测 receipt 值，见 report）。
+	const messagePassedTopic0 = "0x02a52367d10742d8032712c1bb8e0144ff1ec5ffda1ed7d70bb05a2744955054"
+
+	// 格式校验在地址过滤之前做，否则 "address == wantAddr" 蕴含
+	// "address == ToLower(address)"，lowercase 断言恒假（死代码）。
 	for _, blk := range out.Blocks {
-		for _, r := range blk.OpExpected.Receipts {
+		for ri, r := range blk.OpExpected.Receipts {
+			if r.LogsCount != len(r.Logs) {
+				t.Fatalf("receipt %d: logsCount %d != len(logs) %d", ri, r.LogsCount, len(r.Logs))
+			}
 			for _, l := range r.Logs {
-				if l.Address != wantAddr {
-					continue
-				}
-				found = true
-				if l.Address != strings.ToLower(l.Address) {
-					t.Fatalf("log address not lowercase: %s", l.Address)
+				if !strings.HasPrefix(l.Address, "0x") || len(l.Address) != 42 ||
+					l.Address != strings.ToLower(l.Address) {
+					t.Fatalf("bad log address hex: %s", l.Address)
 				}
 				for _, topic := range l.Topics {
-					if topic != strings.ToLower(topic) || !strings.HasPrefix(topic, "0x") ||
-						len(topic) != 66 {
+					if !strings.HasPrefix(topic, "0x") || len(topic) != 66 ||
+						topic != strings.ToLower(topic) {
 						t.Fatalf("bad topic hex: %s", topic)
 					}
 				}
@@ -485,7 +519,29 @@ func TestLadderWithdrawalReceiptCarriesLogs(t *testing.T) {
 			}
 		}
 	}
-	if !found {
-		t.Fatalf("no MessagePassed log found for %s across %d blocks", wantAddr, len(out.Blocks))
+
+	// Canyon 块 1..3 的 withdrawal 是块内最后一笔（idx 3），其回执恰好携带
+	// 一条 MessagePassed log：地址 = L2ToL1MessagePasser，4 个 topic，
+	// topics[0] = 事件签名。这是对 "logs 真的被导出且内容正确" 的硬锚。
+	for blk := 1; blk <= 3; blk++ {
+		rs := out.Blocks[blk].OpExpected.Receipts
+		if len(rs) != 4 {
+			t.Fatalf("block %d: want 4 receipts (attrs+deposit+transfer+withdrawal), got %d", blk, len(rs))
+		}
+		r := rs[3]
+		if r.LogsCount != 1 || len(r.Logs) != 1 {
+			t.Fatalf("block %d withdrawal receipt: want exactly 1 log, got logsCount=%d len=%d",
+				blk, r.LogsCount, len(r.Logs))
+		}
+		l := r.Logs[0]
+		if l.Address != wantAddr {
+			t.Fatalf("block %d log address: want %s, got %s", blk, wantAddr, l.Address)
+		}
+		if len(l.Topics) != 4 {
+			t.Fatalf("block %d MessagePassed topics: want 4, got %d", blk, len(l.Topics))
+		}
+		if l.Topics[0] != messagePassedTopic0 {
+			t.Fatalf("block %d topic0: want %s, got %s", blk, messagePassedTopic0, l.Topics[0])
+		}
 	}
 }

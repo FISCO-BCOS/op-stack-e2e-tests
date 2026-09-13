@@ -2225,9 +2225,13 @@ func l1FeeOfTransfer(receipts types.Receipts) *big.Int {
 // per-block files of runChainPair (:1546). The replayer (OpT8nReplayTest.cpp
 // replayChainVector :1044) inherits the running chain state across blocks:
 // blocks[0] carries `pre`, blocks[i>0] emit NO pre (null/absent -- a real pre
-// object would reset the state). Each block MUST carry its own
-// _op_expected.header/receipts + postState (Task 1 handoff: replaySingleBlockInto
-// reads them with .at(), missing = out_of_range). Recipe constraint (review
+// object would reset the state). generateChainN (legacy chain mode) blocks
+// always carry their own _op_expected.header/receipts + postState (Task 1
+// handoff: replaySingleBlockInto reads them with .at(), missing = out_of_range).
+// Ladder vectors from generateLadderChainSampled intentionally omit postState
+// on unsampled blocks (json omitempty); consumers MUST treat an absent
+// postState as "not sampled" and consult chainOutput.sampledBlocks (absent
+// sampledBlocks = every block sampled, the legacy shape). Recipe constraint (review
 // R13): chain blocks must not read historical blockhashes (ParentOnlyBlockHashes
 // only answers number-1) -- the attributes-deposit + transfer recipe is safe.
 // ---------------------------------------------------------------------
