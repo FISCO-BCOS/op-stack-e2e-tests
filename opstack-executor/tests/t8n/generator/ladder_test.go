@@ -411,6 +411,44 @@ func TestLadderCreateProbeSmoke(t *testing.T) {
 	}
 }
 
+func TestLadderPostStateSampling(t *testing.T) {
+	// 采样点（设计 v2 §3.4）：首块、末块、激活块±1、每 100 块。
+	// 注意 ladder 必须落在同一 L1Block 布局族内（当前仅 regolith..canyon 可生成）。
+	spec, err := parseLadderFlag("0:regolith,50:canyon", 120)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, sampled, err := generateLadderChainSampled(spec, 120)
+	if err != nil {
+		t.Fatalf("generateLadderChainSampled: %v", err)
+	}
+	if len(out.Blocks) != 120 {
+		t.Fatalf("want 120 blocks, got %d", len(out.Blocks))
+	}
+	sampledSet := map[int]bool{}
+	for _, s := range sampled {
+		sampledSet[s] = true
+	}
+	for _, must := range []int{0, 49, 50, 51, 100, 119} {
+		if !sampledSet[must] {
+			t.Fatalf("block %d must be sampled", must)
+		}
+	}
+	if sampledSet[1] {
+		t.Fatalf("block 1 must NOT be sampled (not a boundary, not %%100)")
+	}
+	// 导出层：未采样块 postState 为空，采样块非空
+	for i := range out.Blocks {
+		empty := len(out.Blocks[i].PostState) == 0
+		if empty == sampledSet[i] {
+			t.Fatalf("block %d: sampled=%v but postState-empty=%v", i, sampledSet[i], empty)
+		}
+	}
+	if len(out.SampledBlocks) != len(sampled) {
+		t.Fatalf("SampledBlocks mismatch: %d vs %d", len(out.SampledBlocks), len(sampled))
+	}
+}
+
 func TestLadderWithdrawalReceiptCarriesLogs(t *testing.T) {
 	// canyon 段的 withdrawal 会产生 MessagePassed 事件 → 回执 logs 必须被导出，
 	// 且地址必须是全小写 hex（Go 的 Address.Hex() 是 EIP-55 混合大小写，

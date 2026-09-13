@@ -2239,7 +2239,7 @@ type chainBlockOutput struct {
 	Env        outputEnv                         `json:"env"`
 	Pre        *map[common.Address]outputAccount `json:"pre,omitempty"`
 	Block      outputBlock                       `json:"block"`
-	PostState  types.GenesisAlloc                `json:"postState"`
+	PostState  types.GenesisAlloc                `json:"postState,omitempty"`
 	OpExpected opExpected                        `json:"_op_expected"`
 }
 
@@ -2248,6 +2248,8 @@ type chainBlockOutput struct {
 // as every other vector.
 type chainOutput struct {
 	Blocks []chainBlockOutput `json:"blocks"`
+	// postState 采样块号列表（设计 v2 §3.4/§4.3）；缺省（旧向量）= 每块都采样。
+	SampledBlocks []int `json:"sampledBlocks,omitempty"`
 }
 
 // chainContext is the internal (non-JSON) chain result the fork/break arms

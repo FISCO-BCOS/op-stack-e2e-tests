@@ -251,3 +251,16 @@ func ladderUserDeposit(label string) inputTx {
 // ladderCreateInitCode: PUSH1 1 PUSH1 0 SSTORE; PUSH1 0 PUSH1 0 RETURN
 // （init 阶段写 slot 0 = 1，runtime 为空；created 账户 slot 0 需声明）。
 var ladderCreateInitCode = hexutil.MustDecode("0x600160005560006000f3")
+
+// shouldEmitPostState 采样点（设计 v2 §3.4）：首块、末块、激活块 ±1、每 100 块。
+func shouldEmitPostState(i, total int, activationBlocks []int) bool {
+	if i == 0 || i == total-1 {
+		return true
+	}
+	for _, fb := range activationBlocks {
+		if i >= fb-1 && i <= fb+1 {
+			return true
+		}
+	}
+	return i%100 == 0
+}

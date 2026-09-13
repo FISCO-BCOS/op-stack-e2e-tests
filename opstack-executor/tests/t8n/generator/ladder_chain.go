@@ -391,3 +391,29 @@ func generateLadderChain(spec ladderSpec, n int) (*chainOutput, error) {
 	}
 	return out, nil
 }
+
+// generateLadderChainSampled = generateLadderChain + 导出层采样。内部 postState
+// 全量保留（块间 Pre 链与 assertL1BlockConsistency 依赖前块 postState），
+// 只在导出前把未采样块置 nil。
+func generateLadderChainSampled(spec ladderSpec, n int) (*chainOutput, []int, error) {
+	out, err := generateLadderChain(spec, n)
+	if err != nil {
+		return nil, nil, err
+	}
+	var activationBlocks []int
+	for _, a := range spec.Activations {
+		if a.Block > 0 {
+			activationBlocks = append(activationBlocks, a.Block)
+		}
+	}
+	var sampled []int
+	for i := range out.Blocks {
+		if shouldEmitPostState(i, n, activationBlocks) {
+			sampled = append(sampled, i)
+		} else {
+			out.Blocks[i].PostState = nil
+		}
+	}
+	out.SampledBlocks = sampled
+	return out, sampled, nil
+}
