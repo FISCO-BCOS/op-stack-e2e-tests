@@ -58,6 +58,20 @@ command -v go >/dev/null 2>&1 || { echo "需要 Go 工具链（regen.sh 要在 o
 #   - 已就位但 pin 不符：
 #       用户显式传入（$USER_OPGETH）→ 视为自有 checkout，直接报错，绝不删除；
 #       脚本自管缓存目录 → 视为陈旧缓存，rm -rf 后重建。
+# 浅取精确 SHA 偶发被 GitHub 以「upload-pack: not our ref」拒绝（同一 pin 在另一 runner/副本
+# 上可成功）——重试 3 次，每次间隔 5s；仍失败则按原样报错退出。
+fetch_pin() {  # <repo> <pin>
+  local repo="$1" pin="$2" attempt
+  for attempt in 1 2 3; do
+    if git -C "$repo" fetch --depth 1 origin "$pin"; then
+      return 0
+    fi
+    echo "WARNING: shallow fetch of ${pin:0:8} into $repo failed (attempt $attempt/3); retrying" >&2
+    sleep 5
+  done
+  git -C "$repo" fetch --depth 1 origin "$pin"   # 最后一次不吞错误码
+}
+
 ensure_opgeth() {
   local existing=""
   [ -d "$OPGETH/.git" ] && existing="$(git -C "$OPGETH" rev-parse HEAD 2>/dev/null || true)"
@@ -73,7 +87,7 @@ ensure_opgeth() {
     rm -rf "$OPGETH"
     echo "克隆 op-geth@${PIN:0:8} -> $OPGETH"
     git clone --filter=blob:none https://github.com/ethereum-optimism/op-geth "$OPGETH"
-    git -C "$OPGETH" fetch --depth 1 origin "$PIN"
+    fetch_pin "$OPGETH" "$PIN"
     git -C "$OPGETH" checkout FETCH_HEAD
   fi
 }
@@ -101,7 +115,7 @@ ensure_op_node() {
     rm -rf "$OP_NODE_REPO"
     echo "克隆 optimism@${OP_NODE_PIN:0:8} -> $OP_NODE_REPO"
     git clone --filter=blob:none https://github.com/ethereum-optimism/optimism.git "$OP_NODE_REPO"
-    git -C "$OP_NODE_REPO" fetch --depth 1 origin "$OP_NODE_PIN"
+    fetch_pin "$OP_NODE_REPO" "$OP_NODE_PIN"
     git -C "$OP_NODE_REPO" checkout --detach "$OP_NODE_PIN"
   fi
 }
