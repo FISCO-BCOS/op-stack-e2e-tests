@@ -168,6 +168,12 @@ func TestParseLadderFlagNormalization(t *testing.T) {
 // blockIdx%100==0; granite/holocene carry the bn256-pairing probe,
 // isthmus/jovian the P256VERIFY probe, all other forks none.
 func TestRecipeForTable(t *testing.T) {
+	// Independent floor for the pairing probe gas: the probe must clear
+	// intrinsic(23304 for a 192B input) + 45000 + 34000/pair to actually run
+	// the pairing. Anchored to literals so reverting the constant regresses.
+	if ladderBn256PairingProbeGas <= 102_304 {
+		t.Fatalf("pairing probe gas %d cannot execute 1 pair", ladderBn256PairingProbeGas)
+	}
 	pairingAddr := common.BytesToAddress(addrBytes(preBn256Pairing))
 	p256Addr := common.BytesToAddress(addrBytes(preP256Verify))
 	for _, fork := range ladderForks {
@@ -263,9 +269,6 @@ func TestWithdrawalSlotsDeterministic(t *testing.T) {
 	if a1 != c1 || a1 != slot1 {
 		t.Fatalf("msgNonce declaration slot must be slot 1 for every k: k=1 %s, k=2 %s", a1, c1)
 	}
-	if a1 != common.BigToHash(big.NewInt(1)) {
-		t.Fatalf("k=1 msgNonce declaration slot: want slot 1, got %s", a1)
-	}
 	if a2 == c2 {
 		t.Fatalf("k=2 sentMessages slot == k=1 (%s)", a2)
 	}
@@ -337,14 +340,26 @@ func TestLadderCanyonWithdrawalSmoke(t *testing.T) {
 	if got := acc.Storage[slot1]; got != common.BigToHash(big.NewInt(3)) {
 		t.Fatalf("msgNonce slot 1: want 3, got %s", got.Hex())
 	}
+	// Every withdrawal's dynamic sentMessages[withdrawalHash] slot must also be
+	// present (a task requirement): k=1..3 -> slot1 + 3 sent slots = 4.
+	for k := 1; k <= 3; k++ {
+		_, slotB := withdrawalSlots(k)
+		if got := acc.Storage[slotB]; got != common.BigToHash(big.NewInt(1)) {
+			t.Fatalf("sentMessages slot for withdrawal %d: want 0x1, got %s", k, got.Hex())
+		}
+	}
+	if len(acc.Storage) != 4 {
+		t.Fatalf("MessagePasser storage: want 4 slots (msgNonce + 3 sentMessages), got %d", len(acc.Storage))
+	}
 }
 
 // TestLadderCreateProbeSmoke exercises the create:true recipe arm: with a
 // 101-block canyon-family ladder, block index 100 (100>0 && %100==0) carries
-// the EIP-1559 CREATE probe. Generation succeeding proves the declared slot /
-// created-address pairing is exact -- a wrong crypto.CreateAddress would leave
-// the real created account's slot 0 undeclared and emitPostState would
-// hard-fail. (The create rule is fork-independent, so it IS reachable today
+// the EIP-1559 CREATE probe. The create tx's nonce re-derives the created
+// address, and the postState must carry that account with its init-phase
+// slot 0 = 1 -- without this the test would stay green even if the create
+// silently reverted/OOG'd (the ExtraStorage declaration for the wrong address
+// is inert). (The create rule is fork-independent, so it IS reachable today
 // inside the one layout family the guard allows.)
 func TestLadderCreateProbeSmoke(t *testing.T) {
 	const n = 101
@@ -357,6 +372,7 @@ func TestLadderCreateProbeSmoke(t *testing.T) {
 		t.Fatalf("generateLadderChain: %v", err)
 	}
 	found := false
+	var createNonce uint64
 	for _, raw := range out.Blocks[100].Block.Transactions {
 		var st outputSignedTx
 		if err := json.Unmarshal(raw, &st); err != nil {
@@ -364,11 +380,24 @@ func TestLadderCreateProbeSmoke(t *testing.T) {
 		}
 		if st.OpType == "eip1559" && st.To == nil {
 			found = true
+			createNonce = uint64(st.Nonce)
 			break
 		}
 	}
 	if !found {
 		t.Fatal("block 100 (blockIdx%100==0) carries no create tx (eip1559 to == null)")
+	}
+	// Re-derive the created address from the create tx's nonce and assert the
+	// account + its init-phase slot 0 actually landed: a silently-reverted/OOG
+	// create would still pass the tx-scan above (the ExtraStorage declaration
+	// for a wrong address is inert), so this is the real anchor.
+	created := crypto.CreateAddress(addrOfKey(1), createNonce)
+	acc, ok := out.Blocks[100].PostState[created]
+	if !ok {
+		t.Fatalf("created account %s missing from block 100 postState", created.Hex())
+	}
+	if got := acc.Storage[common.Hash{}]; got != common.BigToHash(big.NewInt(1)) {
+		t.Fatalf("created account slot0: want 0x1, got %s", got.Hex())
 	}
 	// No create probe before block 100.
 	for _, raw := range out.Blocks[99].Block.Transactions {
