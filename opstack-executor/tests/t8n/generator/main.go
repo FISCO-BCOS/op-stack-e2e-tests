@@ -3755,6 +3755,37 @@ func assertL1BlockConsistency(cfg *params.ChainConfig, in *inputCase) error {
 	jovianCfg := cfg.IsJovian(blockTime)
 	layout := forkLayout(blockFork(cfg, blockTime))
 
+	// S7: the Ecotone ACTIVATION block still carries the pre-Ecotone Bedrock
+	// attributes form (setL1BlockValues) because the L1Block upgrade lands later
+	// in the same block (specs/protocol/ecotone/l1-attributes.md:15-20, :112-119).
+	// op-geth accepts it by calldata selector (rollup_cost.go:426-431) and its
+	// execution-side cost function picks Bedrock while the Ecotone slots are
+	// unset (firstEcotoneBlock, rollup_cost.go:174-179). This is the ONE place
+	// the otherwise-forbidden first-Ecotone fallback state is REQUIRED, so detect
+	// exactly (genesis < EcotoneTime <= blockTime) + a Bedrock-shaped 260B
+	// calldata, validate the Bedrock slot mirror, and require the Ecotone slots
+	// to stay zero. Every other post-Ecotone block keeps the 164B rule and the
+	// fallback trap guard below.
+	genesisTime := uint64(in.Genesis.Timestamp)
+	ecotoneActivationBlock := cfg.EcotoneTime != nil &&
+		genesisTime < *cfg.EcotoneTime && *cfg.EcotoneTime <= blockTime
+	if ecotoneActivationBlock && len(data) == 4+32*8 && bytes.Equal(data[0:4], types.BedrockL1AttributesSelector) {
+		slot5, slot6 := slot(5), slot(6)
+		if !bytes.Equal(slot1[:], data[68:100]) {
+			return fmt.Errorf("activation-block slot1 (l1BaseFee) %x != calldata[68:100] %x", slot1, data[68:100])
+		}
+		if !bytes.Equal(slot5[:], data[196:228]) {
+			return fmt.Errorf("activation-block slot5 (overhead) %x != calldata[196:228] %x", slot5, data[196:228])
+		}
+		if !bytes.Equal(slot6[:], data[228:260]) {
+			return fmt.Errorf("activation-block slot6 (scalar) %x != calldata[228:260] %x", slot6, data[228:260])
+		}
+		if slot7 != (common.Hash{}) || !isZero(slot3[16:24]) {
+			return fmt.Errorf("Ecotone activation block must leave the Ecotone slots unset (slot7/blobBaseFee and slot3 scalars zero) so op-geth selects the Bedrock cost function; got slot7=%x slot3[16:24]=%x", slot7, slot3[16:24])
+		}
+		return nil
+	}
+
 	checkCommon := func(layout l1AttributesLayout) error {
 		if !bytes.Equal(slot1[:], data[36:68]) {
 			return fmt.Errorf("slot1 (l1BaseFee) %x != calldata[36:68] %x", slot1, data[36:68])
@@ -3780,7 +3811,8 @@ func assertL1BlockConsistency(cfg *params.ChainConfig, in *inputCase) error {
 		}
 		// First-Ecotone fallback trap (rollup_cost.go:169-179): blob slot and
 		// BOTH 4-byte scalars all zero would silently select the Bedrock cost
-		// function. Forbidden corpus-wide.
+		// function. Forbidden corpus-wide -- EXCEPT at the Ecotone activation
+		// block, which is handled (and requires exactly this state) above.
 		if slot7 == (common.Hash{}) && isZero(slot3[16:24]) {
 			return fmt.Errorf("first-Ecotone fallback trap: slot7 and both slot3 scalars are all zero")
 		}

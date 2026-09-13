@@ -10,6 +10,7 @@ package main
 // implementation it goes green.
 
 import (
+	"bytes"
 	"encoding/json"
 	"math/big"
 	"strings"
@@ -808,5 +809,153 @@ func TestInvalidTxManualTxRootAndBlockHash(t *testing.T) {
 		if !ok || !strings.HasPrefix(root, "0x") || len(root) != 66 {
 			t.Fatalf("%s: placeholder stateRoot malformed: %v", tc.kind, doc.OpPayload["stateRoot"])
 		}
+	}
+}
+
+// ---------------------------------------------------------------------
+// S7 corpus additions (WI-E3 Regolith boundary, WI-E11 Ecotone activation
+// block). These pin the generator-side shape AND the op-geth oracle's
+// activation-block receipt signature; the emitted vectors/goldens are what the
+// C++ differential gate consumes.
+// ---------------------------------------------------------------------
+
+// TestBoundaryRegolithLastShape: genesis Regolith with CanyonTime=2000 in the
+// future -> the single block (ts 1010) stays in the Regolith period; the L2
+// block-timestamp activation rule leaves the Bedrock 260B attributes form in
+// place, and the config must round-trip through the generator's consistency gate.
+func TestBoundaryRegolithLastShape(t *testing.T) {
+	in, err := buildCaseFromSpecs("boundary_regolith_last", "regolith")
+	if err != nil {
+		t.Fatalf("buildCaseFromSpecs: %v", err)
+	}
+	if in.Info.Hardfork != "regolith" {
+		t.Fatalf("_info.hardfork want regolith, got %q", in.Info.Hardfork)
+	}
+	if got := in.Info.Activations["canyon"]; got != 2000 {
+		t.Fatalf("activations[canyon] want 2000, got %d", got)
+	}
+	cfg, err := buildConfigForCase(&in)
+	if err != nil {
+		t.Fatalf("buildConfigForCase: %v", err)
+	}
+	if cfg.CanyonTime == nil || *cfg.CanyonTime != 2000 {
+		t.Fatalf("CanyonTime want 2000, got %v", cfg.CanyonTime)
+	}
+	if cfg.IsCanyon(1010) {
+		t.Fatal("block 1010 must remain pre-Canyon (scheduled, not fired)")
+	}
+	if got := blockFork(cfg, 1010); got != "regolith" {
+		t.Fatalf("blockFork(1010) want regolith, got %q", got)
+	}
+	if err := assertL1BlockConsistency(cfg, &in); err != nil {
+		t.Fatalf("consistency: %v", err)
+	}
+	data := []byte(in.Transactions[0].Data)
+	if len(data) != 4+32*8 {
+		t.Fatalf("attributes want Bedrock 260B, got %d bytes", len(data))
+	}
+	if !bytes.Equal(data[0:4], types.BedrockL1AttributesSelector) {
+		t.Fatalf("attributes selector want Bedrock, got %x", data[0:4])
+	}
+}
+
+// TestEcotoneActivationBlockShape: genesis Canyon, the single block crosses
+// EcotoneTime=1005, but the L1 attributes deposit still uses the pre-Ecotone
+// setL1BlockValues form (Bedrock 260B, Ecotone slots unset). The generator's
+// consistency gate must accept exactly this activation-block carve-out, and the
+// op-geth oracle must derive the LEGACY receipt fields (FeeScalar present;
+// Ecotone base-fee scalars absent) -- the pre-Ecotone extractL1GasParams path.
+func TestEcotoneActivationBlockShape(t *testing.T) {
+	in, err := buildCaseFromSpecs("boundary_ecotone_activation", "canyon")
+	if err != nil {
+		t.Fatalf("buildCaseFromSpecs: %v", err)
+	}
+	if in.Info.Hardfork != "ecotone" {
+		t.Fatalf("_info.hardfork want ecotone, got %q", in.Info.Hardfork)
+	}
+	if got := in.Info.Activations["ecotone"]; got != 1005 {
+		t.Fatalf("activations[ecotone] want 1005, got %d", got)
+	}
+	cfg, err := buildConfigForCase(&in)
+	if err != nil {
+		t.Fatalf("buildConfigForCase: %v", err)
+	}
+	if cfg.EcotoneTime == nil || *cfg.EcotoneTime != 1005 {
+		t.Fatalf("EcotoneTime want 1005, got %v", cfg.EcotoneTime)
+	}
+	if !cfg.IsEcotone(1010) {
+		t.Fatal("block 1010 must be Ecotone")
+	}
+	if got := blockFork(cfg, 1010); got != "ecotone" {
+		t.Fatalf("blockFork(1010) want ecotone, got %q", got)
+	}
+	data := []byte(in.Transactions[0].Data)
+	if len(data) != 4+32*8 || !bytes.Equal(data[0:4], types.BedrockL1AttributesSelector) {
+		t.Fatalf("activation block must carry the Bedrock 260B 0x015d8eb9 attributes, got %d bytes selector %x", len(data), data[0:4])
+	}
+	if in.Transactions[len(in.Transactions)-1].OpType == "deposit" {
+		t.Fatal("activation block needs a trailing non-deposit tx so op-geth derives L1 receipt fields")
+	}
+	if err := assertL1BlockConsistency(cfg, &in); err != nil {
+		t.Fatalf("activation-block consistency (carve-out) failed: %v", err)
+	}
+
+	// Oracle: run the real op-geth pipeline and inspect the emitted receipts.
+	raw, _, err := processBlockVector(&in, "canyon_boundary_ecotone_activation")
+	if err != nil {
+		t.Fatalf("processBlockVector: %v", err)
+	}
+	var doc struct {
+		OpExpected struct {
+			Receipts []struct {
+				Type                  string  `json:"type"`
+				OpL1FeeScalar         *string `json:"_op_l1_fee_scalar"`
+				OpL1BaseFeeScalar     *string `json:"_op_l1_base_fee_scalar"`
+				OpL1BlobBaseFeeScalar *string `json:"_op_l1_blob_base_fee_scalar"`
+				OpL1GasUsed           *string `json:"_op_l1_gas_used"`
+			} `json:"receipts"`
+		} `json:"_op_expected"`
+	}
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatalf("unmarshal vector: %v", err)
+	}
+	if len(doc.OpExpected.Receipts) != 2 {
+		t.Fatalf("want 2 receipts (attributes deposit + transfer), got %d", len(doc.OpExpected.Receipts))
+	}
+	r := doc.OpExpected.Receipts[1]
+	if r.OpL1GasUsed == nil {
+		t.Fatal("activation-block transfer receipt missing _op_l1_gas_used")
+	}
+	if r.OpL1FeeScalar == nil {
+		t.Fatal("activation-block transfer receipt must carry the LEGACY _op_l1_fee_scalar (pre-Ecotone extract path)")
+	}
+	if r.OpL1BaseFeeScalar != nil || r.OpL1BlobBaseFeeScalar != nil {
+		t.Fatalf("activation-block transfer receipt must NOT carry Ecotone scalars (got base=%v blob=%v)",
+			r.OpL1BaseFeeScalar, r.OpL1BlobBaseFeeScalar)
+	}
+}
+
+// TestEcotoneSteadyStateRejectsBedrockAttributes: off the activation block the
+// 164B rule must still bind -- a post-Ecotone steady-state block handed the
+// Bedrock-form attributes is rejected (the carve-out is scoped to the first
+// Ecotone block only).
+func TestEcotoneSteadyStateRejectsBedrockAttributes(t *testing.T) {
+	in, err := buildCaseFromSpecs("deposit_only", "ecotone")
+	if err != nil {
+		t.Fatalf("buildCaseFromSpecs: %v", err)
+	}
+	cfg, err := buildConfigForCase(&in)
+	if err != nil {
+		t.Fatalf("buildConfigForCase: %v", err)
+	}
+	if cfg.EcotoneTime == nil || *cfg.EcotoneTime != 0 {
+		t.Fatalf("pure ecotone config must have EcotoneTime=0, got %v", cfg.EcotoneTime)
+	}
+	if err := assertL1BlockConsistency(cfg, &in); err != nil {
+		t.Fatalf("baseline steady-state case must pass: %v", err)
+	}
+	in.Transactions[0].Data = defaultFeeParams().attributesData("canyon") // Bedrock 260B
+	if err := assertL1BlockConsistency(cfg, &in); err == nil {
+		t.Fatal("expected rejection of Bedrock-form attributes on a post-activation Ecotone block")
 	}
 }

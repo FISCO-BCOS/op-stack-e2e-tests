@@ -696,6 +696,51 @@ func upgradeFrame(baseFork, name, desc string, fp feeParams, gasLimit uint64, ac
 	return c
 }
 
+// activationBlockFrame assembles the fork-ACTIVATION-block skeleton (S7): genesis
+// in baseFork, a single block (timestamp = genesis+10 = 1010) crossing into
+// activationFork at activationT (1000 < T <= 1010). Unlike upgradeFrame, it does
+// NOT rebuild the L1-attributes calldata / L1Block state under the activation
+// fork: the activation block itself still carries the PREVIOUS fork's form. The
+// canonical instance is the Ecotone activation block, which MUST still call the
+// pre-Ecotone setL1BlockValues (Bedrock 260B 0x015d8eb9) because the L1Block
+// upgrade lands later in the same block
+// (specs/protocol/ecotone/l1-attributes.md:15-20, :112-119); only the NEXT block
+// uses setL1BlockValuesEcotone. op-geth recognises the form both by calldata
+// selector (core/types/rollup_cost.go:426-431) and, for the execution-side cost
+// function, by the Ecotone slots still being unset
+// (rollup_cost.go:174-179 firstEcotoneBlock), which is exactly what the
+// Bedrock-form slot seeding produces.
+//
+// _info.hardfork carries the BLOCK-TIME fork (the activation target), matching
+// upgradeFrame's metadata contract: the C++ differential replayer selects its
+// chain config from _info.hardfork ONLY, so the block must replay under the
+// activation fork's config. buildConfigForCase derives the same config as
+// (baseFork + activations) would.
+func activationBlockFrame(baseFork, name, desc string, fp feeParams, gasLimit uint64, activationFork string, activationT uint64) inputCase {
+	c := caseFrame(baseFork, name, desc, fp, gasLimit) // base-fork attributes + L1Block stay untouched
+	c.Info.Activations = map[string]uint64{}
+	started := false
+	for _, f := range opForkOrder {
+		if !started {
+			if f == baseFork {
+				started = true
+			}
+			continue
+		}
+		c.Info.Activations[f] = activationT
+		if f == activationFork {
+			break
+		}
+	}
+	if activationFork == "jovian" {
+		// EncodeOptimismExtraData panics on nil minBaseFee for Jovian BLOCKS;
+		// kept for parity with upgradeFrame (no Jovian caller today).
+		c.Genesis.MinBaseFee = hd64(0)
+	}
+	c.Info.Hardfork = activationFork
+	return c
+}
+
 func fund(c *inputCase, key byte, amount *big.Int) {
 	c.Pre[addrOfKey(key)] = types.Account{Balance: amount}
 }
@@ -1603,6 +1648,26 @@ var caseSpecs = []caseSpec{
 	// _info.activations. buildConfigForCase routes those through
 	// buildChainConfigSpec; the block itself executes under the genesis fork.
 
+	{"boundary_regolith_last", []string{"regolith"}, func(fork string) inputCase {
+		// Regolith fork-period block: genesis Regolith, CanyonTime=2000 > block
+		// time 1010 -- London EVM, Bedrock attributes (260B 0x015d8eb9) and the
+		// Regolith-corrected Bedrock L1 formula (isRegolith=true; rollup_cost.go
+		// :295/:467 adds Ones*16 rather than (Ones+68)*16). The "last Regolith
+		// block" semantic: the next fork is scheduled but has not fired yet, so
+		// the L2 block-timestamp activation rule (specs/protocol/regolith/
+		// overview.md:36-37) leaves the block in the Regolith period. The
+		// pre-Regolith (Bedrock) side of the boundary is not representable to
+		// the replayer (no bedrock _info.hardfork / fork-at-0 config), so the
+		// corpus pins the Regolith side, matching boundary_canyon_last /
+		// boundary_ecotone_last.
+		fp := defaultFeeParams()
+		c := caseFrame(fork, "boundary_regolith_last",
+			"Regolith last-block boundary: genesis Regolith, CanyonTime=2000 in the future (block 1010 < 2000) -- London + Bedrock attributes, Regolith L1 cost correction active",
+			fp, 10_000_000)
+		c.Info.Activations = map[string]uint64{"canyon": 2000}
+		return c
+	}},
+
 	{"boundary_canyon_last", []string{"canyon"}, func(fork string) inputCase {
 		// Canyon fork-period block: genesis Canyon, EcotoneTime=2000 > block
 		// time 1010 -- Shanghai EVM, Bedrock attributes (260B 0x015d8eb9) and
@@ -1639,6 +1704,37 @@ var caseSpecs = []caseSpec{
 			"Ecotone last-block boundary: genesis Ecotone, FjordTime=2000 in the future (block 1010 < 2000) -- calldataGas formula still governs before FastLZ",
 			fp, 10_000_000)
 		c.Info.Activations = map[string]uint64{"fjord": 2000}
+		return c
+	}},
+
+	{"boundary_ecotone_activation", []string{"canyon"}, func(fork string) inputCase {
+		// SPEC ACTIVATION BLOCK (S7; closes the S4 "spec activation-block shape
+		// is S7" deferral): genesis Canyon, the single block crosses
+		// EcotoneTime=1005, and the L1 attributes deposit STILL uses the
+		// pre-Ecotone setL1BlockValues form (Bedrock 260B 0x015d8eb9, slots
+		// 1/5/6) -- the L1Block upgrade lands later in that block, so
+		// setL1BlockValuesEcotone does not exist yet
+		// (specs/protocol/ecotone/l1-attributes.md:15-20, :112-119). The paired
+		// steady-state block (164B 0x440a5e20, slots 3/7 non-zero) is
+		// boundary_ecotone_synth above; this is its activation-block sibling.
+		// activationBlockFrame keeps the base-fork attributes/L1Block state;
+		// only _info.hardfork / activations name the block-time fork (ecotone).
+		//
+		// A non-deposit transfer is appended so the receipt derivation exercises
+		// the pre-Ecotone path: extractL1GasParams falls through on the Bedrock
+		// selector (rollup_cost.go:426-431) -> legacy FeeScalar + Bedrock cost
+		// func, and NewL1CostFunc's firstEcotoneBlock detection (zero Ecotone
+		// slots, rollup_cost.go:174-179) selects the same Bedrock func. Without
+		// a non-deposit tx op-geth's deriveOPStackFields early-returns on the
+		// trailing deposit (receipt_opstack.go:13) and the shape is unobservable.
+		// (The real activation block sets noTxPool; the EL does not enforce that
+		// CL rule, so the transfer is a deliberate differential-gate device.)
+		fp := defaultFeeParams()
+		c := activationBlockFrame("canyon", "boundary_ecotone_activation",
+			"Ecotone activation block: genesis Canyon, single block crosses EcotoneTime; L1 attributes still use pre-Ecotone setL1BlockValues (Bedrock 260B 0x015d8eb9, slots 1/5/6), the Ecotone L1Block upgrade landing later in-block",
+			fp, 10_000_000, "ecotone", 1005)
+		fund(&c, 1, eth(100))
+		c.Transactions = append(c.Transactions, transferTx(1, 0, recA, eth(1), 100_000, junkData("ecotone_activation", 128)))
 		return c
 	}},
 
