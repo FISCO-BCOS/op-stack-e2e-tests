@@ -63,10 +63,12 @@ T8N_DIR="$(dirname "$GEN_DIR")"
 REPO_ROOT="$(git -C "$GEN_DIR" rev-parse --show-toplevel)"
 SCRATCH="$OPGETH/cmd/opt8n-ref"
 N_CHAIN=3
-# D1g（Task 6a-2）：ladder 差分向量的固定编排。块号语义（0=regolith 激活块，
-# 500=canyon 激活块）；与 N_CHAIN 同理写成常量，manifest/判据 2 的枚举才可纯表达式化。
+# D1g（Task 6a-2）：ladder 差分向量的固定编排。块号语义为 1-based 链上块号
+# （0=regolith 的 genesis 激活，125=canyon 激活块，…，875=jovian 激活块）；
+# 8 个 fork 各约 125 块，跨运行族覆盖。与 N_CHAIN 同理写成常量，
+# manifest/判据 2 的枚举才可纯表达式化。
 N_LADDER_BLOCKS=1000
-LADDER_SPEC="0:regolith,500:canyon"
+LADDER_SPEC="0:regolith,125:canyon,250:ecotone,375:fjord,500:granite,625:holocene,750:isthmus,875:jovian"
 # P1 matrix 工件：op-node 是 CL 选方法号的唯一权威，其引用树必须等于 pin 且干净。
 OP_NODE_REPO="${OP_NODE_REPO:-/Users/octopus/octo/code/optimism}"
 OP_NODE_PIN="${OP_NODE_PIN:-76e4fad54244ec6bd07dad07e42c82a16ab5113a}"
@@ -124,8 +126,8 @@ done
 "$OPGETH/opt8n-ref" --mode="chain:${N_CHAIN}" --out-dir "$T8N_DIR/vectors" --op-geth-commit "$PIN"
 "$OPGETH/opt8n-ref" --mode="chain:${N_CHAIN}:fork" --out-dir "$T8N_DIR/vectors" --op-geth-commit "$PIN"
 "$OPGETH/opt8n-ref" --mode="chain:${N_CHAIN}:break" --out-dir "$T8N_DIR/vectors" --op-geth-commit "$PIN"
-# ladder（D1g）：1000 块 regolith→canyon 差分向量。无 golden——ladder 是 mode 产物而非
-# case，判据 1 的 per-case golden 不适用，判据 5 只枚举 golden/ 目录，故此处不产生 golden。
+# ladder（D1g）：1000 块 8-fork（regolith→jovian）差分向量。无 golden——ladder 是 mode
+# 产物而非 case，判据 1 的 per-case golden 不适用，判据 5 只枚举 golden/ 目录，故此处不产生 golden。
 "$OPGETH/opt8n-ref" --mode ladder --ladder "$LADDER_SPEC" --blocks "$N_LADDER_BLOCKS" \
   --out-dir "$T8N_DIR/vectors" --op-geth-commit "$PIN"
 
@@ -421,7 +423,7 @@ sorted_obs=()
 while IFS= read -r line; do sorted_obs+=("$line"); done < <(printf '%s\n' "${observer_vectors[@]}" | sort)
 append_if_absent "$manifest" "Dual-path observer vectors (gaslimit/basefee, bothForks)" "${sorted_obs[@]}"
 # D1g：ladder 差分向量（mode 产物；无 golden，见上方生成步骤）。
-append_if_absent "$manifest" "Ladder differential vector (D1g): ${N_LADDER_BLOCKS}-block regolith->canyon ladder (mode product, no golden)" "ladder_${N_LADDER_BLOCKS}.json"
+append_if_absent "$manifest" "Ladder differential vector (D1g): ${N_LADDER_BLOCKS}-block 8-fork regolith->jovian ladder (mode product, no golden)" "ladder_${N_LADDER_BLOCKS}.json"
 
 # ── diff 源重定义（Task 7 Step 1，审查 R10）：cases ∪ 三模式产物 ∪ ladder == manifest ──
 # cases basename 展开（.in.json → .json）∪ 派生名（corrupt/static 注册项/invalid-tx/chain）
