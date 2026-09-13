@@ -12,6 +12,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -60,6 +61,159 @@ func l1BlockCodeFor(fork string) []byte {
 		return l1BlockRuntimeCodeBedrock
 	}
 	return l1BlockRuntimeCode
+}
+
+// l1BlockRuntimeCodeCombined is the FOUR-way selector dispatch L1Block runtime
+// for phase A″'s cross-family ladder: one chain crossing the Bedrock/Ecotone
+// layout boundary needs a SINGLE genesis L1Block account able to execute the
+// attributes deposit of every fork on the ladder. Neither existing family
+// runtime can: l1BlockRuntimeCodeBedrock knows only 0x015d8eb9, and
+// l1BlockRuntimeCode carries no 0x440a5e20 arm (so the 164B Ecotone-family
+// calldata REVERTS there). This runtime dispatches on all four selectors from
+// op-geth core/types/rollup_cost.go:59-65 to the family-appropriate write path,
+// each composed byte-for-byte from the existing family bodies (see
+// buildCombinedL1BlockRuntime):
+//
+//	0x015d8eb9 Bedrock  -> bedrockBody = slot1 (l1BaseFee [68:100]), slot5
+//	                       (overhead [196:228]), slot6 (scalar [228:260]),
+//	                       identical to l1BlockRuntimeCodeBedrock's body.
+//	0x440a5e20 Ecotone  -> slot1 (l1BaseFee [36:68]), slot3 (baseFeeScalar
+//	                       [4:8] << 96 | blobBaseFeeScalar [8:12] << 64), slot7
+//	                       (blobBaseFee [68:100]). The 164B layout has NO
+//	                       operator-fee/DA segment, so slot8 is never written --
+//	                       exactly l1BlockStorage("ecotone")'s slot set
+//	                       {1,3,7}. (The body is the Isthmus/Jovian body with
+//	                       its slot8 segment swapped for a bare RETURN.)
+//	0x098999be Isthmus  -> ijBody = slot3, slot1, slot7, slot8, identical to
+//	                       l1BlockRuntimeCode's shared body.
+//	0x3db6be2b Jovian   -> ijBody (the same body packs the DA scalar from
+//	                       calldata[176:178]; CALLDATALOAD past the Isthmus
+//	                       176B form reads 0, so one body serves both).
+//
+// calldatasize<4 and unknown selectors revert, matching both existing runtimes.
+// The two existing runtimes and l1BlockCodeFor are deliberately untouched:
+// this constant is referenced ONLY by l1BlockCodeForLadder, so every existing
+// vector stays byte-identical.
+var l1BlockRuntimeCodeCombined = buildCombinedL1BlockRuntime()
+
+// l1BlockCodeForLadder returns the combined four-way L1Block runtime for A2's
+// cross-family ladder. It is a separate helper (NOT a branch inside
+// l1BlockCodeFor) so the existing per-fork vectors keep their exact bytecode;
+// A2 opts in explicitly.
+func l1BlockCodeForLadder() []byte { return l1BlockRuntimeCodeCombined }
+
+// buildCombinedL1BlockRuntime assembles the combined runtime from the two
+// existing family runtimes' bodies plus a four-way dispatch prefix. Every body
+// byte is sliced out of l1BlockRuntimeCodeBedrock / l1BlockRuntimeCode, never
+// retyped, so the per-family write paths cannot drift from the runtimes the
+// differential gate already pins.
+//
+// Body offsets (verified by cases_l1block_test.go's composition assertions):
+//
+//	l1BlockRuntimeCodeBedrock (52B): [0:28) dispatch, [28:52) = bedrockBody
+//	  JUMPDEST; slot1; slot5; slot6; PUSH1 0 PUSH1 0 RETURN
+//	l1BlockRuntimeCode (146B):        [0:43) dispatch, [43:146) = ijBody
+//	  [43]     JUMPDEST
+//	  [44:80)  slot3 pack   (… OR PUSH1 3 SSTORE POP)
+//	  [80:86)  slot1        (PUSH1 0x24 CALLDATALOAD PUSH1 1 SSTORE)
+//	  [86:92)  slot7        (PUSH1 0x44 CALLDATALOAD PUSH1 7 SSTORE)
+//	  [92:141) slot8 pack + SSTORE(8)
+//	  [141:146) PUSH1 0 PUSH1 0 RETURN
+//
+// The combined pc layout is: dispatch prefix (52B), revert block (6B),
+// bedrockBody (24B), ecotoneBody (54B), ijBody (103B) -- every JUMPI target is
+// a one-byte PUSH1 immediate, so the whole runtime is 239B.
+func buildCombinedL1BlockRuntime() []byte {
+	// Bodies lifted verbatim from the two existing runtimes.
+	bedrockBody := l1BlockRuntimeCodeBedrock[28:]
+	ijBody := l1BlockRuntimeCode[43:]
+	if len(bedrockBody) != 24 || len(ijBody) != 103 {
+		panic(fmt.Sprintf("combined L1Block runtime: family body sizes changed (bedrock %d, ij %d)",
+			len(bedrockBody), len(ijBody)))
+	}
+	ijSlot3 := ijBody[1:37]    // slot3 pack: calldata[4:8]<<96 | calldata[8:12]<<64
+	ijSlot1 := ijBody[37:43]   // slot1 = calldata[36:68]
+	ijSlot7 := ijBody[43:49]   // slot7 = calldata[68:100]
+	ijReturn := ijBody[98:103] // PUSH1 0 PUSH1 0 RETURN
+	if !bytes.Equal(ijReturn, []byte{0x60, 0x00, 0x60, 0x00, 0xf3}) {
+		panic("combined L1Block runtime: 146B body's RETURN sequence moved")
+	}
+	// Ecotone body: JUMPDEST + slot3 + slot1 + slot7 + RETURN -- the
+	// Isthmus/Jovian body with the slot8 (operator-fee/DA) segment dropped, so
+	// the written slot set is exactly l1BlockStorage("ecotone")'s {1,3,7}.
+	ecotoneBody := make([]byte, 0, 1+len(ijSlot3)+len(ijSlot1)+len(ijSlot7)+len(ijReturn))
+	ecotoneBody = append(ecotoneBody, 0x5b) // JUMPDEST
+	ecotoneBody = append(ecotoneBody, ijSlot3...)
+	ecotoneBody = append(ecotoneBody, ijSlot1...)
+	ecotoneBody = append(ecotoneBody, ijSlot7...)
+	ecotoneBody = append(ecotoneBody, ijReturn...)
+
+	// revertBlock is byte-identical to both existing runtimes' revert block.
+	revertBlock := []byte{0x5b, 0x60, 0x00, 0x60, 0x00, 0xfd} // JUMPDEST PUSH1 0 PUSH1 0 REVERT
+
+	type jumpPatch struct {
+		pos   int
+		label string
+	}
+	var (
+		code    []byte
+		patches []jumpPatch
+	)
+	emit := func(b ...byte) { code = append(code, b...) }
+	push1Target := func(label string) {
+		patches = append(patches, jumpPatch{pos: len(code) + 1, label: label})
+		emit(0x60, 0x00) // PUSH1 <patched>
+	}
+	selectorCheck := func(selector []byte, label string) {
+		emit(0x80) // DUP1: keep the selector for the next comparison
+		emit(0x63) // PUSH4
+		emit(selector...)
+		emit(0x14) // EQ
+		push1Target(label)
+		emit(0x57) // JUMPI
+	}
+
+	// Guard: calldatasize < 4 -> revert (same shape as both existing runtimes).
+	emit(0x60, 0x04) // PUSH1 4
+	emit(0x36)       // CALLDATASIZE
+	emit(0x10)       // LT
+	push1Target("revert")
+	emit(0x57) // JUMPI
+	// selector = calldata[0:4] (SHR 224 leaves the top 4 bytes).
+	emit(0x60, 0x00) // PUSH1 0
+	emit(0x35)       // CALLDATALOAD
+	emit(0x60, 0xe0) // PUSH1 224
+	emit(0x1c)       // SHR
+	// Four-way dispatch; the types.*Selector vars keep the immediates in sync
+	// with op-geth core/types/rollup_cost.go:59-65.
+	selectorCheck(types.BedrockL1AttributesSelector, "bedrock")
+	selectorCheck(types.EcotoneL1AttributesSelector, "ecotone")
+	selectorCheck(types.IsthmusL1AttributesSelector, "ij")
+	// Last check needs no DUP1: nothing reads the selector afterwards. On no
+	// match this JUMPI falls through into the revert block.
+	emit(0x63) // PUSH4
+	emit(types.JovianL1AttributesSelector...)
+	emit(0x14) // EQ
+	push1Target("ij")
+	emit(0x57) // JUMPI
+
+	labels := map[string]int{}
+	labels["revert"] = len(code)
+	code = append(code, revertBlock...)
+	labels["bedrock"] = len(code)
+	code = append(code, bedrockBody...)
+	labels["ecotone"] = len(code)
+	code = append(code, ecotoneBody...)
+	labels["ij"] = len(code)
+	code = append(code, ijBody...)
+	for _, p := range patches {
+		target := labels[p.label]
+		if target > 0xff {
+			panic(fmt.Sprintf("combined L1Block runtime: jump target %s=%d exceeds PUSH1", p.label, target))
+		}
+		code[p.pos] = byte(target)
+	}
+	return code
 }
 
 // ---------------------------------------------------------------------
