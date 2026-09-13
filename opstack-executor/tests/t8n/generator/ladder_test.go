@@ -62,6 +62,39 @@ func TestParseLadderFlagRejections(t *testing.T) {
 	}
 }
 
+// TestLadderSmoke3BlocksCrossingCanyon：generateLadderChain 的 3 块 smoke，
+// 跨 canyon 边界（D1b）。fork 切换必须全自动：cfg 按 ladderSpec 激活，块时间
+// 由 chain_makers 每块 parent+10s 推进，op-geth 的 cfg.Rules 按块时间换挡。
+// 块时间线（genesis t=1000）：block1 t=1010，block2 t=1020，block3 t=1030；
+// "2:canyon" => CanyonTime=1020，激活块本身即新 fork。
+func TestLadderSmoke3BlocksCrossingCanyon(t *testing.T) {
+	spec, err := parseLadderFlag("0:regolith,2:canyon", 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := generateLadderChain(spec, 3)
+	if err != nil {
+		t.Fatalf("generateLadderChain: %v", err)
+	}
+	if len(out.Blocks) != 3 {
+		t.Fatalf("want 3 blocks, got %d", len(out.Blocks))
+	}
+	// _info.hardfork 按块时间 fork：block1(t=1010) regolith，
+	// block2(t=1020) canyon —— fork 切换必须自动发生。
+	if got := out.Blocks[0].Info.Hardfork; got != "regolith" {
+		t.Fatalf("block 1 hardfork: want regolith, got %q", got)
+	}
+	if got := out.Blocks[1].Info.Hardfork; got != "canyon" {
+		t.Fatalf("block 2 hardfork: want canyon (fork switch must be automatic), got %q", got)
+	}
+	if got := out.Blocks[2].Info.Hardfork; got != "canyon" {
+		t.Fatalf("block 3 hardfork: want canyon, got %q", got)
+	}
+	if len(out.Blocks[2].OpExpected.Receipts) == 0 {
+		t.Fatal("block 3 has no receipts")
+	}
+}
+
 func TestParseLadderFlagNormalization(t *testing.T) {
 	spec, err := parseLadderFlag(" 0:REGOLITH ,125:Canyon ", 1000)
 	if err != nil {
