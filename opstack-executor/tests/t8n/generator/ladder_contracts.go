@@ -426,11 +426,16 @@ func ladderInvalidOpcodeCode() []byte { return []byte{0xfe} }
 // ---------------------------------------------------------------------
 
 // ladderContractProbesEnabled reports whether block index blockIdx carries the
-// contract-layer probes. Every 25 blocks, but skipped on:
+// every-25-block contract-layer probes (event shapes / storage churn / revert /
+// INVALID). Skipped on:
 //   - the existing %100==0 CREATE probe block (keeps that block's tx list and
 //     gas shape unchanged), and
 //   - ANY fork activation block, so the fork-boundary blocks stay exactly as
 //     before (and the jovian activation block stays deposits-only).
+//
+// P2-A2 note: the in-chain CREATE→CALL probe is NOT part of this suite any
+// more; it moved to ladderCreateCallProbeBlocks (one per fork segment). See
+// that function for why.
 func ladderContractProbesEnabled(blockIdx int, isAnyForkActivation bool) bool {
 	if blockIdx <= 0 || blockIdx%ladderContractProbeInterval != 0 {
 		return false
@@ -441,10 +446,87 @@ func ladderContractProbesEnabled(blockIdx int, isAnyForkActivation bool) bool {
 	return !isAnyForkActivation
 }
 
-// injectLadderContractProbes appends the probe txs after every existing recipe
-// tx. nextNonce returns bg.TxNonce(senderAddr) at injection time so the key-1
-// nonces chain deterministically; add is the caller's four-way-sync closure.
-// probeSeq is the count of prior injected probe blocks (see ladderChurnSlots).
+// ladderCreateCallProbeBlocks returns the 0-based block indices that carry the
+// in-chain CREATE→CALL probe (P2-A2): exactly one per fork segment, so the
+// registered 8-fork ladder carries 8 — not the 30 the every-25 grid produced.
+//
+// activationIdxs are the 0-based indices of the non-genesis fork activations
+// (ladderActivation.Block-1), sorted ascending; each cuts the chain into a new
+// segment. Position rule: the segment's midpoint, or the legal index nearest it
+// (ties resolved to the lower index). Legal means blockIdx > 0, not
+// blockIdx%100==0 (the pre-existing CREATE probe block) and not a fork
+// activation index. A segment with no legal index contributes no probe (the
+// caller reports the skip).
+//
+// Why converge: the in-chain CREATE deploys a contract WITH non-empty runtime
+// code. op-geth reports that code in the create receipt's `output`; FISCO's
+// vendored-evmone path reports `0x` (FINDING-create-output, a base-layer
+// representation delta, DIVERGENCES.md FINDING-create-output). One create per
+// fork keeps the create→call lifecycle covered at EVERY fork while registering
+// the same divergence 8 times instead of 30.
+func ladderCreateCallProbeBlocks(n int, activationIdxs []int) []int {
+	excluded := make(map[int]bool, len(activationIdxs))
+	for _, idx := range activationIdxs {
+		excluded[idx] = true
+	}
+	isLegal := func(i int) bool {
+		if i <= 0 || i >= n {
+			return false
+		}
+		if i%100 == 0 {
+			return false
+		}
+		return !excluded[i]
+	}
+	var out []int
+	segStart := 0
+	// Segment ends: each activation index, then n (the segment [segStart, end)
+	// is [segStart, end-1]).
+	ends := append(append([]int{}, activationIdxs...), n)
+	for _, segEnd := range ends {
+		if segStart >= segEnd {
+			segStart = segEnd
+			continue
+		}
+		last := segEnd - 1
+		mid := segStart + (last-segStart)/2
+		picked := -1
+		for d := 0; d <= last-segStart && picked < 0; d++ {
+			for _, cand := range []int{mid - d, mid + d} {
+				if cand >= segStart && cand <= last && isLegal(cand) {
+					picked = cand
+					break
+				}
+			}
+		}
+		if picked >= 0 {
+			out = append(out, picked)
+		}
+		segStart = segEnd
+	}
+	return out
+}
+
+// injectLadderCreateCallProbe appends the in-chain CREATE of the extended logs
+// contract and one call on the freshly created address (the create→call
+// lifecycle). The call's `to` re-derives from the create nonce; the created
+// account lands in postState via receipts[i].ContractAddress. nextNonce returns
+// bg.TxNonce(senderAddr) at injection time so nonces chain deterministically.
+func injectLadderCreateCallProbe(add func(inputTx), nextNonce func() uint64) {
+	deployNonce := nextNonce()
+	add(createTx(1, deployNonce, ladderLogsDeployGas,
+		ladderContractDeployInitCode(ladderLogsProbeCode())))
+	created := crypto.CreateAddress(addrOfKey(1), deployNonce)
+	add(transferTx(1, nextNonce(), created, big.NewInt(0),
+		ladderLogsProbeGas, ladderLogsProbeSelectors[0]))
+}
+
+// injectLadderContractProbes appends the every-25 probe txs after every
+// existing recipe tx. nextNonce returns bg.TxNonce(senderAddr) at injection
+// time so the key-1 nonces chain deterministically; add is the caller's
+// four-way-sync closure. probeSeq is the count of prior injected probe blocks
+// (see ladderChurnSlots). The in-chain CREATE→CALL probe is separate
+// (injectLadderCreateCallProbe / ladderCreateCallProbeBlocks, P2-A2).
 func injectLadderContractProbes(add func(inputTx), nextNonce func() uint64, in *inputCase, probeSeq int) {
 	// 1) genesis logs predeploy: all four event shapes.
 	for i := range ladderLogsProbeSelectors {
@@ -452,17 +534,7 @@ func injectLadderContractProbes(add func(inputTx), nextNonce func() uint64, in *
 			ladderLogsProbeGas, ladderLogsProbeSelectors[i]))
 	}
 
-	// 2) in-chain CREATE of the same contract + one call on it (the call's `to`
-	// re-derives from the create nonce; the created account lands in postState
-	// via receipts[i].ContractAddress).
-	deployNonce := nextNonce()
-	add(createTx(1, deployNonce, ladderLogsDeployGas,
-		ladderContractDeployInitCode(ladderLogsProbeCode())))
-	created := crypto.CreateAddress(addrOfKey(1), deployNonce)
-	add(transferTx(1, nextNonce(), created, big.NewInt(0),
-		ladderLogsProbeGas, ladderLogsProbeSelectors[0]))
-
-	// 3) storage churn: declare the K slots this call leaves non-zero.
+	// 2) storage churn: declare the K slots this call leaves non-zero.
 	add(transferTx(1, nextNonce(), ladderStorageProbeAddr, big.NewInt(0),
 		ladderChurnGas, ladderChurnCalldata(probeSeq)))
 	if in.ExtraStorage == nil {
@@ -471,11 +543,11 @@ func injectLadderContractProbes(add func(inputTx), nextNonce func() uint64, in *
 	in.ExtraStorage[ladderStorageProbeAddr] = append(
 		in.ExtraStorage[ladderStorageProbeAddr], ladderChurnSlots(probeSeq)...)
 
-	// 4) revert with reason data (status 0, non-empty output).
+	// 3) revert with reason data (status 0, non-empty output).
 	add(transferTx(1, nextNonce(), ladderRevertProbeAddr, big.NewInt(0),
 		ladderRevertProbeGas, nil))
 
-	// 5) INVALID opcode (status 0, empty output, gasUsed == limit).
+	// 4) INVALID opcode (status 0, empty output, gasUsed == limit).
 	add(transferTx(1, nextNonce(), ladderInvalidProbeAddr, big.NewInt(0),
 		ladderInvalidProbeGas, nil))
 }

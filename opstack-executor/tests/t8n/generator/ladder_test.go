@@ -554,15 +554,32 @@ func TestLadderWithdrawalReceiptCarriesLogs(t *testing.T) {
 		}
 	}
 
-	// Canyon 块 1..3 的 withdrawal 是块内最后一笔（idx 3），其回执恰好携带
+	// Canyon 块 1..3 的 withdrawal 是 MessagePasser 调用，其回执恰好携带
 	// 一条 MessagePassed log：地址 = L2ToL1MessagePasser，4 个 topic，
 	// topics[0] = 事件签名。这是对 "logs 真的被导出且内容正确" 的硬锚。
+	// P2-A2: the create→call probe can land inside these tiny segments, so the
+	// withdrawal receipt is located by target address (not a fixed index); the
+	// log-shape assertions below are index-independent.
 	for blk := 1; blk <= 3; blk++ {
+		txs := out.Blocks[blk].Block.Transactions
 		rs := out.Blocks[blk].OpExpected.Receipts
-		if len(rs) != 4 {
-			t.Fatalf("block %d: want 4 receipts (attrs+deposit+transfer+withdrawal), got %d", blk, len(rs))
+		if len(rs) != len(txs) {
+			t.Fatalf("block %d: tx/receipt count mismatch: %d vs %d", blk, len(txs), len(rs))
 		}
-		r := rs[3]
+		wIdx := -1
+		for i, raw := range txs {
+			var st outputSignedTx
+			if err := json.Unmarshal(raw, &st); err != nil {
+				t.Fatalf("decode block %d tx %d: %v", blk, i, err)
+			}
+			if st.To != nil && *st.To == messagePasserAddr {
+				wIdx = i
+			}
+		}
+		if wIdx < 0 {
+			t.Fatalf("block %d carries no withdrawal tx (to == MessagePasser)", blk)
+		}
+		r := rs[wIdx]
 		if r.LogsCount != 1 || len(r.Logs) != 1 {
 			t.Fatalf("block %d withdrawal receipt: want exactly 1 log, got logsCount=%d len=%d",
 				blk, r.LogsCount, len(r.Logs))
@@ -1151,6 +1168,9 @@ func topicsLen(logs []outputLog) int {
 // same logs contract and the call that follows it: the created address
 // re-derives from the create nonce and exists in postState with the exact probe
 // runtime, and the call's receipt is a 3-topic Transfer log from that address.
+// P2-A2: the create→call probe is one per fork segment, so the spec below
+// (activation canyon@2 -> index 1) puts it at the canyon segment's midpoint
+// (index 15), not on the every-25 grid.
 func TestLadderContractProbeCreateCallLifecycle(t *testing.T) {
 	spec, err := parseLadderFlag("0:regolith,2:canyon", 30)
 	if err != nil {
@@ -1160,7 +1180,14 @@ func TestLadderContractProbeCreateCallLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generateLadderChain: %v", err)
 	}
-	rs := ladderProbeReceipts(t, out.Blocks[25])
+	// The regolith segment is the single genesis block (index 0), which is not a
+	// legal probe position, so only the canyon segment contributes.
+	wantBlocks := ladderCreateCallProbeBlocks(30, []int{1})
+	if !reflect.DeepEqual(wantBlocks, []int{15}) {
+		t.Fatalf("probe block computation changed: want [15], got %v", wantBlocks)
+	}
+	blkIdx := wantBlocks[0]
+	rs := ladderProbeReceipts(t, out.Blocks[blkIdx])
 	var create *ladderProbeReceipt
 	for i := range rs {
 		if rs[i].opType == "eip1559" && rs[i].to == nil {
@@ -1169,12 +1196,12 @@ func TestLadderContractProbeCreateCallLifecycle(t *testing.T) {
 		}
 	}
 	if create == nil {
-		t.Fatal("block 25 carries no in-chain CREATE probe (eip1559 to == null)")
+		t.Fatalf("block %d carries no in-chain CREATE probe (eip1559 to == null)", blkIdx)
 	}
 	created := crypto.CreateAddress(addrOfKey(1), create.nonce)
-	acc, ok := out.Blocks[25].PostState[created]
+	acc, ok := out.Blocks[blkIdx].PostState[created]
 	if !ok {
-		t.Fatalf("created probe contract %s missing from block 25 postState", created.Hex())
+		t.Fatalf("created probe contract %s missing from block %d postState", created.Hex(), blkIdx)
 	}
 	if !bytes.Equal(acc.Code, ladderLogsProbeCode()) {
 		t.Fatalf("created probe contract code differs from ladderLogsProbeCode (len %d vs %d)",
@@ -1193,6 +1220,74 @@ func TestLadderContractProbeCreateCallLifecycle(t *testing.T) {
 			created.Hex(), call[0].rc.Logs[0].Address)
 	}
 }
+
+// TestLadderCreateCallProbeBlocks anchors the P2-A2 frequency rule: exactly one
+// in-chain CREATE→CALL probe per fork segment, at the segment midpoint, on the
+// registered 8-fork ladder, avoiding the %100 CREATE blocks and the activation
+// blocks (which are never midpoint hits here, but the skip logic is anchored
+// separately below).
+func TestLadderCreateCallProbeBlocks(t *testing.T) {
+	// Registered ladder: 0:regolith,125:canyon,...,875:jovian -> 0-based
+	// activation indices 124/249/374/499/624/749/874.
+	spec, err := parseLadderFlag(ladderFull8, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	idxs := make([]int, 0, len(spec.Activations))
+	for _, a := range spec.Activations {
+		if a.Block > 0 {
+			idxs = append(idxs, a.Block-1)
+		}
+	}
+	got := ladderCreateCallProbeBlocks(1000, idxs)
+	want := []int{61, 186, 311, 436, 561, 686, 811, 936}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("registered ladder create/call probe blocks: want %v, got %v", want, got)
+	}
+	// 8 forks -> 8 probes (was 30 on the every-25 grid). Also anchor the
+	// disjointness from the every-25 suite on the registered spec.
+	every25 := 0
+	for i := 1; i < 1000; i++ {
+		if ladderContractProbesEnabled(i, false) {
+			every25++
+		}
+	}
+	if every25 != 30 {
+		t.Fatalf("every-25 suite count changed: want 30, got %d", every25)
+	}
+	for _, b := range got {
+		if ladderContractProbesEnabled(b, false) {
+			t.Fatalf("create/call probe block %d collides with the every-25 suite", b)
+		}
+		if b%100 == 0 {
+			t.Fatalf("create/call probe block %d is a %%100 CREATE block", b)
+		}
+	}
+
+	// Skip rule: the midpoint (or nearest legal index) must avoid the excluded
+	// blocks. Take a short ladder whose activation index IS the midpoint of a
+	// segment and is itself excluded.
+	//
+	// "0:regolith,100:canyon,101:ecotone" (n=102): 0-based activation indices
+	// 99 and 100. Segments: [0,98] (mid 49, legal), [99,99] (only index 99 = the
+	// canyon activation -> excluded, so NO probe might land there) and
+	// [100,101] (mid 100 = the ecotone activation AND a %100 block -> excluded,
+	// so the nearest legal index is 101).
+	gotSkip := ladderCreateCallProbeBlocks(102, []int{99, 100})
+	wantSkip := []int{49, 101}
+	if !reflect.DeepEqual(gotSkip, wantSkip) {
+		t.Fatalf("skip-rule probe blocks: want %v, got %v", wantSkip, gotSkip)
+	}
+
+	// A segment whose every index is excluded contributes no probe at all
+	// (rather than falling back to a neighbouring segment). n=2 with the only
+	// post-genesis block as the activation: [0,0] is block 0 (illegal) and
+	// [1,1] is the activation (excluded) -> no probes.
+	if got := ladderCreateCallProbeBlocks(2, []int{1}); len(got) != 0 {
+		t.Fatalf("fully-excluded ladder must yield no create/call probes, got %v", got)
+	}
+}
+
 
 // TestLadderContractProbeChurnStorage checks the storage-churn contract: each
 // probe block leaves exactly its K=8 slot group non-zero, clears the previous

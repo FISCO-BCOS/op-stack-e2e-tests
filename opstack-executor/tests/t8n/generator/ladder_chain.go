@@ -303,6 +303,21 @@ func generateLadderChain(spec ladderSpec, n int) (*chainOutput, error) {
 	}
 	withdrawalCount := 0  // per-generation 1-based withdrawal counter (withdrawalSlots k)
 	contractProbeSeq := 0 // count of blocks that actually carried the P2-A probes
+	// P2-A2: the in-chain CREATE→CALL probe lands once per fork segment (the
+	// registered 8-fork ladder -> 8), not on the every-25 grid (30). The 0-based
+	// activation indices are ladderActivation.Block-1 for every non-genesis
+	// activation; ladderCreateCallProbeBlocks picks the segment midpoints while
+	// avoiding the %100 CREATE blocks and the activation blocks themselves.
+	var createCallActivationIdxs []int
+	for _, a := range spec.Activations {
+		if a.Block > 0 {
+			createCallActivationIdxs = append(createCallActivationIdxs, a.Block-1)
+		}
+	}
+	createCallBlocks := make(map[int]struct{})
+	for _, b := range ladderCreateCallProbeBlocks(n, createCallActivationIdxs) {
+		createCallBlocks[b] = struct{}{}
+	}
 	if err := func() (err error) {
 		defer func() {
 			if r := recover(); r != nil {
@@ -432,6 +447,12 @@ func generateLadderChain(spec ladderSpec, n int) (*chainOutput, error) {
 			if ladderContractProbesEnabled(i, isAnyForkActivation) {
 				injectLadderContractProbes(add, func() uint64 { return bg.TxNonce(senderAddr) }, in, contractProbeSeq)
 				contractProbeSeq++
+			}
+			// P2-A2 in-chain CREATE→CALL probe: appended AFTER the every-25 suite
+			// (they never coincide on the registered ladder; the order keeps the
+			// every-25 receipt indices stable when they do).
+			if _, ok := createCallBlocks[i]; ok {
+				injectLadderCreateCallProbe(add, func() uint64 { return bg.TxNonce(senderAddr) })
 			}
 
 			ins[i] = in
