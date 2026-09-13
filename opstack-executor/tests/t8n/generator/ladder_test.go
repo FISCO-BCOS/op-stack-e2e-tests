@@ -1017,3 +1017,347 @@ func TestLadderFourFamilySmoke(t *testing.T) {
 		}
 	}
 }
+
+// ---------------------------------------------------------------------
+// P2-A contract-layer probes.
+// ---------------------------------------------------------------------
+
+// ladderProbeReceipt pairs a block tx's `to` with its receipt, so tests can
+// select probe txs by target address without postState-side heuristics.
+type ladderProbeReceipt struct {
+	opType string
+	to     *common.Address
+	nonce  uint64
+	rc     expectedReceipt
+}
+
+func ladderProbeReceipts(t *testing.T, blk chainBlockOutput) []ladderProbeReceipt {
+	t.Helper()
+	if len(blk.Block.Transactions) != len(blk.OpExpected.Receipts) {
+		t.Fatalf("tx/receipt count mismatch: %d vs %d",
+			len(blk.Block.Transactions), len(blk.OpExpected.Receipts))
+	}
+	out := make([]ladderProbeReceipt, 0, len(blk.Block.Transactions))
+	for i, raw := range blk.Block.Transactions {
+		var st outputSignedTx
+		if err := json.Unmarshal(raw, &st); err != nil {
+			t.Fatalf("decode tx %d: %v", i, err)
+		}
+		out = append(out, ladderProbeReceipt{
+			opType: st.OpType, to: st.To, nonce: uint64(st.Nonce),
+			rc: blk.OpExpected.Receipts[i],
+		})
+	}
+	return out
+}
+
+func probeReceiptsTo(rs []ladderProbeReceipt, addr common.Address) []ladderProbeReceipt {
+	var out []ladderProbeReceipt
+	for _, r := range rs {
+		if r.to != nil && *r.to == addr {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// TestLadderLogsCodeByteStable anchors the PRE-EXISTING logsCode() bytes. The
+// P2-A extended contract is a separate object precisely so this sha256 does not
+// move: the contract_logs vector's `pre.code` carries these bytes verbatim, so
+// a change here would split that vector.
+func TestLadderLogsCodeByteStable(t *testing.T) {
+	const wantSHA = "ff7a6d4451bd10ea33f9133bce8669f95a862c529def55c09ecaf4640970bb59"
+	got := sha256.Sum256(logsCode())
+	if gotHex := fmt.Sprintf("%x", got); gotHex != wantSHA {
+		t.Fatalf("logsCode() changed (contract_logs vector would split): want %s, got %s", wantSHA, gotHex)
+	}
+	if len(logsCode()) != 113 {
+		t.Fatalf("logsCode() length: want 113, got %d", len(logsCode()))
+	}
+}
+
+// TestLadderContractProbeEventShapes exercises the four selector entry points of
+// the genesis logs predeploy on the first probe block (index 25):
+//   - 3 topics + 32-byte non-empty data (ERC-20 Transfer shape),
+//   - a >=2-log receipt,
+//   - a zero-topic LOG0 with non-empty data,
+//   - a 256-byte data log.
+func TestLadderContractProbeEventShapes(t *testing.T) {
+	spec, err := parseLadderFlag("0:regolith,2:canyon", 30)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := generateLadderChain(spec, 30)
+	if err != nil {
+		t.Fatalf("generateLadderChain: %v", err)
+	}
+	receipts := probeReceiptsTo(ladderProbeReceipts(t, out.Blocks[25]), ladderLogsProbeAddr)
+	if len(receipts) != 4 {
+		t.Fatalf("block 25: want 4 calls to the logs predeploy, got %d", len(receipts))
+	}
+	for i, r := range receipts {
+		if r.rc.Status != "0x1" {
+			t.Fatalf("block 25 logs call %d: status want 0x1, got %s", i, r.rc.Status)
+		}
+	}
+
+	transfer := receipts[0].rc
+	if len(transfer.Logs) != 1 || len(transfer.Logs[0].Topics) != 3 {
+		t.Fatalf("shape0: want 1 log with 3 topics, got logs=%d", len(transfer.Logs))
+	}
+	wantTopic0 := "0x" + common.Bytes2Hex(crypto.Keccak256([]byte("Transfer(address,address,uint256)")))
+	if transfer.Logs[0].Topics[0] != wantTopic0 {
+		t.Fatalf("shape0 topic0: want %s, got %s", wantTopic0, transfer.Logs[0].Topics[0])
+	}
+	wantFrom := "0x" + common.Bytes2Hex(common.LeftPadBytes(ladderLogsFromAddr.Bytes(), 32))
+	wantTo := "0x" + common.Bytes2Hex(common.LeftPadBytes(ladderLogsToAddr.Bytes(), 32))
+	if transfer.Logs[0].Topics[1] != wantFrom || transfer.Logs[0].Topics[2] != wantTo {
+		t.Fatalf("shape0 indexed topics: want from=%s to=%s, got %v", wantFrom, wantTo, transfer.Logs[0].Topics[1:])
+	}
+	if transfer.Logs[0].Data == "0x" || len(transfer.Logs[0].Data) != 2+64 {
+		t.Fatalf("shape0 data: want non-empty 32 bytes, got %q", transfer.Logs[0].Data)
+	}
+
+	if multi := receipts[1].rc; len(multi.Logs) < 2 {
+		t.Fatalf("shape1: want >=2 logs, got %d", len(multi.Logs))
+	}
+
+	zero := receipts[2].rc
+	if len(zero.Logs) != 1 || len(zero.Logs[0].Topics) != 0 {
+		t.Fatalf("shape2: want exactly 1 zero-topic log, got logs=%d topics=%d",
+			len(zero.Logs), topicsLen(zero.Logs))
+	}
+	if zero.Logs[0].Data == "0x" {
+		t.Fatalf("shape2: zero-topic log must still carry non-empty data")
+	}
+
+	long := receipts[3].rc
+	if len(long.Logs) != 1 || len(long.Logs[0].Topics) != 1 {
+		t.Fatalf("shape3: want 1 log with 1 topic, got logs=%d", len(long.Logs))
+	}
+	if got := len(long.Logs[0].Data); got != 2+512 {
+		t.Fatalf("shape3 data: want 256 bytes (514 hex chars), got %d chars", got)
+	}
+}
+
+func topicsLen(logs []outputLog) int {
+	if len(logs) == 0 {
+		return 0
+	}
+	return len(logs[0].Topics)
+}
+
+// TestLadderContractProbeCreateCallLifecycle checks the in-chain CREATE of the
+// same logs contract and the call that follows it: the created address
+// re-derives from the create nonce and exists in postState with the exact probe
+// runtime, and the call's receipt is a 3-topic Transfer log from that address.
+func TestLadderContractProbeCreateCallLifecycle(t *testing.T) {
+	spec, err := parseLadderFlag("0:regolith,2:canyon", 30)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := generateLadderChain(spec, 30)
+	if err != nil {
+		t.Fatalf("generateLadderChain: %v", err)
+	}
+	rs := ladderProbeReceipts(t, out.Blocks[25])
+	var create *ladderProbeReceipt
+	for i := range rs {
+		if rs[i].opType == "eip1559" && rs[i].to == nil {
+			create = &rs[i]
+			break
+		}
+	}
+	if create == nil {
+		t.Fatal("block 25 carries no in-chain CREATE probe (eip1559 to == null)")
+	}
+	created := crypto.CreateAddress(addrOfKey(1), create.nonce)
+	acc, ok := out.Blocks[25].PostState[created]
+	if !ok {
+		t.Fatalf("created probe contract %s missing from block 25 postState", created.Hex())
+	}
+	if !bytes.Equal(acc.Code, ladderLogsProbeCode()) {
+		t.Fatalf("created probe contract code differs from ladderLogsProbeCode (len %d vs %d)",
+			len(acc.Code), len(ladderLogsProbeCode()))
+	}
+	call := probeReceiptsTo(rs, created)
+	if len(call) != 1 {
+		t.Fatalf("want exactly 1 call to the created contract, got %d", len(call))
+	}
+	if call[0].rc.Status != "0x1" || len(call[0].rc.Logs) != 1 || len(call[0].rc.Logs[0].Topics) != 3 {
+		t.Fatalf("created-contract call: want status 0x1 + 1 three-topic log, got status=%s logs=%d",
+			call[0].rc.Status, len(call[0].rc.Logs))
+	}
+	if call[0].rc.Logs[0].Address != "0x"+common.Bytes2Hex(created.Bytes()) {
+		t.Fatalf("created-contract log address: want %s, got %s",
+			created.Hex(), call[0].rc.Logs[0].Address)
+	}
+}
+
+// TestLadderContractProbeChurnStorage checks the storage-churn contract: each
+// probe block leaves exactly its K=8 slot group non-zero, clears the previous
+// group (absent from postState), and stores the warmed rewrite values.
+func TestLadderContractProbeChurnStorage(t *testing.T) {
+	spec, err := parseLadderFlag("0:regolith,2:canyon", 60)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := generateLadderChain(spec, 60)
+	if err != nil {
+		t.Fatalf("generateLadderChain: %v", err)
+	}
+	checkGroup := func(idx int, base uint64) {
+		t.Helper()
+		acc, ok := out.Blocks[idx].PostState[ladderStorageProbeAddr]
+		if !ok {
+			t.Fatalf("block %d: churn account missing from postState", idx)
+		}
+		if len(acc.Storage) != ladderChurnSlotCount {
+			t.Fatalf("block %d: want %d non-zero churn slots, got %d",
+				idx, ladderChurnSlotCount, len(acc.Storage))
+		}
+		for j := 0; j < ladderChurnSlotCount; j++ {
+			key := common.BigToHash(new(big.Int).SetUint64(base + uint64(j)))
+			want := common.BigToHash(new(big.Int).SetUint64(0x31 + uint64(j)))
+			if got := acc.Storage[key]; got != want {
+				t.Fatalf("block %d slot %d: want %s, got %s", idx, base+uint64(j), want.Hex(), got.Hex())
+			}
+		}
+		// The previous group must be gone (cleared to zero -> not in the trie).
+		if base >= ladderChurnSlotStride {
+			prev := common.BigToHash(new(big.Int).SetUint64(base - ladderChurnSlotStride))
+			if got, ok := acc.Storage[prev]; ok {
+				t.Fatalf("block %d: previous group slot %s should be cleared, got %s",
+					idx, prev.Hex(), got.Hex())
+			}
+		}
+	}
+	checkGroup(25, 0*ladderChurnSlotStride)
+	checkGroup(50, 1*ladderChurnSlotStride)
+	// Between probes the churn state persists through the candidate chain, so
+	// the pre of the next probe still sees the previous group (the clear path
+	// above is only meaningful if it does).
+	if got := out.Blocks[26].PostState[ladderStorageProbeAddr].Storage; len(got) != ladderChurnSlotCount {
+		t.Fatalf("block 26 (non-probe): churn storage not carried forward, got %d slots", len(got))
+	}
+}
+
+// TestLadderContractProbeRevertAndInvalid checks the two failure paths:
+// REVERT with abi-encoded Error(string) reason (status 0, non-empty output,
+// partial gas) and the INVALID opcode (status 0, empty output, all gas).
+func TestLadderContractProbeRevertAndInvalid(t *testing.T) {
+	spec, err := parseLadderFlag("0:regolith,2:canyon", 30)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := generateLadderChain(spec, 30)
+	if err != nil {
+		t.Fatalf("generateLadderChain: %v", err)
+	}
+	rs := ladderProbeReceipts(t, out.Blocks[25])
+
+	rev := probeReceiptsTo(rs, ladderRevertProbeAddr)
+	if len(rev) != 1 {
+		t.Fatalf("want 1 revert probe, got %d", len(rev))
+	}
+	wantOut := "0x" + common.Bytes2Hex(ladderRevertReasonPayload())
+	if rev[0].rc.Status != "0x0" {
+		t.Fatalf("revert probe status: want 0x0, got %s", rev[0].rc.Status)
+	}
+	if rev[0].rc.Output != wantOut {
+		t.Fatalf("revert probe output: want %s, got %s", wantOut, rev[0].rc.Output)
+	}
+	if rev[0].rc.GasUsed == fmt.Sprintf("0x%x", ladderRevertProbeGas) {
+		t.Fatalf("revert probe must not consume the whole gas limit (REVERT is partial)")
+	}
+
+	inv := probeReceiptsTo(rs, ladderInvalidProbeAddr)
+	if len(inv) != 1 {
+		t.Fatalf("want 1 invalid-opcode probe, got %d", len(inv))
+	}
+	if inv[0].rc.Status != "0x0" {
+		t.Fatalf("invalid probe status: want 0x0, got %s", inv[0].rc.Status)
+	}
+	if inv[0].rc.Output != "0x" {
+		t.Fatalf("invalid probe output: want 0x, got %s", inv[0].rc.Output)
+	}
+	if want := fmt.Sprintf("0x%x", ladderInvalidProbeGas); inv[0].rc.GasUsed != want {
+		t.Fatalf("invalid probe gasUsed: want %s (whole limit), got %s", want, inv[0].rc.GasUsed)
+	}
+}
+
+// TestLadderContractProbeSkipRule anchors the skip rule: probes land on every
+// 25th block EXCEPT the existing %100 CREATE block and any fork activation
+// block. canyon@26 puts its activation on index 25, a probe slot that must be
+// skipped; index 50 (no conflict) must still carry the probes.
+func TestLadderContractProbeSkipRule(t *testing.T) {
+	hasProbe := func(blk chainBlockOutput) bool {
+		return len(probeReceiptsTo(ladderProbeReceipts(t, blk), ladderLogsProbeAddr)) > 0
+	}
+	// canyon@26 -> activation index 25.
+	spec, err := parseLadderFlag("0:regolith,26:canyon", 60)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := generateLadderChain(spec, 60)
+	if err != nil {
+		t.Fatalf("generateLadderChain: %v", err)
+	}
+	if hasProbe(out.Blocks[25]) {
+		t.Fatal("block 25 is the canyon activation block: probes must be skipped")
+	}
+	// The REGULAR recipe txs on an activation block are untouched (attr + user
+	// deposit + transfer + withdrawal).
+	if got := len(out.Blocks[25].Block.Transactions); got != 4 {
+		t.Fatalf("activation block tx count: want 4 (regular recipe intact), got %d", got)
+	}
+	if !hasProbe(out.Blocks[50]) {
+		t.Fatal("block 50 (no activation conflict) must carry the probes")
+	}
+
+	// %100==0 keeps only the existing CREATE probe.
+	spec2, err := parseLadderFlag("0:regolith,2:canyon", 101)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out2, err := generateLadderChain(spec2, 101)
+	if err != nil {
+		t.Fatalf("generateLadderChain: %v", err)
+	}
+	if hasProbe(out2.Blocks[100]) {
+		t.Fatal("block 100 is the %100 CREATE block: contract probes must be skipped")
+	}
+	created := false
+	for _, r := range ladderProbeReceipts(t, out2.Blocks[100]) {
+		if r.opType == "eip1559" && r.to == nil {
+			created = true
+		}
+	}
+	if !created {
+		t.Fatal("block 100 must still carry the pre-existing CREATE probe")
+	}
+}
+
+// TestLadderContractProbeDeterminism: same spec twice -> byte-identical JSON
+// (new addresses, calldata, nonces and storage declarations are all inputs).
+func TestLadderContractProbeDeterminism(t *testing.T) {
+	spec, err := parseLadderFlag("0:regolith,2:canyon,4:ecotone", 55)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := func() string {
+		out, err := generateLadderChain(spec, 55)
+		if err != nil {
+			t.Fatalf("generateLadderChain: %v", err)
+		}
+		data, err := json.Marshal(out)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		h := sha256.Sum256(data)
+		return fmt.Sprintf("%x", h)
+	}
+	if a, b := sum(), sum(); a != b {
+		t.Fatalf("ladder generation is not deterministic: %s != %s", a, b)
+	}
+}

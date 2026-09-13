@@ -232,6 +232,21 @@ func generateLadderChain(spec ladderSpec, n int) (*chainOutput, error) {
 		messagePasserAddr: {Balance: big.NewInt(0), Nonce: 1, Code: realMessagePasserCode},
 		senderAddr:        {Balance: eth(senderFund)},
 	}
+	// P2-A contract-layer probes: four deterministic predeploys (extended logs,
+	// storage churn, revert-with-reason, INVALID). Nonce 1 + code keeps each
+	// account non-empty under EIP-158. See ladder_contracts.go for the code.
+	genesisPre[ladderLogsProbeAddr] = types.Account{Balance: big.NewInt(0), Nonce: 1, Code: ladderLogsProbeCode()}
+	genesisPre[ladderStorageProbeAddr] = types.Account{Balance: big.NewInt(0), Nonce: 1, Code: ladderStorageChurnCode()}
+	genesisPre[ladderRevertProbeAddr] = types.Account{Balance: big.NewInt(0), Nonce: 1, Code: ladderRevertReasonCode()}
+	genesisPre[ladderInvalidProbeAddr] = types.Account{Balance: big.NewInt(0), Nonce: 1, Code: ladderInvalidOpcodeCode()}
+
+	// Fork-activation block timestamps (from the EFFECTIVE activations map, so a
+	// skipped fork coupled to the next activation is covered too). Used to keep
+	// the contract probes off every fork-boundary block.
+	activationTimes := make(map[uint64]struct{}, len(activations))
+	for _, ts := range activations {
+		activationTimes[ts] = struct{}{}
+	}
 	// Runtime-readiness assertion (replaces the deleted layout-family guard):
 	// the genesis L1Block account MUST carry the combined four-way runtime, or a
 	// cross-family ladder would revert its attributes deposit on the first block
@@ -286,7 +301,8 @@ func generateLadderChain(spec ladderSpec, n int) (*chainOutput, error) {
 	for i, a := range spec.Activations {
 		forkPath[i] = a.Fork
 	}
-	withdrawalCount := 0 // per-generation 1-based withdrawal counter (withdrawalSlots k)
+	withdrawalCount := 0  // per-generation 1-based withdrawal counter (withdrawalSlots k)
+	contractProbeSeq := 0 // count of blocks that actually carried the P2-A probes
 	if err := func() (err error) {
 		defer func() {
 			if r := recover(); r != nil {
@@ -326,6 +342,11 @@ func generateLadderChain(spec ladderSpec, n int) (*chainOutput, error) {
 			if i == 0 {
 				in.Pre = genesisPre // block i>0's Pre is filled AFTER assembly, from i-1's postState
 			}
+			// P2-A: keep the probe predeploys in EVERY block's candidate set so
+			// their code (and the churn contract's storage) survive the per-block
+			// pre chain between the every-25-blocks probes. See
+			// ladderContractProbeAddrs for the failure mode this avoids.
+			in.ExtraCandidates = append(in.ExtraCandidates, ladderContractProbeAddrs...)
 			var txs []*types.Transaction
 			var outTxs []json.RawMessage
 			// add builds + injects one tx, keeping ins[i].Transactions in EXACT
@@ -400,6 +421,17 @@ func generateLadderChain(spec ladderSpec, n int) (*chainOutput, error) {
 			}
 			for _, p := range recipe.precompiles {
 				add(precompileCallTxNonce(1, bg.TxNonce(senderAddr), p.addr.Bytes(), p.input, p.gas, 0))
+			}
+
+			// P2-A contract-layer probes (events/storage/revert/invalid), appended
+			// AFTER every existing recipe tx so pre-existing tx positions and
+			// nonces are untouched. blockTime is an activation timestamp iff this
+			// block is a fork boundary (regolith@0's 1000 never equals a block
+			// time: blocks start at 1010).
+			_, isAnyForkActivation := activationTimes[blockTime]
+			if ladderContractProbesEnabled(i, isAnyForkActivation) {
+				injectLadderContractProbes(add, func() uint64 { return bg.TxNonce(senderAddr) }, in, contractProbeSeq)
+				contractProbeSeq++
 			}
 
 			ins[i] = in
