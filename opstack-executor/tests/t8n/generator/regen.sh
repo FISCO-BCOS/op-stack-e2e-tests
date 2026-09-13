@@ -26,7 +26,8 @@
 #   - vectors/*.json              逐 case 参考向量 + 三模式派生（corrupt/static/invalid-tx/chain）
 #   - golden/engine/*.golden.json 引擎黄金 + chained/ 链式黄金
 #   - golden/engine/{SHA256SUMS,manifest.txt}  golden 书务契约（append-only 维护，见判据 5）
-#   - golden/engine/getpayload/SHA256SUMS      getpayload 封套契约（同上；封套本体归 P2 Task 4）
+#   - golden/engine/getpayload/SHA256SUMS      getpayload 封套契约（封套本体由本脚本生成，
+#                                              P2 Task 4；映射见 getpayload/manifest.txt）
 #   - vectors/manifest.txt        注册表（幂等 append；static item 3/12 强制排除，loader 不可表达）
 #   - matrix/caps.json            op-geth 反射法报出的 Engine caps（生成物，不入库）
 #   - matrix/engine_api_windows.json  op-node 在 9 fork 激活点选用的方法号（生成物，不入库）
@@ -121,6 +122,39 @@ done
 
 "$OPGETH/opt8n-ref" --chain-output-dir "$T8N_DIR/golden/engine/chained" \
   --op-geth-commit "$PIN"                                    # 链式对 golden（chainA/B + jovianChainA/B）
+
+# ── getpayload 封套（P2 Task 4 接线，F-COV-2 收口）───────────────────────────
+# 9 个 LEGAL (fork, getPayload-version) 格，走真实 engine 路径
+# （ForkchoiceUpdatedV<fcu> → GetPayloadV<version>）。case/fork 映射、V 选档依据与
+# 确定性论证（NoTxPool 同步出块 ⇒ 逐字节可复现）全部记载在
+# golden/engine/getpayload/manifest.txt——本处只机械化那份映射，不另立事实源：
+#   granite_v3 用 granite_deposit_mint（granite 无 transfer_basic case）；
+#   karst_v5 复用 jovian body + --engine-fork karst（corpus 无 karst case）；
+#   karst_v5 与 jovian_v4 逐字节相同是记录在案的数据点，不是缺陷（见其 SHA256SUMS）。
+# 校验和契约 getpayload/SHA256SUMS 由判据 5 只读对拍：若重生字节与已提交值漂移，
+# 在此 WARNING、在 tripwire 红——刷新校验和永远是「有意的同提交动作」。
+GP_DIR="$T8N_DIR/golden/engine/getpayload"
+mkdir -p "$GP_DIR"
+gen_envelope() {  # <case.in.json stem> <out name> [engine-fork]
+  local in_case="$1" out_name="$2" fork_override="${3:-}"
+  local fork_args=()
+  [ -n "$fork_override" ] && fork_args=(--engine-fork "$fork_override")
+  "$OPGETH/opt8n-ref" --input "$T8N_DIR/cases/${in_case}.in.json" \
+    --output "$GP_DIR/$out_name" --engine-getpayload "${fork_args[@]+"${fork_args[@]}"}" \
+    --op-geth-commit "$PIN"
+}
+gen_envelope regolith_transfer_basic regolith_v2.json
+gen_envelope canyon_transfer_basic    canyon_v2.json
+gen_envelope ecotone_transfer_basic   ecotone_v3.json
+gen_envelope fjord_transfer_basic     fjord_v3.json
+gen_envelope granite_deposit_mint     granite_v3.json
+gen_envelope holocene_transfer_basic  holocene_v3.json
+gen_envelope isthmus_transfer_basic   isthmus_v4.json
+gen_envelope jovian_transfer_basic    jovian_v4.json
+gen_envelope jovian_transfer_basic    karst_v5.json karst
+for gp in regolith_v2 canyon_v2 ecotone_v3 fjord_v3 granite_v3 holocene_v3 isthmus_v4 jovian_v4 karst_v5; do
+  [ -f "$GP_DIR/$gp.json" ] || { echo "getpayload: $gp.json missing after generation" >&2; exit 1; }
+done
 
 # ── 判据 5：golden 书务维护（F-COV-1 复盘；append-only）──────────────────────
 # F-COV-1（WI-E3/E11）：语料新增了两个 golden，但 golden/engine/SHA256SUMS 没同步，直到
@@ -278,8 +312,8 @@ maintain_manifest(engine / "manifest.txt", golden_files(), "golden/engine/manife
 maintain_sums(getpayload / "SHA256SUMS", getpayload,
               sorted(p for p in getpayload.iterdir() if p.is_file() and p.suffix == ".json"),
               "golden/engine/getpayload/SHA256SUMS",
-              "These envelopes are produced outside this script (P2 Task 4's regen.sh wiring); "
-              "the tripwire's getpayload case stays red until they are regenerated.")
+              "The envelopes are generated above in this script; a vanished one means the "
+              "generation step broke.")
 PYEOF
 
 # ── matrix 工件（P1）：两个 dumper 各自在对应 pin 树内 build ─────────────────
