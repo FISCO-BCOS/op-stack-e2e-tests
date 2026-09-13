@@ -90,8 +90,47 @@ func TestLadderSmoke3BlocksCrossingCanyon(t *testing.T) {
 	if got := out.Blocks[2].Info.Hardfork; got != "canyon" {
 		t.Fatalf("block 3 hardfork: want canyon, got %q", got)
 	}
+	// chain-vector pre convention: ONLY block 0 carries pre; replayChainVector
+	// reloads state only when `pre` is present, so a regression to nil (or to
+	// non-nil on i>0) would fail silently downstream.
+	if out.Blocks[0].Pre == nil {
+		t.Fatal("block 0 must carry pre (chain replay origin)")
+	}
+	if out.Blocks[1].Pre != nil || out.Blocks[2].Pre != nil {
+		t.Fatal("blocks 1/2 must NOT carry pre (replayer inherits chain state)")
+	}
+	// currentTimestamp must really advance parent+10s (genesis t=1000 ->
+	// 0x3f2/0x3fc/0x406 = 1010/1020/1030) -- the enabler for automatic fork
+	// switching; a frozen timestamp would keep every block on the genesis fork.
+	for i, want := range []string{"0x3f2", "0x3fc", "0x406"} {
+		if got := out.Blocks[i].Env.CurrentTimestamp; got != want {
+			t.Fatalf("block %d currentTimestamp: want %s, got %s", i, want, got)
+		}
+	}
+	// block 0's L1-attributes deposit must have succeeded (0x1) -- a failed
+	// attributes deposit would silently leave the L1Block predeploy stale.
+	if got := out.Blocks[0].OpExpected.Receipts[0].Status; got != "0x1" {
+		t.Fatalf("block 0 attributes deposit receipt status: want 0x1, got %q", got)
+	}
 	if len(out.Blocks[2].OpExpected.Receipts) == 0 {
 		t.Fatal("block 3 has no receipts")
+	}
+}
+
+// TestLadderRejectsLayoutBoundaryCrossing：I1 守卫。regolith(Bedrock 族) ->
+// ecotone(Ecotone 族) 跨 L1Block 布局边界，一个 genesis 账户无法同时承载两种
+// runtime，必须在生成前报错（而不是块内以误导性的 slot 不匹配失败）。
+func TestLadderRejectsLayoutBoundaryCrossing(t *testing.T) {
+	spec, err := parseLadderFlag("0:regolith,2:ecotone", 6)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = generateLadderChain(spec, 6)
+	if err == nil {
+		t.Fatal("want layout-boundary error, got nil")
+	}
+	if !strings.Contains(err.Error(), "layout family") {
+		t.Fatalf("error %q does not contain %q", err, "layout family")
 	}
 }
 

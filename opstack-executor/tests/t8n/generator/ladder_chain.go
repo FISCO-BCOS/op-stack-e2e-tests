@@ -12,10 +12,15 @@ package main
 //     激活块携带旧布局——L1Block 升级在激活块内稍后才落地（与
 //     assertL1BlockConsistency 的 S7 Ecotone 特例同一语义）。
 //   - 每块 _info.hardfork = blockFork(cfg, blockTime)（块自身的 fork）。
-//   - genesis alloc 的 L1Block code/storage 用梯顶 fork（fp.daScalar=400 与
-//     chainN 的 jovian 臂一致，DA 足迹可观察）；message passer 携带真实部署
-//     runtime（Task 3 提款要用，现在携带无害）；sender 预充值 eth(1000)
-//     （比 chainN 的 eth(100) 大，Task 3 要加多笔转账）。
+//   - genesis alloc 的 L1Block code/storage 用梯顶 fork——但仅当整条 ladder
+//     落在同一 L1Block 布局族内才合法（见下方 forkLayout 守卫）：一个 genesis
+//     账户只能承载一种 L1Block runtime，Bedrock 族（regolith..canyon）与
+//     Ecotone 族（ecotone..jovian）的 runtime/存储布局互斥（Ecotone 族不
+//     dispatch Bedrock selector，槽位 1/3/7/8 vs 5/6 也不同名），跨族必须分链
+//     生成。fp.daScalar=400 仅在梯顶为 jovian 时设置（与 chainN 的 jovian 臂
+//     一致，DA 足迹可观察）；message passer 携带真实部署 runtime（Task 3 提款
+//     要用，现在携带无害）；sender 预充值 eth(1000)（比 chainN 的 eth(100)
+//     大，Task 3 要加多笔转账）。
 //
 // 每块配方与 chainN 相同：L1-attributes deposit + 真链上 nonce 的 sender
 // transfer（recipe 级别的差分注入留给 Task 3）。
@@ -34,6 +39,7 @@ import (
 	"github.com/ethereum/go-ethereum/consensus/misc/eip1559"
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethdb"
 )
 
@@ -104,6 +110,16 @@ var ladderCreate2DeployerCode = hexutil.MustDecode(
 		"7358221220fdc4a0fe96e3b21c108ca155438d37c9143fb01278a3c1d274948b" +
 		"ad89c564ba64736f6c63430008130033")
 
+// init anchors the hand-copied literal above: op-geth's init() only guards its
+// own copy (consensus/misc/create2deployer.go), so a generator-side typo would
+// silently seed wrong code and split the activation-block state root.
+func init() {
+	if got := crypto.Keccak256Hash(ladderCreate2DeployerCode); got !=
+		common.HexToHash("0xb0550b5b431e30d38000efb7107aaa0ade03d48a7198a140edda9d27134468b2") {
+		panic("ladderCreate2DeployerCode corrupt: keccak " + got.Hex())
+	}
+}
+
 func generateLadderChain(spec ladderSpec, n int) (*chainOutput, error) {
 	if n < 2 {
 		return nil, fmt.Errorf("generateLadderChain: n must be >= 2 (got %d)", n)
@@ -123,8 +139,21 @@ func generateLadderChain(spec ladderSpec, n int) (*chainOutput, error) {
 		return nil, err
 	}
 	topFork := spec.Activations[len(spec.Activations)-1].Fork
+	// 单个 genesis 账户只能承载一种 L1Block runtime：Bedrock 族
+	// （regolith..canyon）与 Ecotone 族（ecotone..jovian）的 runtime 与存储
+	// 布局互斥（Ecotone 族不 dispatch Bedrock selector，槽位 1/3/7/8 vs 5/6
+	// 也不同名）。因此一条 ladder 必须落在同一布局族内——跨族请分链生成。
+	if forkLayout(spec.Activations[0].Fork) != forkLayout(topFork) {
+		return nil, fmt.Errorf(
+			"ladder spans the L1Block layout boundary (%s..%s): one chain can only "+
+				"carry one L1Block runtime; generate one ladder per layout family "+
+				"(bedrock: regolith..canyon, ecotone-family: ecotone..jovian)",
+			spec.Activations[0].Fork, topFork)
+	}
 	fp := defaultFeeParams()
-	fp.daScalar = 400 // non-zero DA scalar: block DA footprint observable (chainN jovian arm)
+	if topFork == "jovian" {
+		fp.daScalar = 400 // non-zero DA scalar: block DA footprint observable (chainN jovian arm)
+	}
 
 	// Canyon 激活 ⇒ Process 在激活块 SetCode Create2Deployer（见
 	// canyonCreate2DeployerAddr 注释），生成侧必须在 genesis 预置同一代码。
@@ -254,7 +283,7 @@ func generateLadderChain(spec ladderSpec, n int) (*chainOutput, error) {
 		return nil, err
 	}
 	if len(blocks) != n {
-		return nil, fmt.Errorf("expected %d generated blocks, got %d", n, len(blocks))
+		return nil, fmt.Errorf("generateLadderChain: expected %d generated blocks, got %d", n, len(blocks))
 	}
 
 	// Self-check: independent fresh DB, Process+ValidateState over ALL n blocks
@@ -269,6 +298,14 @@ func generateLadderChain(spec ladderSpec, n int) (*chainOutput, error) {
 		if i > 0 {
 			ins[i].Pre = out.Blocks[i-1].PostState
 		}
+		// NOTE: assertL1BlockConsistency derives the block time from
+		// in.Genesis.Timestamp+10 (main.go:3754), so it judges every block by
+		// the FIRST block's fork/layout -- i.e. it assumes a layout-uniform
+		// chain. That is exactly what the forkLayout guard at the top of this
+		// function guarantees. If a cross-family chain is ever supported, pass
+		// an explicit block time parameter instead of overloading
+		// knobs.Timestamp (that field is the chain's genesis timestamp,
+		// main.go:218-221).
 		if err := assertL1BlockConsistency(cfg, ins[i]); err != nil {
 			return nil, fmt.Errorf("block %d: %w", i, err)
 		}
