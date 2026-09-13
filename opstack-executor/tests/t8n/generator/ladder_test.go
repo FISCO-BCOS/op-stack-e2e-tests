@@ -14,6 +14,8 @@ import (
 	"testing"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/common/math"
+	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 )
 
@@ -132,20 +134,46 @@ func TestLadderSmoke3BlocksCrossingCanyon(t *testing.T) {
 	}
 }
 
-// TestLadderRejectsLayoutBoundaryCrossing：I1 守卫。regolith(Bedrock 族) ->
-// ecotone(Ecotone 族) 跨 L1Block 布局边界，一个 genesis 账户无法同时承载两种
-// runtime，必须在生成前报错（而不是块内以误导性的 slot 不匹配失败）。
-func TestLadderRejectsLayoutBoundaryCrossing(t *testing.T) {
+// TestLadderCrossesLayoutBoundary: A2. The old I1 guard
+// (forkLayout(first) != forkLayout(top) -> error) is GONE; a chain crossing the
+// Bedrock/Ecotone L1Block layout boundary now generates, because
+//   - the genesis L1Block code is A1's combined four-way runtime
+//     (l1BlockCodeForLadder), and
+//   - genesis is seeded with the genesis fork's Bedrock layout (slots 1/5/6),
+//     with each later family's slots introduced by its first real deposit.
+//
+// The genesis code is anchored externally via block 0's emitted `pre` (not by
+// trusting the in-function readiness assert).
+func TestLadderCrossesLayoutBoundary(t *testing.T) {
 	spec, err := parseLadderFlag("0:regolith,2:ecotone", 6)
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = generateLadderChain(spec, 6)
-	if err == nil {
-		t.Fatal("want layout-boundary error, got nil")
+	out, err := generateLadderChain(spec, 6)
+	if err != nil {
+		t.Fatalf("cross-family ladder must generate after A2, got: %v", err)
 	}
-	if !strings.Contains(err.Error(), "layout family") {
-		t.Fatalf("error %q does not contain %q", err, "layout family")
+	if out.Blocks[0].Pre == nil {
+		t.Fatal("block 0 must carry pre")
+	}
+	acc, ok := (*out.Blocks[0].Pre)[l1BlockAddr]
+	if !ok {
+		t.Fatalf("genesis L1Block %s missing from block 0 pre", l1BlockAddr)
+	}
+	if !bytes.Equal(acc.Code, l1BlockCodeForLadder()) {
+		t.Fatalf("genesis L1Block code is not the combined four-way runtime (len %d)", len(acc.Code))
+	}
+	// Genesis seeds are the Bedrock layout: Ecotone-family slots must be absent
+	// (they are introduced by the deposit of the first post-Ecotone block).
+	for _, slot := range []common.Hash{types.L1FeeScalarsSlot, types.L1BlobBaseFeeSlot, types.OperatorFeeParamsSlot} {
+		if _, ok := acc.Storage[slot]; ok {
+			t.Fatalf("genesis must not pre-seed Ecotone-family slot %s", slot.Hex())
+		}
+	}
+	// Block 1 (index 0, t=1010) is regolith and still uses the Bedrock form;
+	// the fork switch must be automatic.
+	if got := out.Blocks[0].Info.Hardfork; got != "regolith" {
+		t.Fatalf("block 0 hardfork: want regolith, got %q", got)
 	}
 }
 
@@ -364,8 +392,8 @@ func TestLadderCanyonWithdrawalSmoke(t *testing.T) {
 // address, and the postState must carry that account with its init-phase
 // slot 0 = 1 -- without this the test would stay green even if the create
 // silently reverted/OOG'd (the ExtraStorage declaration for the wrong address
-// is inert). (The create rule is fork-independent, so it IS reachable today
-// inside the one layout family the guard allows.)
+// is inert). (The create rule is fork-independent, so a canyon-family ladder
+// exercises it directly.)
 func TestLadderCreateProbeSmoke(t *testing.T) {
 	const n = 101
 	spec, err := parseLadderFlag("0:regolith,2:canyon", n)
@@ -418,7 +446,8 @@ func TestLadderCreateProbeSmoke(t *testing.T) {
 
 func TestLadderPostStateSampling(t *testing.T) {
 	// 采样点（设计 v2 §3.4）：首块、末块、激活块±1、每 100 块。
-	// 注意 ladder 必须落在同一 L1Block 布局族内（当前仅 regolith..canyon 可生成）。
+	// A2 起 ladder 可跨 L1Block 布局族；此处用 canyon-only spec 保持采样集
+	// 可精确枚举。
 	//
 	// ladderActivation.Block 是 1-based 块号（canyon@50 => Timestamp=1500），
 	// block i 的时间是 genesis+10*(i+1)，故激活块 = 索引 49：48 是激活前一块、
@@ -709,6 +738,282 @@ func TestPostStateDefaultIsFull(t *testing.T) {
 	for i, b := range doc.Blocks {
 		if _, ok := b["postState"]; !ok {
 			t.Fatalf("default run: block %d missing postState (only boundary mode samples)", i)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------
+// A2 (stage 2/3): cross-family ladder prerequisites.
+// ---------------------------------------------------------------------
+
+// ladderBlockAttrsData returns block b's attributes deposit calldata (tx 0).
+func ladderBlockAttrsData(t *testing.T, b chainBlockOutput) []byte {
+	t.Helper()
+	if len(b.Block.Transactions) == 0 {
+		t.Fatalf("block has no transactions")
+	}
+	var st outputSignedTx
+	if err := json.Unmarshal(b.Block.Transactions[0], &st); err != nil {
+		t.Fatalf("decode attributes tx: %v", err)
+	}
+	return st.Data
+}
+
+// TestL1BlockGenesisSeeds pins the A2 seeding adjudication: a ladder's genesis
+// seeds are the GENESIS fork's layout (regolith -> Bedrock 1/5/6), NOT the
+// union of every activated layout.
+//
+// The union was the brief's first proposal, and it does fix the observed block-0
+// failure, but it is unusable: pre-seeding the Ecotone slots makes op-geth's
+// state-based NewL1CostFunc pick the Ecotone cost function while
+// deriveOPStackFields extracts Bedrock gasParams from the still-Bedrock
+// activation-block calldata; the two disagree and crossCheckVaults rejects the
+// vector ("l1 fee cross-check: vault delta ... != sum of per-tx L1 fees ...").
+// The lower half of this test documents that the rejected union really would
+// have added those slots (so the premise is not vacuous).
+func TestL1BlockGenesisSeeds(t *testing.T) {
+	fp := defaultFeeParams()
+	forks := []string{"regolith", "canyon", "ecotone", "isthmus", "jovian"}
+	got := fp.l1BlockGenesisSeeds(forks)
+	want := fp.l1BlockStorage("regolith")
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("genesis seeds: want the genesis fork's (Bedrock) layout %v, got %v", want, got)
+	}
+	for _, slot := range []common.Hash{types.L1FeeScalarsSlot, types.L1BlobBaseFeeSlot, types.OperatorFeeParamsSlot} {
+		if _, ok := got[slot]; ok {
+			t.Fatalf("genesis seeds must NOT contain the later-family slot %s", slot.Hex())
+		}
+	}
+
+	// Rejected alternative: the literal union (every activated layout, last
+	// writer wins) WOULD add 3/7/8 -- so the exclusion above is a real decision.
+	// (A non-zero operator fee makes Isthmus's slot8 non-zero, since the union's
+	// slot8 entry is otherwise absent when every operator-fee field is zero.)
+	unionFP := defaultFeeParams()
+	unionFP.opFeeScalar = 5000
+	union := map[common.Hash]common.Hash{}
+	for _, fork := range forks {
+		for k, v := range unionFP.l1BlockStorage(fork) {
+			union[k] = v
+		}
+	}
+	for _, slot := range []common.Hash{types.L1FeeScalarsSlot, types.L1BlobBaseFeeSlot, types.OperatorFeeParamsSlot} {
+		if _, ok := union[slot]; !ok {
+			t.Fatalf("test premise broken: the rejected union should contain slot %s", slot.Hex())
+		}
+	}
+}
+
+// TestL1BlockWrittenSlots pins the per-layout slot sets the ladder declares as
+// extra_storage so emitPostState accepts the transition blocks' newly-written
+// slots.
+func TestL1BlockWrittenSlots(t *testing.T) {
+	bedrock := []common.Hash{types.L1BaseFeeSlot, types.OverheadSlot, types.ScalarSlot}
+	ecotone := []common.Hash{types.L1BaseFeeSlot, types.L1FeeScalarsSlot, types.L1BlobBaseFeeSlot}
+	isthmus := []common.Hash{types.L1BaseFeeSlot, types.L1FeeScalarsSlot, types.L1BlobBaseFeeSlot, types.OperatorFeeParamsSlot}
+	want := map[string][]common.Hash{
+		"regolith": bedrock, "canyon": bedrock,
+		"ecotone": ecotone, "fjord": ecotone, "granite": ecotone, "holocene": ecotone,
+		"isthmus": isthmus, "jovian": isthmus,
+	}
+	for fork, exp := range want {
+		got := l1BlockWrittenSlots(fork)
+		if !reflect.DeepEqual(got, exp) {
+			t.Fatalf("%s written slots: want %v, got %v", fork, exp, got)
+		}
+	}
+}
+
+// TestAssertL1BlockConsistencyAtExplicitBlockTime anchors Task 3: the wrapper
+// keeps the genesis+10 default (so every pre-existing call site is unchanged),
+// while assertL1BlockConsistencyAt judges the block by the time it is handed.
+// knobs.Timestamp stays the CHAIN GENESIS field.
+func TestAssertL1BlockConsistencyAtExplicitBlockTime(t *testing.T) {
+	// regolith genesis, Ecotone activating at t=1040.
+	cfg, err := buildChainConfigSpec(chainConfigSpec{
+		base: "regolith", activations: map[string]uint64{"ecotone": 1040},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fp := defaultFeeParams()
+	attr := fp.attributesTx("explicit-time", "ecotone")
+	in := &inputCase{
+		Genesis:      genesisKnobs{Timestamp: math.HexOrDecimal64(1000)},
+		Pre:          types.GenesisAlloc{l1BlockAddr: {Storage: fp.l1BlockStorage("ecotone")}},
+		Transactions: []inputTx{attr},
+	}
+	// Wrapper: blockTime = genesis+10 = 1010 -> still regolith/Bedrock, so the
+	// 164B Ecotone deposit is rejected.
+	if err := assertL1BlockConsistency(cfg, in); err == nil {
+		t.Fatal("wrapper must judge the block at genesis+10 (pre-Ecotone) and reject a 164B Ecotone deposit")
+	}
+	// Explicit block time at/after EcotoneTime -> Ecotone layout, accepted.
+	if err := assertL1BlockConsistencyAt(cfg, in, 1050); err != nil {
+		t.Fatalf("explicit blockTime 1050 must accept the Ecotone deposit: %v", err)
+	}
+}
+
+// TestLadderEcotoneCrossFamilySmoke is acceptance smoke #1:
+// "0:regolith,2:canyon,4:ecotone" (n=6). Generation succeeds, every block's
+// _info.hardfork is correct, assertL1BlockConsistencyAt passes per block
+// (generation would fail otherwise), and the Ecotone-family deposits REALLY
+// execute: block 4/5 postState carries l1BlockStorage("ecotone")'s values.
+//
+// Contrast (recorded here and re-asserted below): before A2 the genesis L1Block
+// used l1BlockCodeFor(topFork) = the 146B runtime for topFork=ecotone, and that
+// runtime REVERTS on the 164B Ecotone selector (A1's
+// TestCombinedL1BlockSelectorEquivalence pins the same fact). So the 164B
+// deposits on blocks 4/5 are exactly what the combined runtime makes possible.
+func TestLadderEcotoneCrossFamilySmoke(t *testing.T) {
+	spec, err := parseLadderFlag("0:regolith,2:canyon,4:ecotone", 6)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := generateLadderChain(spec, 6)
+	if err != nil {
+		t.Fatalf("generateLadderChain: %v", err)
+	}
+	wantHF := []string{"regolith", "canyon", "canyon", "ecotone", "ecotone", "ecotone"}
+	for i, hf := range wantHF {
+		if got := out.Blocks[i].Info.Hardfork; got != hf {
+			t.Fatalf("block %d hardfork: want %s, got %s", i, hf, got)
+		}
+	}
+	// Attributes deposit executed on EVERY block (status 0x1 == not reverted).
+	for i := range out.Blocks {
+		rs := out.Blocks[i].OpExpected.Receipts
+		if len(rs) == 0 {
+			t.Fatalf("block %d has no receipts", i)
+		}
+		if rs[0].Status != "0x1" {
+			t.Fatalf("block %d attributes deposit status: want 0x1, got %s", i, rs[0].Status)
+		}
+	}
+	// Calldata layout: Bedrock 260B through the Ecotone activation block
+	// (block 3 carries the parent layout), 164B Ecotone from block 4 on.
+	for i := 0; i < 4; i++ {
+		d := ladderBlockAttrsData(t, out.Blocks[i])
+		if len(d) != 4+32*8 || !bytes.Equal(d[:4], types.BedrockL1AttributesSelector) {
+			t.Fatalf("block %d: want 260B Bedrock attributes, got len=%d sel=%x", i, len(d), d[:4])
+		}
+	}
+	for i := 4; i < 6; i++ {
+		d := ladderBlockAttrsData(t, out.Blocks[i])
+		if len(d) != 164 || !bytes.Equal(d[:4], types.EcotoneL1AttributesSelector) {
+			t.Fatalf("block %d: want 164B Ecotone attributes, got len=%d sel=%x", i, len(d), d[:4])
+		}
+	}
+	// The pre-A2 runtime would revert on this very calldata.
+	fp := defaultFeeParams()
+	if ok, _, _, _ := l1BlockExec(t, l1BlockRuntimeCode, fp.attributesData("ecotone"), l1Sentinel()); ok {
+		t.Fatal("PRE-EXISTING FACT CHANGED: the 146B runtime must revert on the Ecotone selector")
+	}
+	// A2 proof that the Ecotone deposits executed: postState slots ==
+	// l1BlockStorage("ecotone") = {1,3,7}, slot8 untouched.
+	want := fp.l1BlockStorage("ecotone")
+	for _, idx := range []int{4, 5} {
+		acc := out.Blocks[idx].PostState[l1BlockAddr]
+		for slot, val := range want {
+			if got := acc.Storage[slot]; got != val {
+				t.Fatalf("block %d L1Block slot %s: want %s, got %s", idx, slot.Hex(), val.Hex(), got.Hex())
+			}
+		}
+		if _, ok := acc.Storage[types.OperatorFeeParamsSlot]; ok {
+			t.Fatalf("block %d: the Ecotone layout must not write slot8", idx)
+		}
+	}
+}
+
+// TestLadderFourFamilySmoke is acceptance smoke #2:
+// "0:regolith,2:canyon,4:ecotone,6:isthmus,8:jovian" (n=12). All four L1Block
+// layout families are reached in one chain. The spec SKIPS fjord/granite/
+// holocene; generateLadderChain couples them to the next activated fork's
+// timestamp (a real chain cannot skip a fork, and op-geth's post-Isthmus
+// receipt cost function requires Fjord -- without coupling generation fails at
+// the first 176B block).
+func TestLadderFourFamilySmoke(t *testing.T) {
+	spec, err := parseLadderFlag("0:regolith,2:canyon,4:ecotone,6:isthmus,8:jovian", 12)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := generateLadderChain(spec, 12)
+	if err != nil {
+		t.Fatalf("generateLadderChain: %v", err)
+	}
+	wantHF := []string{
+		"regolith", "canyon", "canyon", "ecotone", "ecotone",
+		"isthmus", "isthmus", "jovian", "jovian", "jovian", "jovian", "jovian",
+	}
+	for i, hf := range wantHF {
+		if got := out.Blocks[i].Info.Hardfork; got != hf {
+			t.Fatalf("block %d hardfork: want %s, got %s", i, hf, got)
+		}
+	}
+	for i := range out.Blocks {
+		rs := out.Blocks[i].OpExpected.Receipts
+		if len(rs) == 0 || rs[0].Status != "0x1" {
+			t.Fatalf("block %d attributes deposit did not execute", i)
+		}
+	}
+	// All four families reachable, and both activation-block forms are the
+	// fauthful pre-fork form:
+	//   idx3 ecotone activation -> parent Bedrock 260B;
+	//   idx5 isthmus activation -> parent Ecotone 164B (Task 5 exemption);
+	//   idx7 jovian activation  -> parent Isthmus 176B, deposits-only (Task 6).
+	wantAttrs := []struct {
+		n   int
+		sel []byte
+	}{
+		{4 + 32*8, types.BedrockL1AttributesSelector}, // 0 regolith
+		{4 + 32*8, types.BedrockL1AttributesSelector}, // 1 canyon
+		{4 + 32*8, types.BedrockL1AttributesSelector}, // 2 canyon
+		{4 + 32*8, types.BedrockL1AttributesSelector}, // 3 ecotone ACTIVATION (old Bedrock form)
+		{164, types.EcotoneL1AttributesSelector},      // 4 first Ecotone-format
+		{164, types.EcotoneL1AttributesSelector},      // 5 isthmus ACTIVATION (old Ecotone form)
+		{176, types.IsthmusL1AttributesSelector},      // 6 first Isthmus-format
+		{176, types.IsthmusL1AttributesSelector},      // 7 jovian ACTIVATION (old Isthmus form)
+		{178, types.JovianL1AttributesSelector},       // 8 first Jovian-format
+		{178, types.JovianL1AttributesSelector},       // 9
+		{178, types.JovianL1AttributesSelector},       // 10
+		{178, types.JovianL1AttributesSelector},       // 11
+	}
+	for i, w := range wantAttrs {
+		d := ladderBlockAttrsData(t, out.Blocks[i])
+		if len(d) != w.n || !bytes.Equal(d[:4], w.sel) {
+			t.Fatalf("block %d attributes: want len=%d sel=%x, got len=%d sel=%x", i, w.n, w.sel, len(d), d[:4])
+		}
+	}
+	// Jovian activation block: deposits-only (op-geth CalcDAFootprint).
+	for _, raw := range out.Blocks[7].Block.Transactions {
+		var st outputSignedTx
+		if err := json.Unmarshal(raw, &st); err != nil {
+			t.Fatalf("decode gate block tx: %v", err)
+		}
+		if st.OpType != "deposit" {
+			t.Fatalf("Jovian activation block must be deposits-only, got %q", st.OpType)
+		}
+	}
+	// Task 6 DA transition: slot8 DA bytes stay unset through the Isthmus blocks
+	// and the Jovian activation block; the FIRST 178B Jovian block's deposit
+	// writes daScalar=400 at slot8[18:20] (operator-fee segment zero with the
+	// default fp), and it persists.
+	for _, idx := range []int{5, 6, 7} {
+		acc := out.Blocks[idx].PostState[l1BlockAddr]
+		if got, ok := acc.Storage[types.OperatorFeeParamsSlot]; ok && !isZero(got[18:20]) {
+			t.Fatalf("block %d: DA bytes must be unset before the first 178B block, got %x", idx, got[18:20])
+		}
+	}
+	daSlot := out.Blocks[8].PostState[l1BlockAddr].Storage[types.OperatorFeeParamsSlot]
+	if !bytes.Equal(daSlot[18:20], []byte{0x01, 0x90}) {
+		t.Fatalf("first 178B Jovian block must write daScalar 400 (0x0190), got %x", daSlot[18:20])
+	}
+	if !isZero(daSlot[20:32]) {
+		t.Fatalf("operator-fee segment must stay zero with the default fp, got %x", daSlot[20:32])
+	}
+	for idx := 9; idx < 12; idx++ {
+		if got := out.Blocks[idx].PostState[l1BlockAddr].Storage[types.OperatorFeeParamsSlot]; got != daSlot {
+			t.Fatalf("block %d slot8 %s != first-Jovian slot8 %s (DA must persist)", idx, got.Hex(), daSlot.Hex())
 		}
 	}
 }

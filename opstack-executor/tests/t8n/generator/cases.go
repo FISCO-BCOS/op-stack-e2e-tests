@@ -678,6 +678,61 @@ func (fp feeParams) l1BlockStorage(fork string) map[common.Hash]common.Hash {
 	return st
 }
 
+// l1BlockGenesisSeeds builds the genesis L1Block seeds for a LADDER (A2):
+// the layout of the fork active AT GENESIS, i.e. the first activated fork.
+//
+// A2's brief proposed unioning EVERY activated layout instead, because a single
+// genesis account must satisfy the Pre-slot mirror for blocks in different
+// families (Bedrock reads 1/5/6, Ecotone-family reads 1/3/7/8) and the old
+// top-fork-only seeding left Bedrock's 5/6 unseeded -- which is indeed why
+// block 0 failed. A full union is NOT usable, though (probe evidence, A2
+// report): pre-seeding the Ecotone slots makes the Ecotone ACTIVATION block
+// (Bedrock 260B calldata, Ecotone config) see an already-configured Ecotone
+// state, so op-geth's state-based NewL1CostFunc picks the Ecotone cost function
+// while deriveOPStackFields extracts Bedrock gasParams from the still-Bedrock
+// calldata. The two disagree and crossCheckVaults (main.go:4761) rejects the
+// vector: "l1 fee cross-check: vault delta ... != sum of per-tx L1 fees ...".
+//
+// The faithful genesis state is therefore the genesis fork's layout only:
+// parseLadderFlag forces the first activation to be 0:regolith, so genesis is
+// always the Bedrock layout (slots 1/5/6, DA/operator-fee/scalars unset). Each
+// later fork's slots are introduced by the block whose attributes deposit first
+// writes them; assertL1BlockConsistencyAt carries the narrow transition
+// exemptions for those blocks. Forks is accepted (canonical order) so the
+// helper documents which layout is chosen and so a future non-regolith genesis
+// fork keeps working.
+func (fp feeParams) l1BlockGenesisSeeds(forks []string) map[common.Hash]common.Hash {
+	if len(forks) == 0 {
+		panic("l1BlockGenesisSeeds: no activated forks")
+	}
+	return fp.l1BlockStorage(forks[0])
+}
+
+// l1BlockWrittenSlots returns the L1Block slots the attributes deposit of a
+// layout writes. A ladder must declare these per block as extra_storage: on the
+// first block of a fork the slots are NOT yet in the Pre state (the deposit is
+// what introduces them), and emitPostState hard-fails on any written slot
+// outside the declared (Pre ++ extra_storage) set. Values are irrelevant here
+// -- only the slot keys feed the declaration set -- so this mirrors the
+// dispatch arms of the combined runtime:
+//
+//	Bedrock  260B -> 1,5,6
+//	Ecotone  164B -> 1,3,7 (no operator-fee/DA segment)
+//	Isthmus  176B -> 1,3,7,8
+//	Jovian   178B -> 1,3,7,8 (same body packs the DA scalar into slot8[18:20])
+func l1BlockWrittenSlots(fork string) []common.Hash {
+	switch forkLayout(fork) {
+	case layoutBedrock:
+		return []common.Hash{types.L1BaseFeeSlot, types.OverheadSlot, types.ScalarSlot}
+	case layoutEcotone:
+		return []common.Hash{types.L1BaseFeeSlot, types.L1FeeScalarsSlot, types.L1BlobBaseFeeSlot}
+	case layoutIsthmus, layoutJovian:
+		return []common.Hash{types.L1BaseFeeSlot, types.L1FeeScalarsSlot, types.L1BlobBaseFeeSlot, types.OperatorFeeParamsSlot}
+	default:
+		panic(fmt.Sprintf("l1BlockWrittenSlots: unhandled layout for %q", fork))
+	}
+}
+
 func (fp feeParams) attributesTx(label string, fork string) inputTx {
 	to := l1BlockAddr
 	return inputTx{

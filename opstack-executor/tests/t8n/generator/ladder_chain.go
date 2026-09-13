@@ -12,18 +12,18 @@ package main
 //     激活块携带旧布局——L1Block 升级在激活块内稍后才落地（与
 //     assertL1BlockConsistency 的 S7 Ecotone 特例同一语义）。
 //   - 每块 _info.hardfork = blockFork(cfg, blockTime)（块自身的 fork）。
-//   - genesis alloc 的 L1Block code/storage 用梯顶 fork——但仅当整条 ladder
-//     落在同一 L1Block 布局族内才合法（见下方 forkLayout 守卫）：一个 genesis
-//     账户只能承载一种 L1Block runtime，Bedrock 族（regolith..canyon）与
-//     Ecotone 族（ecotone..jovian）的 runtime/存储布局互斥（Ecotone 族不
-//     dispatch Bedrock selector，槽位 1/3/7/8 vs 5/6 也不同名），跨族必须分链
-//     生成。fp.daScalar=400 仅在梯顶为 jovian 时设置（与 chainN 的 jovian 臂
-//     一致，DA 足迹可观察）；message passer 携带真实部署 runtime（Task 3 提款
-//     要用，现在携带无害）；sender 预充值 max(1000, 2n) ETH（下限比 chainN 的
-//     eth(100) 大，且线性覆盖每块一笔的 1 ETH transfer + gas：原硬编码
-//     eth(1000) 在 --blocks=1000 时差最后一块 ~0.19 ETH 就 panic，实测 999
-//     块 OK / 1000 块 insufficient funds；2n 对所有 n 都留有余量，小数点以下
-//     的 gas 最坏 ~8.5e-4 ETH/块）。
+//   - genesis alloc 的 L1Block code 用 A1 的组合四路 runtime
+//     （l1BlockCodeForLadder），storage 用 genesis-fork 播种
+//     （fp.l1BlockGenesisSeeds(activatedForks)，即 regolith 的 Bedrock 布局
+//     1/5/6）——一条链因此可以真正跨越 Bedrock/Ecotone 布局边界（见下方 guard
+//     删除处注释）。fp.daScalar=400 仅在梯顶为 jovian 时设置（与 chainN 的
+//     jovian 臂一致，DA 足迹可观察）；后续 fork 的槽位（3/7/8）由各 fork 第一个
+//     真实 attributes 存款写入，assertL1BlockConsistencyAt 为这些过渡块保留窄
+//     豁免。message passer 携带真实部署 runtime（Task 3 提款要用，现在携带无害）；sender 预充值 max(1000, 2n)
+//     ETH（下限比 chainN 的 eth(100) 大，且线性覆盖每块一笔的 1 ETH transfer +
+//     gas：原硬编码 eth(1000) 在 --blocks=1000 时差最后一块 ~0.19 ETH 就 panic，
+//     实测 999 块 OK / 1000 块 insufficient funds；2n 对所有 n 都留有余量，
+//     小数点以下的 gas 最坏 ~8.5e-4 ETH/块）。
 //
 // 每块配方 = L1-attributes deposit + recipeFor(fork, blockIdx, isForkActivation)
 // 的用户存款 / 提款 / CREATE / precompile 探针 + 一笔真链上 nonce 的 sender
@@ -31,6 +31,7 @@ package main
 // 提款写入的 MessagePasser 槽由 withdrawalSlots 声明（emitPostState 硬校验）。
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
@@ -142,35 +143,74 @@ func generateLadderChain(spec ladderSpec, n int) (*chainOutput, error) {
 		}
 		activations[a.Fork] = a.Timestamp
 	}
+	// Cumulative-fork coupling (A2): a ladder activation table is a strictly
+	// increasing SUBSEQUENCE, so it may skip intermediate forks. op-geth
+	// tolerates a skipped fork in the config but NOT in the L1-cost accounting:
+	// extractL1GasParamsPostIsthmus (core/types/rollup_cost.go:534-556) installs
+	// the Fjord cost function UNCONDITIONALLY for post-Isthmus calldata, while
+	// the state-transition cost function (NewL1CostFunc) picks Fjord only when
+	// cfg.IsOptimismFjord(time). With Isthmus active but Fjord not, receipt
+	// derivation and charging disagree and crossCheckVaults rejects the block
+	// (probe evidence: "l1 fee cross-check: vault delta ... != sum of per-tx L1
+	// fees ..." at the first 176B block). Couple every skipped intermediate fork
+	// to the NEXT activated fork's timestamp (e.g. 6:isthmus activates
+	// fjord/granite/holocene at 1060), so the config is cumulative like a real
+	// chain. blockFork() still reports the latest fork, so _info.hardfork is
+	// unchanged.
+	topIdx := -1
+	for i := len(ladderForks) - 1; i >= 0; i-- {
+		if _, ok := activations[ladderForks[i]]; ok {
+			topIdx = i
+			break
+		}
+	}
+	if topIdx < 1 {
+		return nil, fmt.Errorf("ladder: no activated fork above regolith (spec %+v)", spec.Activations)
+	}
+	nextTS := activations[ladderForks[topIdx]]
+	for idx := topIdx - 1; idx >= 1; idx-- {
+		fork := ladderForks[idx]
+		if ts, ok := activations[fork]; ok {
+			nextTS = ts
+			continue
+		}
+		activations[fork] = nextTS
+	}
 	cfg, err := buildChainConfigSpec(chainConfigSpec{base: "regolith", activations: activations})
 	if err != nil {
 		return nil, err
 	}
 	topFork := spec.Activations[len(spec.Activations)-1].Fork
-	// 单个 genesis 账户只能承载一种 L1Block runtime：Bedrock 族
-	// （regolith..canyon）与 Ecotone 族（ecotone..jovian）的 runtime 与存储
-	// 布局互斥（Ecotone 族不 dispatch Bedrock selector，槽位 1/3/7/8 vs 5/6
-	// 也不同名）。因此一条 ladder 必须落在同一布局族内——跨族请分链生成。
-	if forkLayout(spec.Activations[0].Fork) != forkLayout(topFork) {
-		return nil, fmt.Errorf(
-			"ladder spans the L1Block layout boundary (%s..%s): one chain can only "+
-				"carry one L1Block runtime; generate one ladder per layout family "+
-				"(bedrock: regolith..canyon, ecotone-family: ecotone..jovian)",
-			spec.Activations[0].Fork, topFork)
-	}
+	// A2: the Bedrock/Ecotone layout-family guard is GONE. It existed only
+	// because a single genesis L1Block account carried exactly one family
+	// runtime (l1BlockCodeFor(topFork)), and neither family runtime accepts the
+	// other family's selector (the 146B runtime reverts on the 164B Ecotone
+	// calldata; the 52B Bedrock runtime knows only 0x015d8eb9). A1's combined
+	// four-way dispatch runtime (l1BlockCodeForLadder, 239B: Bedrock 0x015d8eb9,
+	// Ecotone 0x440a5e20, Isthmus 0x098999be, Jovian 0x3db6be2b) executes the
+	// attributes deposit of EVERY family, so one chain can now cross the
+	// boundary. Genesis keeps the genesis fork's (Bedrock) seeding and each
+	// later family introduces its own slots via its first real deposit
+	// (fp.l1BlockGenesisSeeds; see its doc for why a full union is unusable).
+	// The parser invariants (0:regolith first, strictly increasing canonical
+	// forks) still hold in parseLadderFlag; the runtime readiness is asserted
+	// below.
 	fp := defaultFeeParams()
+	activatedForks := make([]string, len(spec.Activations))
+	for i, a := range spec.Activations {
+		activatedForks[i] = a.Fork
+	}
 	if topFork == "jovian" {
 		fp.daScalar = 400 // non-zero DA scalar: block DA footprint observable (chainN jovian arm)
 	}
 
 	// Canyon 激活 ⇒ Process 在激活块 SetCode Create2Deployer（见
 	// canyonCreate2DeployerAddr 注释），生成侧必须在 genesis 预置同一代码。
-	canyonActivated := false
-	for _, a := range spec.Activations {
-		if a.Fork == "canyon" {
-			canyonActivated = true
-		}
-	}
+	// 用 EFFECTIVE activations（含上面 cumulative coupling 补入的 canyon）：
+	// spec 跳过 canyon 但激活 ecotone 时，coupling 会把 CanyonTime 设为 ecotone
+	// 的激活时间，注入仍会触发——只查原始 spec 会漏预置并让 self-check 以
+	// merkle-root 分叉失败。
+	_, canyonActivated := activations["canyon"]
 
 	const (
 		denom      = uint64(50)
@@ -188,9 +228,18 @@ func generateLadderChain(spec ladderSpec, n int) (*chainOutput, error) {
 		senderFund = 1000
 	}
 	genesisPre := types.GenesisAlloc{
-		l1BlockAddr:       {Balance: big.NewInt(0), Nonce: 1, Code: l1BlockCodeFor(topFork), Storage: fp.l1BlockStorage(topFork)},
+		l1BlockAddr:       {Balance: big.NewInt(0), Nonce: 1, Code: l1BlockCodeForLadder(), Storage: fp.l1BlockGenesisSeeds(activatedForks)},
 		messagePasserAddr: {Balance: big.NewInt(0), Nonce: 1, Code: realMessagePasserCode},
 		senderAddr:        {Balance: eth(senderFund)},
+	}
+	// Runtime-readiness assertion (replaces the deleted layout-family guard):
+	// the genesis L1Block account MUST carry the combined four-way runtime, or a
+	// cross-family ladder would revert its attributes deposit on the first block
+	// of the other family. Anchor it explicitly so a regression to
+	// l1BlockCodeFor(topFork) is caught here rather than as a mysterious
+	// slot/receipt mismatch downstream.
+	if !bytes.Equal(genesisPre[l1BlockAddr].Code, l1BlockCodeForLadder()) {
+		return nil, fmt.Errorf("ladder genesis L1Block code is not the combined four-way runtime")
 	}
 	if canyonActivated {
 		genesisPre[canyonCreate2DeployerAddr] = types.Account{
@@ -296,6 +345,15 @@ func generateLadderChain(spec ladderSpec, n int) (*chainOutput, error) {
 			// deposits, then non-deposit txs.
 			add(attr)
 
+			// Declare the L1Block slots the calldata's LAYOUT writes: on the
+			// first block of a new family the deposit introduces slots absent
+			// from Pre, and emitPostState rejects undeclared written slots.
+			// layoutFork (parent layout) is what the dispatch arm writes.
+			if in.ExtraStorage == nil {
+				in.ExtraStorage = map[common.Address][]common.Hash{}
+			}
+			in.ExtraStorage[l1BlockAddr] = append(in.ExtraStorage[l1BlockAddr], l1BlockWrittenSlots(layoutFork)...)
+
 			blockForkName := blockFork(cfg, blockTime)
 			// Jovian activation block must be deposits-only (op-geth
 			// core/types/rollup_cost.go:571-576); assertL1BlockConsistency
@@ -368,15 +426,12 @@ func generateLadderChain(spec ladderSpec, n int) (*chainOutput, error) {
 		if i > 0 {
 			ins[i].Pre = out.Blocks[i-1].PostState
 		}
-		// NOTE: assertL1BlockConsistency derives the block time from
-		// in.Genesis.Timestamp+10 (main.go:3754), so it judges every block by
-		// the FIRST block's fork/layout -- i.e. it assumes a layout-uniform
-		// chain. That is exactly what the forkLayout guard at the top of this
-		// function guarantees. If a cross-family chain is ever supported, pass
-		// an explicit block time parameter instead of overloading
-		// knobs.Timestamp (that field is the chain's genesis timestamp,
-		// main.go:218-221).
-		if err := assertL1BlockConsistency(cfg, ins[i]); err != nil {
+		// A2: judge every block by ITS OWN time (blocks[i].Time()), not the
+		// genesis+10 default -- a cross-family ladder's blocks activate different
+		// forks, so the single-block assumption would type every block as
+		// regolith/canyon. assertL1BlockConsistency keeps the genesis+10 default
+		// for all pre-existing call sites.
+		if err := assertL1BlockConsistencyAt(cfg, ins[i], blocks[i].Time()); err != nil {
 			return nil, fmt.Errorf("block %d: %w", i, err)
 		}
 		if err := assertDepositsFirst(ins[i].Transactions); err != nil {

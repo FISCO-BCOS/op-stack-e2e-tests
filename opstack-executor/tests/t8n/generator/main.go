@@ -3782,6 +3782,19 @@ func parentBeaconRootOrZero(h *common.Hash) string {
 }
 
 func assertL1BlockConsistency(cfg *params.ChainConfig, in *inputCase) error {
+	// Single-block / fork-at-0 vectors have exactly one block, at
+	// genesis.Timestamp+10 (chain_makers.makeHeader's fixed parent+10s step).
+	// Multi-block ladders must judge EVERY block by its own time, so they call
+	// assertL1BlockConsistencyAt directly with blocks[i].Time() (ladder_chain.go).
+	// This wrapper keeps every pre-existing call site's behavior byte-identical.
+	return assertL1BlockConsistencyAt(cfg, in, uint64(in.Genesis.Timestamp)+10)
+}
+
+// assertL1BlockConsistencyAt is assertL1BlockConsistency with an EXPLICIT block
+// time. blockTime decides the block's fork (blockFork) and hence the expected
+// L1-attributes layout. knobs.Timestamp is the CHAIN GENESIS timestamp and must
+// NOT be overloaded to carry a block time.
+func assertL1BlockConsistencyAt(cfg *params.ChainConfig, in *inputCase, blockTime uint64) error {
 	if len(in.Transactions) == 0 {
 		return fmt.Errorf("case has no transactions (needs the L1 attributes deposit)")
 	}
@@ -3807,7 +3820,6 @@ func assertL1BlockConsistency(cfg *params.ChainConfig, in *inputCase) error {
 	// whose single block crosses IsthmusTime/JovianTime must be judged by the
 	// block-time fork -- op-geth switches the attributes deposit format at the
 	// fork boundary. For pure fork-at-0 recipes blockFork == the case hardfork.
-	blockTime := uint64(in.Genesis.Timestamp) + 10 // chain_makers.makeHeader: block time fixed at parent+10
 	jovianCfg := cfg.IsJovian(blockTime)
 	layout := forkLayout(blockFork(cfg, blockTime))
 
@@ -3820,11 +3832,21 @@ func assertL1BlockConsistency(cfg *params.ChainConfig, in *inputCase) error {
 	// the otherwise-forbidden first-Ecotone fallback state is REQUIRED, so detect
 	// exactly (genesis < EcotoneTime <= blockTime) + a Bedrock-shaped 260B
 	// calldata, validate the Bedrock slot mirror, and require the Ecotone slots
-	// to stay zero. Every other post-Ecotone block keeps the 164B rule and the
-	// fallback trap guard below.
+	// to stay zero. Every other post-Ecotone block keeps the 164B rule (with the
+	// A2 first-format transition carve-out in the layoutEcotone branch below)
+	// and the fallback trap guard.
 	genesisTime := uint64(in.Genesis.Timestamp)
 	ecotoneActivationBlock := cfg.EcotoneTime != nil &&
 		genesisTime < *cfg.EcotoneTime && *cfg.EcotoneTime <= blockTime
+	// First Isthmus block: like S7/Ecotone, it still carries the PREVIOUS
+	// (Ecotone 164B) attributes form -- op-geth extractL1GasParams detects this
+	// by selector (rollup_cost.go:410-415) and uses the Ecotone cost function.
+	// Detect it as the first block whose OWN fork is Isthmus (parent still
+	// pre-Isthmus): chain_makers.makeHeader advances exactly +10s per block, the
+	// same interval the assert's default wrapper already assumes.
+	const makeHeaderInterval = uint64(10)
+	firstIsthmusBlock := cfg.IsthmusTime != nil && blockTime >= makeHeaderInterval &&
+		cfg.IsIsthmus(blockTime) && !cfg.IsIsthmus(blockTime-makeHeaderInterval)
 	if ecotoneActivationBlock && len(data) == 4+32*8 && bytes.Equal(data[0:4], types.BedrockL1AttributesSelector) {
 		slot5, slot6 := slot(5), slot(6)
 		if !bytes.Equal(slot1[:], data[68:100]) {
@@ -3925,9 +3947,35 @@ func assertL1BlockConsistency(cfg *params.ChainConfig, in *inputCase) error {
 			return err
 		}
 		if !bytes.Equal(slot8[18:20], data[176:178]) {
+			// A2 ladder transition: the FIRST full-format (178B) Jovian block's
+			// PRE still has the DA scalar unset. The preceding Jovian ACTIVATION
+			// block carries the 176B Isthmus form (CalcDAFootprint's activation
+			// branch, rollup_cost.go:568-575) and writes no DA byte, and the
+			// ladder's genesis seeding deliberately does NOT pre-seed a DA value
+			// (genesis is pre-Jovian). This 178B deposit introduces the scalar, so
+			// the Pre mirror cannot hold yet. Gate on a chain whose genesis is
+			// strictly pre-Jovian, so a fork-at-0 Jovian vector that forgot to
+			// seed the DA scalar still fails here.
+			if genesisTime < *cfg.JovianTime && isZero(slot8[18:20]) {
+				return nil
+			}
 			return fmt.Errorf("slot8[18:20] (daFootprintGasScalar) %x != calldata[176:178] %x", slot8[18:20], data[176:178])
 		}
 		return nil
+	case firstIsthmusBlock && len(data) == 164 && bytes.Equal(data[0:4], types.EcotoneL1AttributesSelector):
+		// Task 5 (A2), symmetric to the Ecotone S7 exception above: the FIRST
+		// ISTHMUS block still carries the pre-Isthmus (Ecotone 164B) attributes
+		// form because the L1Block upgrade lands later in the block. op-geth
+		// accepts it by selector (extractL1GasParams, rollup_cost.go:410-415,
+		// "edge case: for the very first Isthmus block we still need to use the
+		// Ecotone function") and the generator's parent-layout rule emits exactly
+		// this form (ladder_chain.go). Validate the Ecotone slot mirror; the
+		// operator-fee slot-8 segment does not exist yet and is not checked (the
+		// next, full-format Isthmus block introduces it -- its own default-branch
+		// checkCommon covers it). The alternative -- making the generator emit
+		// the 176B Isthmus form here -- would deviate from op-node and from
+		// op-geth's activation-block semantics.
+		return checkCommon(layoutEcotone)
 	case layout == layoutEcotone:
 		// Ecotone/Fjord/Granite/Holocene: exactly 164B with the Ecotone
 		// selector and NO operator-fee/DA segment. extractL1GasParamsPostEcotone
@@ -3938,6 +3986,21 @@ func assertL1BlockConsistency(cfg *params.ChainConfig, in *inputCase) error {
 		}
 		if !bytes.Equal(data[0:4], types.EcotoneL1AttributesSelector) {
 			return fmt.Errorf("Ecotone-family attributes selector mismatch: got %x", data[0:4])
+		}
+		// A2 first-format transition: on a chain whose genesis is pre-Ecotone,
+		// the FIRST block carrying the 164B Ecotone form runs it because the
+		// L1Block upgrade landed in the previous (activation) block -- that
+		// activation block used the Bedrock 260B form and wrote only slots 1/5/6
+		// (S7 branch above), so the PRE state still has the Ecotone slots unset
+		// and THIS deposit writes them. The strict Pre mirror cannot hold yet.
+		// Gate on (genesis < EcotoneTime <= blockTime) plus the actually-unset
+		// state, so fork-at-0 Ecotone vectors (genesis pre-seeds 3/7) keep the
+		// strict mirror and the fallback-trap guard. The deposit's real effect
+		// is anchored by the post-state assertion in the A2 cross-family smoke
+		// (PostState L1Block slots == l1BlockStorage("ecotone")).
+		if slot7 == (common.Hash{}) && isZero(slot3[16:24]) &&
+			cfg.EcotoneTime != nil && genesisTime < *cfg.EcotoneTime && *cfg.EcotoneTime <= blockTime {
+			return nil
 		}
 		return checkCommon(layoutEcotone)
 	default: // isthmus
