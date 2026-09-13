@@ -122,6 +122,10 @@ func main() {
 		// generateLadderChain's forkLayout guard).
 		ladderSpec   = flag.String("ladder", "", "D1: fork activation table <block>:<fork>,… (block-number semantics; karst rejected; with --mode=ladder)")
 		ladderBlocks = flag.Int("blocks", 1000, "D1: total blocks for --mode=ladder")
+		// D1h: postState export granularity for ladder mode. "boundary" (default)
+		// keeps the sampled vector (sample points + sampledBlocks key); "full"
+		// emits postState on every block and omits sampledBlocks.
+		postStateMode = flag.String("poststate", "boundary", "D1h: ladder postState granularity: boundary|full (with --mode=ladder)")
 		// P2 Task 1 probe: drive the real miner/engine getPayload path (not
 		// GenerateChainWithGenesis) for the case's fork and dump the raw engine
 		// response JSON. Takes --input + --output like the vector path.
@@ -184,7 +188,7 @@ func main() {
 			os.Exit(1)
 		}
 	case *invalidMode == "ladder":
-		if err := runLadderMode(*invalidOut, *ladderSpec, *ladderBlocks, *opGethCommit); err != nil {
+		if err := runLadderMode(*invalidOut, *ladderSpec, *ladderBlocks, *opGethCommit, *postStateMode); err != nil {
 			fmt.Fprintf(os.Stderr, "opt8n-ref: %v\n", err)
 			os.Exit(1)
 		}
@@ -204,7 +208,7 @@ func main() {
 			os.Exit(1)
 		}
 	default:
-		fmt.Fprintln(os.Stderr, "usage: opt8n-ref --write-cases <dir> | --probe-receipt-fields <case.in.json> | --probe-spec | --probe-genesis-number | --probe-precompile <fork> | --input <case.in.json> --output <vector.json> [--golden-output <golden.json>] [--op-geth-commit <sha>] | --input <case.in.json> --output <engine-response.json> --engine-getpayload [--engine-fork <fork>] | --chain-output-dir <dir> [--op-geth-commit <sha>] | --mode corrupt|static|invalid-tx --base <stem> --out-dir <dir> [--op-geth-commit <sha>] | --mode chain:<N>[:fork|:break] --out-dir <dir> [--op-geth-commit <sha>] | --mode ladder --ladder <块号:fork名,…> --blocks N --out-dir <dir>")
+		fmt.Fprintln(os.Stderr, "usage: opt8n-ref --write-cases <dir> | --probe-receipt-fields <case.in.json> | --probe-spec | --probe-genesis-number | --probe-precompile <fork> | --input <case.in.json> --output <vector.json> [--golden-output <golden.json>] [--op-geth-commit <sha>] | --input <case.in.json> --output <engine-response.json> --engine-getpayload [--engine-fork <fork>] | --chain-output-dir <dir> [--op-geth-commit <sha>] | --mode corrupt|static|invalid-tx --base <stem> --out-dir <dir> [--op-geth-commit <sha>] | --mode chain:<N>[:fork|:break] --out-dir <dir> [--op-geth-commit <sha>] | --mode ladder --ladder <块号:fork名,…> --blocks N --out-dir <dir> [--poststate boundary|full]")
 		os.Exit(2)
 	}
 }

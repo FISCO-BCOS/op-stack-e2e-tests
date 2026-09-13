@@ -437,15 +437,35 @@ func generateLadderChainSampled(spec ladderSpec, n int) (*chainOutput, error) {
 
 // runLadderMode 生成一条 ladder 向量并落盘（向量 + SHA256SUMS）。幂等：同参数
 // 两次执行逐字节相同（json.Marshal 对 map 按键排序；签名/源哈希/槽位全部确定性）。
-func runLadderMode(outDir, ladderFlag string, blocks int, opGethCommit string) error {
+//
+// poststate 选择导出层的 postState 粒度（设计 v2 §3.1）：
+//   - "boundary"（默认）：generateLadderChainSampled，只在采样点携带 postState
+//     并写出 sampledBlocks 键；
+//   - "full"：generateLadderChain，每块都携带 postState，且不写 sampledBlocks
+//     （缺省 = 每块都采样，即旧向量契约；C++ 侧据此做全量比对）。
+func runLadderMode(outDir, ladderFlag string, blocks int, opGethCommit, poststate string) error {
 	if outDir == "" {
 		return fmt.Errorf("--out-dir is required for --mode=ladder")
+	}
+	var full bool
+	switch poststate {
+	case "boundary":
+		full = false
+	case "full":
+		full = true
+	default:
+		return fmt.Errorf("--poststate must be boundary or full, got %q", poststate)
 	}
 	spec, err := parseLadderFlag(ladderFlag, blocks)
 	if err != nil {
 		return err
 	}
-	out, err := generateLadderChainSampled(spec, blocks)
+	var out *chainOutput
+	if full {
+		out, err = generateLadderChain(spec, blocks)
+	} else {
+		out, err = generateLadderChainSampled(spec, blocks)
+	}
 	if err != nil {
 		return err
 	}

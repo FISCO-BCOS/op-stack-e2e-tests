@@ -552,7 +552,7 @@ func TestLadderWithdrawalReceiptCarriesLogs(t *testing.T) {
 
 func TestRunLadderModeWritesVectorAndSums(t *testing.T) {
 	dir := t.TempDir()
-	if err := runLadderMode(dir, "0:regolith,2:canyon", 4, "testcommit"); err != nil {
+	if err := runLadderMode(dir, "0:regolith,2:canyon", 4, "testcommit", "boundary"); err != nil {
 		t.Fatalf("runLadderMode: %v", err)
 	}
 	vec := filepath.Join(dir, "ladder_4.json")
@@ -569,10 +569,94 @@ func TestRunLadderModeWritesVectorAndSums(t *testing.T) {
 		t.Fatalf("SHA256SUMS mismatch:\n got %q\nwant %q", sums, want)
 	}
 	// rejection paths
-	if err := runLadderMode(dir, "0:regolith,2:karst", 4, "c"); err == nil {
+	if err := runLadderMode(dir, "0:regolith,2:karst", 4, "c", "boundary"); err == nil {
 		t.Fatal("karst ladder must be rejected")
 	}
-	if err := runLadderMode("", "0:regolith,2:canyon", 4, "c"); err == nil {
+	if err := runLadderMode("", "0:regolith,2:canyon", 4, "c", "boundary"); err == nil {
 		t.Fatal("missing out-dir must be rejected")
+	}
+}
+
+// TestRunLadderModePostStateModes 验证 D1h 的 --poststate 导出粒度开关：
+//   - full：每块都带 postState，且不写 sampledBlocks（缺省 = 全量采样的旧契约）；
+//   - boundary：保持采样（sampledBlocks 键存在，未采样块无 postState）；
+//   - 非法值报错并点名 --poststate。
+func TestRunLadderModePostStateModes(t *testing.T) {
+	type ladderDoc struct {
+		Blocks        []map[string]json.RawMessage `json:"blocks"`
+		SampledBlocks *[]int                       `json:"sampledBlocks"`
+	}
+	load := func(t *testing.T, dir string) ladderDoc {
+		t.Helper()
+		data, err := os.ReadFile(filepath.Join(dir, "ladder_12.json"))
+		if err != nil {
+			t.Fatalf("read ladder_12.json: %v", err)
+		}
+		var top map[string]json.RawMessage
+		if err := json.Unmarshal(data, &top); err != nil {
+			t.Fatalf("unmarshal outer: %v", err)
+		}
+		var doc ladderDoc
+		if err := json.Unmarshal(top["ladder_12"], &doc); err != nil {
+			t.Fatalf("unmarshal ladder doc: %v", err)
+		}
+		return doc
+	}
+	// canyon@5（1-based 块号）=> 0-based 索引 4；总 12 块 => 采样集必为真子集。
+	const spec, blocks = "0:regolith,5:canyon", 12
+
+	fullDir := t.TempDir()
+	if err := runLadderMode(fullDir, spec, blocks, "testcommit", "full"); err != nil {
+		t.Fatalf("full mode: %v", err)
+	}
+	full := load(t, fullDir)
+	if full.SampledBlocks != nil {
+		t.Fatalf("full mode must NOT emit sampledBlocks, got %v", *full.SampledBlocks)
+	}
+	if len(full.Blocks) != blocks {
+		t.Fatalf("full mode: got %d blocks, want %d", len(full.Blocks), blocks)
+	}
+	for i, b := range full.Blocks {
+		if _, ok := b["postState"]; !ok {
+			t.Fatalf("full mode: block %d missing postState", i)
+		}
+	}
+
+	boundaryDir := t.TempDir()
+	if err := runLadderMode(boundaryDir, spec, blocks, "testcommit", "boundary"); err != nil {
+		t.Fatalf("boundary mode: %v", err)
+	}
+	boundary := load(t, boundaryDir)
+	if boundary.SampledBlocks == nil {
+		t.Fatal("boundary mode must emit sampledBlocks")
+	}
+	sampled := make(map[int]bool, len(*boundary.SampledBlocks))
+	for _, i := range *boundary.SampledBlocks {
+		sampled[i] = true
+	}
+	if len(sampled) == blocks {
+		t.Fatalf("boundary mode unexpectedly sampled every block (%v); test cannot prove a full/boundary difference", *boundary.SampledBlocks)
+	}
+	var unsampledWithPostState int
+	for i, b := range boundary.Blocks {
+		_, has := b["postState"]
+		if sampled[i] != has {
+			t.Fatalf("boundary block %d: sampled=%v but postState present=%v", i, sampled[i], has)
+		}
+		if !sampled[i] {
+			unsampledWithPostState++
+		}
+	}
+	if unsampledWithPostState == 0 {
+		t.Fatal("test spec produced no unsampled block; full/boundary distinction is vacuous")
+	}
+
+	// 非法值必须报错并点名 flag。
+	err := runLadderMode(t.TempDir(), spec, blocks, "c", "every")
+	if err == nil {
+		t.Fatal("invalid --poststate value must be rejected")
+	}
+	if !strings.Contains(err.Error(), "--poststate") || !strings.Contains(err.Error(), "every") {
+		t.Fatalf("invalid --poststate error must name the flag and value, got %q", err)
 	}
 }
