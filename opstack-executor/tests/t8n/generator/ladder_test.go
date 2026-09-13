@@ -259,8 +259,12 @@ func TestWithdrawalSlotsDeterministic(t *testing.T) {
 		t.Fatalf("withdrawalSlots(1) not deterministic: (%s,%s) vs (%s,%s)", a1, a2, b1, b2)
 	}
 	c1, c2 := withdrawalSlots(2)
-	if a1 == c1 {
-		t.Fatalf("k=2 msgNonce declaration slot == k=1 (%s)", a1)
+	slot1 := common.BigToHash(big.NewInt(1))
+	if a1 != c1 || a1 != slot1 {
+		t.Fatalf("msgNonce declaration slot must be slot 1 for every k: k=1 %s, k=2 %s", a1, c1)
+	}
+	if a1 != common.BigToHash(big.NewInt(1)) {
+		t.Fatalf("k=1 msgNonce declaration slot: want slot 1, got %s", a1)
 	}
 	if a2 == c2 {
 		t.Fatalf("k=2 sentMessages slot == k=1 (%s)", a2)
@@ -274,14 +278,8 @@ func TestWithdrawalSlotsDeterministic(t *testing.T) {
 			ladderWithdrawalTarget, 0, ladderWithdrawalGasLimit, ladderWithdrawalData))
 		return common.BytesToHash(crypto.Keccak256(wh, make([]byte, 32)))
 	}
-	if a1 != common.BigToHash(big.NewInt(1)) {
-		t.Fatalf("k=1 msgNonce declaration slot: want slot 1, got %s", a1)
-	}
 	if a2 != sentFor(1) {
 		t.Fatalf("k=1 sentMessages slot: want %s, got %s", sentFor(1), a2)
-	}
-	if c1 != common.BigToHash(big.NewInt(2)) {
-		t.Fatalf("k=2 msgNonce declaration slot: want slot 2, got %s", c1)
 	}
 	if c2 != sentFor(2) {
 		t.Fatalf("k=2 sentMessages slot: want %s, got %s", sentFor(2), c2)

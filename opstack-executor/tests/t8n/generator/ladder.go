@@ -114,15 +114,17 @@ func parseLadderFlag(s string, totalBlocks int) (ladderSpec, error) {
 // Task 3 (D1c): per-fork transaction recipes.
 // ---------------------------------------------------------------------
 
-// ladderBn256PairingProbeGas / ladderP256VerifyProbeGas are the probe txs'
-// gas limits (design v2 §3.3/§6). The P256VERIFY value (34500) is 10x its
-// 3450 RequiredGas, so the probe actually reaches and executes the precompile.
-// The bn256-pairing value (60000) is BELOW intrinsic(24072) + RequiredGas(1
-// pair, 79000) = 103072, so the pairing probe OOGs inside the precompile
-// rather than completing -- see the Task 3 report; it still deterministically
-// exercises the fork's pairing dispatch/gas path. Kept as specified.
+// ladderBn256PairingProbeGas / ladderP256VerifyProbeGas are the probe txs' gas
+// limits (design v2 §3.3/§6). The P256VERIFY value (34500) clears intrinsic
+// (160B input -> 23560) plus the 3450 RequiredGas, so the probe really runs.
+// The bn256-pairing value (200000) must exceed intrinsic (192B input, 64 zero
+// bytes -> 23304) + Bn256PairingBaseGasIstanbul(45000) + 34000/pair = 102304
+// for repeatedBn256Pair(1); a lower value (the brief's 60000) OOGs INSIDE the
+// precompile, so the pairing never executes and the probe is meaningless.
+// The fine-grained Granite-era gas boundary (the 112687-byte input cap) is
+// deferred to Task 6, once granite segments are reachable.
 const (
-	ladderBn256PairingProbeGas = 60_000
+	ladderBn256PairingProbeGas = 200_000
 	ladderP256VerifyProbeGas   = 34_500
 )
 
@@ -214,22 +216,20 @@ func withdrawalTx(nonce uint64) inputTx {
 
 // withdrawalSlots 返回第 k 次（1-based）withdrawal 在 MessagePasser 上声明的两个
 // 写入槽（emitPostState 对未声明槽位硬失败）。全部输入固定 → 确定性。
-// 与 cases.go message_passer_withdraw 的构造同构（versionedNonce = (1<<240)|(k-1)，
-// 合约 _msgNonce 位于 slot 1）。
 //
-// 语义说明（Task 3 report）：第二个返回值 sentMessages[withdrawalHash] 的动态槽
-// 随 k 变化；第一个返回值按 brief 取 common.BigToHash(k)。合约真实的 _msgNonce
-// 槽恒为 slot 1（值随 k 自增，见 cases.go:1030-1046 的 worked example），因此
-// k=1 时二者一致；k>=2 时 BigToHash(k) 是一个"占位"声明槽而非真实写入槽——
-// generateLadderChain 中 ins[i].Pre 已（自上一条链 postState）携带 slot 1，
-// emitPostState 只对真实存在于 storage trie 的槽做强校验，故占位声明无害。
+// 槽位语义（合约字节码 + cases.go:1030-1046 + 存储 dump 三重确认）：真实
+// `_msgNonce` 恒位于 slot 1，其值随调用次数自增（第 k 次调用 hash 用的
+// versionedNonce = (1<<240)|(k-1)，调用后 slot 1 = k）；声明只关心"哪个槽"，
+// 值与声明无关，因此第一个返回值无条件为 slot 1。
+// sentMessages[withdrawalHash] 是 mapping 动态槽 keccak256(withdrawalHash‖0)，
+// 随 withdrawalHash 变化，故第二个返回值随 k 变化。
 func withdrawalSlots(k int) (common.Hash, common.Hash) {
 	versionedNonce := new(big.Int).Or(
 		new(big.Int).Lsh(big.NewInt(1), 240), big.NewInt(int64(k-1)))
 	withdrawalHash := crypto.Keccak256(abiEncodeWithdrawal(versionedNonce,
 		addrOfKey(1), ladderWithdrawalTarget, 0, ladderWithdrawalGasLimit, ladderWithdrawalData))
 	sentSlot := common.BytesToHash(crypto.Keccak256(withdrawalHash, make([]byte, 32)))
-	return common.BigToHash(big.NewInt(int64(k))), sentSlot
+	return common.BigToHash(big.NewInt(1)), sentSlot
 }
 
 // ladderUserDeposit 是每块一笔的未签名用户存款（mint 1e17 到 recA，gas 50k）。
