@@ -410,3 +410,44 @@ func TestLadderCreateProbeSmoke(t *testing.T) {
 		}
 	}
 }
+
+func TestLadderWithdrawalReceiptCarriesLogs(t *testing.T) {
+	// canyon 段的 withdrawal 会产生 MessagePassed 事件 → 回执 logs 必须被导出，
+	// 且地址必须是全小写 hex（Go 的 Address.Hex() 是 EIP-55 混合大小写，
+	// FISCO 侧 bcos::toHex 全小写——不归一化会导致对拍必红）。
+	spec, err := parseLadderFlag("0:regolith,2:canyon", 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := generateLadderChain(spec, 4)
+	if err != nil {
+		t.Fatalf("generateLadderChain: %v", err)
+	}
+	wantAddr := "0x" + common.Bytes2Hex(messagePasserAddr.Bytes())
+	found := false
+	for _, blk := range out.Blocks {
+		for _, r := range blk.OpExpected.Receipts {
+			for _, l := range r.Logs {
+				if l.Address != wantAddr {
+					continue
+				}
+				found = true
+				if l.Address != strings.ToLower(l.Address) {
+					t.Fatalf("log address not lowercase: %s", l.Address)
+				}
+				for _, topic := range l.Topics {
+					if topic != strings.ToLower(topic) || !strings.HasPrefix(topic, "0x") ||
+						len(topic) != 66 {
+						t.Fatalf("bad topic hex: %s", topic)
+					}
+				}
+				if !strings.HasPrefix(l.Data, "0x") || l.Data != strings.ToLower(l.Data) {
+					t.Fatalf("bad data hex: %s", l.Data)
+				}
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("no MessagePassed log found for %s across %d blocks", wantAddr, len(out.Blocks))
+	}
+}

@@ -454,6 +454,8 @@ type expectedReceipt struct {
 	GasUsed           string `json:"gasUsed"`
 	CumulativeGasUsed string `json:"cumulativeGasUsed"`
 	LogsCount         int    `json:"logsCount"`
+	// D2 logs 逐字段对拍（设计 v2 §3.5）：旧向量无此键，FISCO 侧 isMember 跳过。
+	Logs []outputLog `json:"logs,omitempty"`
 	// Tx return data (receipt output), hex-encoded; always emitted ("0x" for
 	// empty). Captured by reexecuting the block (chain-maker AddTx discards it).
 	Output                  string  `json:"output"`
@@ -472,6 +474,34 @@ type expectedReceipt struct {
 	OpOperatorFeeScalar    *string `json:"_op_operator_fee_scalar,omitempty"`
 	OpOperatorFeeConstant  *string `json:"_op_operator_fee_constant,omitempty"`
 	OpDaFootprintGasScalar *string `json:"_op_da_footprint_gas_scalar,omitempty"`
+}
+
+// outputLog 是 receipt logs 的向量形状。address/topics/data 一律全小写 0x-hex：
+// Go 的 Address.Hex() 是 EIP-55 混合大小写，FISCO 侧 bcos::toHex 全小写，
+// 必须归一化（设计 v2 §3.5）。
+type outputLog struct {
+	Address string   `json:"address"`
+	Topics  []string `json:"topics"`
+	Data    string   `json:"data"`
+}
+
+func outputLogsOf(r *types.Receipt) []outputLog {
+	if len(r.Logs) == 0 {
+		return nil
+	}
+	logs := make([]outputLog, 0, len(r.Logs))
+	for _, l := range r.Logs {
+		topics := make([]string, 0, len(l.Topics))
+		for _, t := range l.Topics {
+			topics = append(topics, "0x"+common.Bytes2Hex(t.Bytes()))
+		}
+		logs = append(logs, outputLog{
+			Address: "0x" + common.Bytes2Hex(l.Address.Bytes()),
+			Topics:  topics,
+			Data:    hexutil.Encode(l.Data),
+		})
+	}
+	return logs
 }
 
 type opExpected struct {
@@ -4523,6 +4553,7 @@ func buildExpectedReceipts(cfg *params.ChainConfig, in *inputCase, txs []*types.
 			LogsCount:         len(r.Logs),
 			Output:            hexutil.Encode(outputs[i]),
 		}
+		er.Logs = outputLogsOf(r)
 		if r.DepositNonce != nil {
 			s := hexutil.EncodeUint64(*r.DepositNonce)
 			er.OpDepositNonce = &s
