@@ -2,8 +2,12 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/json"
+	"fmt"
 	"math/big"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -543,5 +547,32 @@ func TestLadderWithdrawalReceiptCarriesLogs(t *testing.T) {
 		if l.Topics[0] != messagePassedTopic0 {
 			t.Fatalf("block %d topic0: want %s, got %s", blk, messagePassedTopic0, l.Topics[0])
 		}
+	}
+}
+
+func TestRunLadderModeWritesVectorAndSums(t *testing.T) {
+	dir := t.TempDir()
+	if err := runLadderMode(dir, "0:regolith,2:canyon", 4, "testcommit"); err != nil {
+		t.Fatalf("runLadderMode: %v", err)
+	}
+	vec := filepath.Join(dir, "ladder_4.json")
+	if _, err := os.Stat(vec); err != nil {
+		t.Fatalf("vector missing: %v", err)
+	}
+	sums, err := os.ReadFile(filepath.Join(dir, "SHA256SUMS"))
+	if err != nil {
+		t.Fatalf("SHA256SUMS missing: %v", err)
+	}
+	data, _ := os.ReadFile(vec)
+	want := fmt.Sprintf("%x  ladder_4.json\n", sha256.Sum256(data))
+	if string(sums) != want {
+		t.Fatalf("SHA256SUMS mismatch:\n got %q\nwant %q", sums, want)
+	}
+	// rejection paths
+	if err := runLadderMode(dir, "0:regolith,2:karst", 4, "c"); err == nil {
+		t.Fatal("karst ladder must be rejected")
+	}
+	if err := runLadderMode("", "0:regolith,2:canyon", 4, "c"); err == nil {
+		t.Fatal("missing out-dir must be rejected")
 	}
 }

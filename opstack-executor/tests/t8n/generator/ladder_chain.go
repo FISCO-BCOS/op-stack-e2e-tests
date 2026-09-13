@@ -19,8 +19,11 @@ package main
 //     dispatch Bedrock selector，槽位 1/3/7/8 vs 5/6 也不同名），跨族必须分链
 //     生成。fp.daScalar=400 仅在梯顶为 jovian 时设置（与 chainN 的 jovian 臂
 //     一致，DA 足迹可观察）；message passer 携带真实部署 runtime（Task 3 提款
-//     要用，现在携带无害）；sender 预充值 eth(1000)（比 chainN 的 eth(100)
-//     大，Task 3 要加多笔转账）。
+//     要用，现在携带无害）；sender 预充值 max(1000, 2n) ETH（下限比 chainN 的
+//     eth(100) 大，且线性覆盖每块一笔的 1 ETH transfer + gas：原硬编码
+//     eth(1000) 在 --blocks=1000 时差最后一块 ~0.19 ETH 就 panic，实测 999
+//     块 OK / 1000 块 insufficient funds；2n 对所有 n 都留有余量，小数点以下
+//     的 gas 最坏 ~8.5e-4 ETH/块）。
 //
 // 每块配方 = L1-attributes deposit + recipeFor(fork, blockIdx, isForkActivation)
 // 的用户存款 / 提款 / CREATE / precompile 探针 + 一笔真链上 nonce 的 sender
@@ -28,9 +31,12 @@ package main
 // 提款写入的 MessagePasser 槽由 withdrawalSlots 声明（emitPostState 硬校验）。
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"math/big"
+	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -173,10 +179,18 @@ func generateLadderChain(spec ladderSpec, n int) (*chainOutput, error) {
 	)
 	beaconRoot := common.HexToHash("0x0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c")
 	senderAddr := addrOfKey(1)
+	// 每块至多一笔 1 ETH 的 sender transfer（recipeFor），n 块最多 n ETH；所有
+	// tx 都从 key1 出，gas 上界 ≈ 4.2e5 gas × 2 gwei ≈ 8.5e-4 ETH/块。故 2n
+	// 对任意 n 都有余量；下限 1000 保持小 ladder 的历史金额不变（n=3 仍是
+	// eth(1000)，既有 smoke/采样向量逐字节不变）。
+	senderFund := int64(n) * 2
+	if senderFund < 1000 {
+		senderFund = 1000
+	}
 	genesisPre := types.GenesisAlloc{
 		l1BlockAddr:       {Balance: big.NewInt(0), Nonce: 1, Code: l1BlockCodeFor(topFork), Storage: fp.l1BlockStorage(topFork)},
 		messagePasserAddr: {Balance: big.NewInt(0), Nonce: 1, Code: realMessagePasserCode},
-		senderAddr:        {Balance: eth(1000)},
+		senderAddr:        {Balance: eth(senderFund)},
 	}
 	if canyonActivated {
 		genesisPre[canyonCreate2DeployerAddr] = types.Account{
@@ -419,4 +433,34 @@ func generateLadderChainSampled(spec ladderSpec, n int) (*chainOutput, error) {
 	}
 	out.SampledBlocks = sampled
 	return out, nil
+}
+
+// runLadderMode 生成一条 ladder 向量并落盘（向量 + SHA256SUMS）。幂等：同参数
+// 两次执行逐字节相同（json.Marshal 对 map 按键排序；签名/源哈希/槽位全部确定性）。
+func runLadderMode(outDir, ladderFlag string, blocks int, opGethCommit string) error {
+	if outDir == "" {
+		return fmt.Errorf("--out-dir is required for --mode=ladder")
+	}
+	spec, err := parseLadderFlag(ladderFlag, blocks)
+	if err != nil {
+		return err
+	}
+	out, err := generateLadderChainSampled(spec, blocks)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(outDir, 0o755); err != nil {
+		return err
+	}
+	stem := fmt.Sprintf("ladder_%d", blocks)
+	if err := writeChainVector(outDir, stem, out, opGethCommit); err != nil {
+		return err
+	}
+	data, err := os.ReadFile(filepath.Join(outDir, stem+".json"))
+	if err != nil {
+		return err
+	}
+	sum := sha256.Sum256(data)
+	line := fmt.Sprintf("%x  %s.json\n", sum, stem)
+	return os.WriteFile(filepath.Join(outDir, "SHA256SUMS"), []byte(line), 0o644)
 }

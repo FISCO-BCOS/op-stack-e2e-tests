@@ -114,9 +114,14 @@ func main() {
 		// the ASSEMBLED valid product of a base case and re-emit it as an invalid
 		// vector). corrupt emits invalid_<base>_<field>.json for every §4a field;
 		// static emits invalid_<base>_static_<n>.json for every §4c item.
-		invalidMode = flag.String("mode", "", "corrupt|static|invalid-tx: emit invalid vectors from a base case stem; chain:<N>[:fork|:break]: emit a linear chain / fork / break vector")
+		invalidMode = flag.String("mode", "", "corrupt|static|invalid-tx: emit invalid vectors from a base case stem; chain:<N>[:fork|:break]: emit a linear chain / fork / break vector; ladder: emit a ladder vector")
 		baseStem    = flag.String("base", "isthmus_transfer_basic", "base case stem for --mode=corrupt/static (e.g. isthmus_transfer_basic)")
 		invalidOut  = flag.String("out-dir", "", "output dir for --mode=corrupt/static invalid vectors")
+		// D1: ladder mode activation table + total block count. The ladder starts
+		// at 0:regolith and must stay inside one L1Block layout family (see
+		// generateLadderChain's forkLayout guard).
+		ladderSpec   = flag.String("ladder", "", "D1: fork activation table <block>:<fork>,… (block-number semantics; karst rejected; with --mode=ladder)")
+		ladderBlocks = flag.Int("blocks", 1000, "D1: total blocks for --mode=ladder")
 		// P2 Task 1 probe: drive the real miner/engine getPayload path (not
 		// GenerateChainWithGenesis) for the case's fork and dump the raw engine
 		// response JSON. Takes --input + --output like the vector path.
@@ -178,6 +183,11 @@ func main() {
 			fmt.Fprintf(os.Stderr, "opt8n-ref: %v\n", err)
 			os.Exit(1)
 		}
+	case *invalidMode == "ladder":
+		if err := runLadderMode(*invalidOut, *ladderSpec, *ladderBlocks, *opGethCommit); err != nil {
+			fmt.Fprintf(os.Stderr, "opt8n-ref: %v\n", err)
+			os.Exit(1)
+		}
 	case *invalidMode == "corrupt" || *invalidMode == "static" || *invalidMode == "invalid-tx":
 		if err := runInvalidMode(*invalidMode, *baseStem, *invalidOut, *opGethCommit); err != nil {
 			fmt.Fprintf(os.Stderr, "opt8n-ref: %v\n", err)
@@ -194,7 +204,7 @@ func main() {
 			os.Exit(1)
 		}
 	default:
-		fmt.Fprintln(os.Stderr, "usage: opt8n-ref --write-cases <dir> | --probe-receipt-fields <case.in.json> | --probe-spec | --probe-genesis-number | --probe-precompile <fork> | --input <case.in.json> --output <vector.json> [--golden-output <golden.json>] [--op-geth-commit <sha>] | --input <case.in.json> --output <engine-response.json> --engine-getpayload [--engine-fork <fork>] | --chain-output-dir <dir> [--op-geth-commit <sha>] | --mode corrupt|static|invalid-tx --base <stem> --out-dir <dir> [--op-geth-commit <sha>] | --mode chain:<N>[:fork|:break] --out-dir <dir> [--op-geth-commit <sha>]")
+		fmt.Fprintln(os.Stderr, "usage: opt8n-ref --write-cases <dir> | --probe-receipt-fields <case.in.json> | --probe-spec | --probe-genesis-number | --probe-precompile <fork> | --input <case.in.json> --output <vector.json> [--golden-output <golden.json>] [--op-geth-commit <sha>] | --input <case.in.json> --output <engine-response.json> --engine-getpayload [--engine-fork <fork>] | --chain-output-dir <dir> [--op-geth-commit <sha>] | --mode corrupt|static|invalid-tx --base <stem> --out-dir <dir> [--op-geth-commit <sha>] | --mode chain:<N>[:fork|:break] --out-dir <dir> [--op-geth-commit <sha>] | --mode ladder --ladder <块号:fork名,…> --blocks N --out-dir <dir>")
 		os.Exit(2)
 	}
 }
