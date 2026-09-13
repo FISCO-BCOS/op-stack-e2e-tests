@@ -9,6 +9,10 @@ __pycache__/
 # generator itself are tracked. ---
 opstack-executor/tests/t8n/cases/
 opstack-executor/tests/t8n/vectors/*.json
+# ladder mode (D1g) writes a per-vector checksums file beside the vectors; it is a
+# generation by-product with no reader (unlike golden/engine/SHA256SUMS, which is a
+# tracked contract), so it stays out of the tree.
+opstack-executor/tests/t8n/vectors/SHA256SUMS
 opstack-executor/tests/t8n/golden/engine/*.golden.json
 opstack-executor/tests/t8n/golden/engine/chained/*.json
 opstack-executor/tests/t8n/golden/engine/getpayload/*.json

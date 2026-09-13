@@ -24,6 +24,7 @@
 # 产物（写入 opstack-executor/tests/t8n/）
 #   - cases/                      逐 case 输入（瞬态，不入库，脚本不校验其字节）
 #   - vectors/*.json              逐 case 参考向量 + 三模式派生（corrupt/static/invalid-tx/chain）
+#                                 + ladder 差分向量（D1g，mode 产物，无 golden）
 #   - golden/engine/*.golden.json 引擎黄金 + chained/ 链式黄金
 #   - golden/engine/{SHA256SUMS,manifest.txt}  golden 书务契约（append-only 维护，见判据 5）
 #   - golden/engine/getpayload/SHA256SUMS      getpayload 封套契约（封套本体由本脚本生成，
@@ -62,6 +63,10 @@ T8N_DIR="$(dirname "$GEN_DIR")"
 REPO_ROOT="$(git -C "$GEN_DIR" rev-parse --show-toplevel)"
 SCRATCH="$OPGETH/cmd/opt8n-ref"
 N_CHAIN=3
+# D1g（Task 6a-2）：ladder 差分向量的固定编排。块号语义（0=regolith 激活块，
+# 500=canyon 激活块）；与 N_CHAIN 同理写成常量，manifest/判据 2 的枚举才可纯表达式化。
+N_LADDER_BLOCKS=1000
+LADDER_SPEC="0:regolith,500:canyon"
 # P1 matrix 工件：op-node 是 CL 选方法号的唯一权威，其引用树必须等于 pin 且干净。
 OP_NODE_REPO="${OP_NODE_REPO:-/Users/octopus/octo/code/optimism}"
 OP_NODE_PIN="${OP_NODE_PIN:-76e4fad54244ec6bd07dad07e42c82a16ab5113a}"
@@ -119,6 +124,10 @@ done
 "$OPGETH/opt8n-ref" --mode="chain:${N_CHAIN}" --out-dir "$T8N_DIR/vectors" --op-geth-commit "$PIN"
 "$OPGETH/opt8n-ref" --mode="chain:${N_CHAIN}:fork" --out-dir "$T8N_DIR/vectors" --op-geth-commit "$PIN"
 "$OPGETH/opt8n-ref" --mode="chain:${N_CHAIN}:break" --out-dir "$T8N_DIR/vectors" --op-geth-commit "$PIN"
+# ladder（D1g）：1000 块 regolith→canyon 差分向量。无 golden——ladder 是 mode 产物而非
+# case，判据 1 的 per-case golden 不适用，判据 5 只枚举 golden/ 目录，故此处不产生 golden。
+"$OPGETH/opt8n-ref" --mode ladder --ladder "$LADDER_SPEC" --blocks "$N_LADDER_BLOCKS" \
+  --out-dir "$T8N_DIR/vectors" --op-geth-commit "$PIN"
 
 "$OPGETH/opt8n-ref" --chain-output-dir "$T8N_DIR/golden/engine/chained" \
   --op-geth-commit "$PIN"                                    # 链式对 golden（chainA/B + jovianChainA/B）
@@ -387,11 +396,20 @@ is_observer() {
   done
   return 1
 }
+# D1g：ladder 是 mode 产物（不是 case，也不属 corrupt/static/invalid-tx/chain 三模式组），
+# 单独成组 append，避免混进 Phase-3 注释组造成「48 vectors」计数失真。
+is_ladder() {
+  case "$1" in
+    ladder_*.json) return 0 ;;
+    *) return 1 ;;
+  esac
+}
 registerable=()
 for f in "$T8N_DIR"/vectors/*.json; do
   base="$(basename "$f")"
   if is_unregistered_static "$base"; then continue; fi
   if is_observer "$base"; then continue; fi
+  if is_ladder "$base"; then continue; fi
   registerable+=("$base")
 done
 # 确定性顺序：排序后追加（与 diff 集合比较同序）。
@@ -402,10 +420,12 @@ append_if_absent "$manifest" "Phase-3 enhanced corpus (Task 6): corrupt 12 + sta
 sorted_obs=()
 while IFS= read -r line; do sorted_obs+=("$line"); done < <(printf '%s\n' "${observer_vectors[@]}" | sort)
 append_if_absent "$manifest" "Dual-path observer vectors (gaslimit/basefee, bothForks)" "${sorted_obs[@]}"
+# D1g：ladder 差分向量（mode 产物；无 golden，见上方生成步骤）。
+append_if_absent "$manifest" "Ladder differential vector (D1g): ${N_LADDER_BLOCKS}-block regolith->canyon ladder (mode product, no golden)" "ladder_${N_LADDER_BLOCKS}.json"
 
-# ── diff 源重定义（Task 7 Step 1，审查 R10）：cases ∪ 三模式产物 == manifest ──
+# ── diff 源重定义（Task 7 Step 1，审查 R10）：cases ∪ 三模式产物 ∪ ladder == manifest ──
 # cases basename 展开（.in.json → .json）∪ 派生名（corrupt/static 注册项/invalid-tx/chain）
-# 与 manifest 非注释行比集合相等（防孤儿向量/漏格）。
+# ∪ ladder（D1g）与 manifest 非注释行比集合相等（防孤儿向量/漏格）。
 {
   ls "$T8N_DIR"/cases/*.in.json | xargs -n1 basename | sed 's/\.in\.json$/.json/'
   printf 'invalid_isthmus_transfer_basic_%s.json\n' stateRoot gasUsed receiptsRoot parentHash extraData blockHash
@@ -422,6 +442,7 @@ append_if_absent "$manifest" "Dual-path observer vectors (gaslimit/basefee, both
   printf 'invalid_jovian_chain_%d_fork.json\n' "$N_CHAIN"
   printf 'invalid_isthmus_chain_%d_break.json\n' "$N_CHAIN"
   printf 'invalid_jovian_chain_%d_break.json\n' "$N_CHAIN"
+  printf 'ladder_%d.json\n' "$N_LADDER_BLOCKS"          # D1g ladder mode product
 } | sort > /tmp/opt8n-left.$$
 grep -v '^#' "$manifest" | sed '/^$/d' | sort > /tmp/opt8n-right.$$
 if ! diff /tmp/opt8n-left.$$ /tmp/opt8n-right.$$; then

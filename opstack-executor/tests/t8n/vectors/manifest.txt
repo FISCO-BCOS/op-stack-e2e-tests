@@ -212,3 +212,6 @@ ecotone_boundary_ecotone_last.json
 # Phase-3 enhanced corpus (Task 6): corrupt 12 + static 10 + invalid-tx 18 + chain 6 + legacy 2 = 48 vectors (idempotent; §4c item 3/12 excluded — loader 不可表达)
 canyon_boundary_ecotone_activation.json
 regolith_boundary_regolith_last.json
+
+# Ladder differential vector (D1g): 1000-block regolith->canyon ladder (mode product, no golden)
+ladder_1000.json
