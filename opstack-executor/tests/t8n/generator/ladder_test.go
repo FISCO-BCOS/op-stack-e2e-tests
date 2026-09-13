@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"math/big"
 	"os"
@@ -658,5 +659,56 @@ func TestRunLadderModePostStateModes(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "--poststate") || !strings.Contains(err.Error(), "every") {
 		t.Fatalf("invalid --poststate error must name the flag and value, got %q", err)
+	}
+}
+
+// TestPostStateDefaultIsFull 锚定 --poststate 的注册默认值是 full：全量比对
+// （每块都带 postState、不写 sampledBlocks）是默认，boundary 采样是 opt-in。
+// 用 flag.Lookup 读注册默认值（而非直接读变量），再用该默认值跑一遍 CLI 入口
+// 并检查产物形状——若未来有人把默认悄悄改回 boundary，此测试必红。
+func TestPostStateDefaultIsFull(t *testing.T) {
+	f := flag.Lookup("poststate")
+	if f == nil {
+		t.Fatal(`flag "poststate" is not registered`)
+	}
+	if defaultPostStateMode != "full" {
+		t.Fatalf("defaultPostStateMode: want %q, got %q", "full", defaultPostStateMode)
+	}
+	if f.DefValue != "full" {
+		t.Fatalf("--poststate default: want %q, got %q (boundary sampling must be opt-in)", "full", f.DefValue)
+	}
+
+	// Mirror regen.sh's invocation: no explicit --poststate, so the CLI would
+	// pass the registered default through to runLadderMode.
+	dir := t.TempDir()
+	const spec, blocks = "0:regolith,5:canyon", 12
+	if err := runLadderMode(dir, spec, blocks, "testcommit", f.DefValue); err != nil {
+		t.Fatalf("runLadderMode with default %q: %v", f.DefValue, err)
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "ladder_12.json"))
+	if err != nil {
+		t.Fatalf("read ladder_12.json: %v", err)
+	}
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(data, &top); err != nil {
+		t.Fatalf("unmarshal outer: %v", err)
+	}
+	var doc struct {
+		Blocks        []map[string]json.RawMessage `json:"blocks"`
+		SampledBlocks *[]int                       `json:"sampledBlocks"`
+	}
+	if err := json.Unmarshal(top["ladder_12"], &doc); err != nil {
+		t.Fatalf("unmarshal ladder doc: %v", err)
+	}
+	if doc.SampledBlocks != nil {
+		t.Fatalf("default run must NOT emit sampledBlocks, got %v", *doc.SampledBlocks)
+	}
+	if len(doc.Blocks) != blocks {
+		t.Fatalf("default run: got %d blocks, want %d", len(doc.Blocks), blocks)
+	}
+	for i, b := range doc.Blocks {
+		if _, ok := b["postState"]; !ok {
+			t.Fatalf("default run: block %d missing postState (only boundary mode samples)", i)
+		}
 	}
 }

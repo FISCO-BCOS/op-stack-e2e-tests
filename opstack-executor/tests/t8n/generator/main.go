@@ -83,6 +83,16 @@ import (
 // schemaVersion is `_op_test_vectors.version` (v3-block, plan schema).
 const schemaVersion = "3-block"
 
+// defaultPostStateMode is the ladder export's postState granularity default.
+// Full-state comparison (postState on every block, no sampledBlocks key) is the
+// default; boundary sampling is opt-in via --poststate boundary.
+const defaultPostStateMode = "full"
+
+// postStateMode is the --poststate flag. Declared at package scope (rather than
+// inside main) so a test can assert the registered default directly and catch a
+// silent revert to boundary sampling.
+var postStateMode = flag.String("poststate", defaultPostStateMode, "D1h: ladder postState granularity: full|boundary (with --mode=ladder; default full = postState on every block)")
+
 // Fixed OP-Stack / system addresses (op-geth params + rollup_cost.go).
 var (
 	l1BlockAddr       = types.L1BlockAddr // 0x4200...0015
@@ -122,10 +132,6 @@ func main() {
 		// generateLadderChain's forkLayout guard).
 		ladderSpec   = flag.String("ladder", "", "D1: fork activation table <block>:<fork>,… (block-number semantics; karst rejected; with --mode=ladder)")
 		ladderBlocks = flag.Int("blocks", 1000, "D1: total blocks for --mode=ladder")
-		// D1h: postState export granularity for ladder mode. "boundary" (default)
-		// keeps the sampled vector (sample points + sampledBlocks key); "full"
-		// emits postState on every block and omits sampledBlocks.
-		postStateMode = flag.String("poststate", "boundary", "D1h: ladder postState granularity: boundary|full (with --mode=ladder)")
 		// P2 Task 1 probe: drive the real miner/engine getPayload path (not
 		// GenerateChainWithGenesis) for the case's fork and dump the raw engine
 		// response JSON. Takes --input + --output like the vector path.
@@ -208,7 +214,7 @@ func main() {
 			os.Exit(1)
 		}
 	default:
-		fmt.Fprintln(os.Stderr, "usage: opt8n-ref --write-cases <dir> | --probe-receipt-fields <case.in.json> | --probe-spec | --probe-genesis-number | --probe-precompile <fork> | --input <case.in.json> --output <vector.json> [--golden-output <golden.json>] [--op-geth-commit <sha>] | --input <case.in.json> --output <engine-response.json> --engine-getpayload [--engine-fork <fork>] | --chain-output-dir <dir> [--op-geth-commit <sha>] | --mode corrupt|static|invalid-tx --base <stem> --out-dir <dir> [--op-geth-commit <sha>] | --mode chain:<N>[:fork|:break] --out-dir <dir> [--op-geth-commit <sha>] | --mode ladder --ladder <块号:fork名,…> --blocks N --out-dir <dir> [--poststate boundary|full]")
+		fmt.Fprintln(os.Stderr, "usage: opt8n-ref --write-cases <dir> | --probe-receipt-fields <case.in.json> | --probe-spec | --probe-genesis-number | --probe-precompile <fork> | --input <case.in.json> --output <vector.json> [--golden-output <golden.json>] [--op-geth-commit <sha>] | --input <case.in.json> --output <engine-response.json> --engine-getpayload [--engine-fork <fork>] | --chain-output-dir <dir> [--op-geth-commit <sha>] | --mode corrupt|static|invalid-tx --base <stem> --out-dir <dir> [--op-geth-commit <sha>] | --mode chain:<N>[:fork|:break] --out-dir <dir> [--op-geth-commit <sha>] | --mode ladder --ladder <块号:fork名,…> --blocks N --out-dir <dir> [--poststate full|boundary (default full)]")
 		os.Exit(2)
 	}
 }
