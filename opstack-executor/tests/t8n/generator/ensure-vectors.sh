@@ -58,8 +58,10 @@ command -v go >/dev/null 2>&1 || { echo "需要 Go 工具链（regen.sh 要在 o
 #   - 已就位但 pin 不符：
 #       用户显式传入（$USER_OPGETH）→ 视为自有 checkout，直接报错，绝不删除；
 #       脚本自管缓存目录 → 视为陈旧缓存，rm -rf 后重建。
-# 浅取精确 SHA 偶发被 GitHub 以「upload-pack: not our ref」拒绝（同一 pin 在另一 runner/副本
-# 上可成功）——重试 3 次，每次间隔 5s；仍失败则按原样报错退出。
+# 浅取精确 SHA 会被 GitHub 以「upload-pack: not our ref」间歇拒绝（实测同一 pin：
+# amd64 腿过、arm/macos 腿连拒 4 次；同 OS 的两条腿共享缓存键，冷启时双双 miss 才暴露）。
+# 策略：先 3 次浅取重试（覆盖瞬时抖动），仍失败则降级为 blobless 全 ref 取（让该 SHA 可达，
+# 元数据量远小于全量），最后以 cat-file 复核可达性，不可达才按原样报错退出。
 fetch_pin() {  # <repo> <pin>
   local repo="$1" pin="$2" attempt
   for attempt in 1 2 3; do
@@ -69,7 +71,10 @@ fetch_pin() {  # <repo> <pin>
     echo "WARNING: shallow fetch of ${pin:0:8} into $repo failed (attempt $attempt/3); retrying" >&2
     sleep 5
   done
-  git -C "$repo" fetch --depth 1 origin "$pin"   # 最后一次不吞错误码
+  echo "WARNING: bare-SHA fetch refused 3x for ${pin:0:8}; falling back to a blobless ref fetch" >&2
+  git -C "$repo" fetch --filter=blob:none origin
+  git -C "$repo" cat-file -e "${pin}^{commit}" 2>/dev/null && return 0
+  git -C "$repo" fetch origin "$pin"   # 最后的直取，失败错误码照常上抛
 }
 
 ensure_opgeth() {
