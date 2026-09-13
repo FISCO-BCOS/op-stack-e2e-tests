@@ -754,14 +754,40 @@ func fund(c *inputCase, key byte, amount *big.Int) {
 // gas >= RequiredGas(cap-sized input) so the call reaches the precompile's own
 // cap check instead of OOG-ing first); value defaults to 0.
 func precompileCallTx(addr []byte, data []byte, gas uint64, value uint64) inputTx {
-	k := privKey(1)
+	return precompileCallTxNonce(1, 0, addr, data, gas, value)
+}
+
+// precompileCallTxNonce is precompileCallTx with an explicit sender-nonce, for
+// chained multi-tx frames (the ladder recipe issues several key-1 txs per
+// block). Same field shape/semantics otherwise.
+func precompileCallTxNonce(key byte, nonce uint64, addr []byte, data []byte, gas uint64, value uint64) inputTx {
+	k := privKey(key)
 	to := common.BytesToAddress(addr)
 	return inputTx{
 		OpType:               "eip1559",
 		ChainID:              hd256(chainID),
-		Nonce:                hd64(0),
+		Nonce:                hd64(nonce),
 		To:                   &to,
 		Value:                hd256(new(big.Int).SetUint64(value)),
+		Gas:                  hd64(gas),
+		MaxFeePerGas:         hdu(2_000_000_000), // 2 gwei
+		MaxPriorityFeePerGas: hdu(100_000_000),   // 0.1 gwei
+		Data:                 data,
+		SecretKey:            &k,
+	}
+}
+
+// createTx mirrors transferTx but leaves To nil (EIP-1559 contract creation):
+// buildTx's eip1559 arm passes To straight through to types.DynamicFeeTx, where
+// nil is the create marker. Used by the ladder CREATE probe.
+func createTx(key byte, nonce uint64, gas uint64, data hexutil.Bytes) inputTx {
+	k := privKey(key)
+	return inputTx{
+		OpType:               "eip1559",
+		ChainID:              hd256(chainID),
+		Nonce:                hd64(nonce),
+		To:                   nil,
+		Value:                hd256(big.NewInt(0)),
 		Gas:                  hd64(gas),
 		MaxFeePerGas:         hdu(2_000_000_000), // 2 gwei
 		MaxPriorityFeePerGas: hdu(100_000_000),   // 0.1 gwei

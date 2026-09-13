@@ -22,8 +22,10 @@ package main
 //     要用，现在携带无害）；sender 预充值 eth(1000)（比 chainN 的 eth(100)
 //     大，Task 3 要加多笔转账）。
 //
-// 每块配方与 chainN 相同：L1-attributes deposit + 真链上 nonce 的 sender
-// transfer（recipe 级别的差分注入留给 Task 3）。
+// 每块配方 = L1-attributes deposit + recipeFor(fork, blockIdx, isForkActivation)
+// 的用户存款 / 提款 / CREATE / precompile 探针 + 一笔真链上 nonce 的 sender
+// transfer（Task 3 D1c）。deposit 必须排在非存款交易之前（assertDepositsFirst）；
+// 提款写入的 MessagePasser 槽由 withdrawalSlots 声明（emitPostState 硬校验）。
 
 import (
 	"encoding/json"
@@ -221,6 +223,7 @@ func generateLadderChain(spec ladderSpec, n int) (*chainOutput, error) {
 	for i, a := range spec.Activations {
 		forkPath[i] = a.Fork
 	}
+	withdrawalCount := 0 // per-generation 1-based withdrawal counter (withdrawalSlots k)
 	if err := func() (err error) {
 		defer func() {
 			if r := recover(); r != nil {
@@ -246,19 +249,6 @@ func generateLadderChain(spec ladderSpec, n int) (*chainOutput, error) {
 			// layout because the L1Block upgrade lands later IN the block.
 			layoutFork := blockFork(cfg, blockTime-ladderBlockInterval)
 			attr := fp.attributesTx(fmt.Sprintf("ladder_%d_%d", n, i), layoutFork)
-			tx0, outTx0, terr := buildTx(&attr, signer, cfg)
-			if terr != nil {
-				panic(fmt.Errorf("block %d attributes tx: %w", i, terr))
-			}
-			bg.AddTx(tx0)
-
-			nonce := bg.TxNonce(senderAddr) // real chained nonce (0, 1, 2, ...)
-			transfer := transferTx(1, nonce, recA, eth(1), 21_000, nil)
-			tx1, outTx1, terr := buildTx(&transfer, signer, cfg)
-			if terr != nil {
-				panic(fmt.Errorf("block %d transfer tx: %w", i, terr))
-			}
-			bg.AddTx(tx1)
 
 			in := &inputCase{
 				Info: caseInfo{
@@ -269,14 +259,80 @@ func generateLadderChain(spec ladderSpec, n int) (*chainOutput, error) {
 				Genesis:               knobs,
 				Coinbase:              sequencerVault,
 				ParentBeaconBlockRoot: beaconRoot,
-				Transactions:          []inputTx{attr, transfer},
 			}
 			if i == 0 {
 				in.Pre = genesisPre // block i>0's Pre is filled AFTER assembly, from i-1's postState
 			}
+			var txs []*types.Transaction
+			var outTxs []json.RawMessage
+			// add builds + injects one tx, keeping ins[i].Transactions in EXACT
+			// sync with bg.AddTx order (the vector's tx list must match the block).
+			add := func(it inputTx) {
+				tx, out, terr := buildTx(&it, signer, cfg)
+				if terr != nil {
+					panic(fmt.Errorf("block %d %s tx: %w", i, it.OpType, terr))
+				}
+				bg.AddTx(tx)
+				in.Transactions = append(in.Transactions, it)
+				txs = append(txs, tx)
+				outTxs = append(outTxs, out)
+			}
+
+			// Order (assertDepositsFirst): attributes deposit FIRST, then user
+			// deposits, then non-deposit txs.
+			add(attr)
+
+			blockForkName := blockFork(cfg, blockTime)
+			// Jovian activation block must be deposits-only (op-geth
+			// core/types/rollup_cost.go:571-576); assertL1BlockConsistency
+			// (main.go:3851-3855) enforces the same. Jovian is the only fork
+			// with such a constraint (checked against the pin; see report).
+			isForkActivation := cfg.JovianTime != nil && blockTime == *cfg.JovianTime
+			recipe := recipeFor(blockForkName, i, isForkActivation)
+
+			for d := 0; d < recipe.deposit; d++ {
+				add(ladderUserDeposit(fmt.Sprintf("ladder_dep_%d_%d", i, d)))
+			}
+
+			// Existing per-block sender transfer; nonce read live (chained).
+			// It is a NON-deposit tx, so it must be suppressed on a
+			// deposits-only activation block (Jovian, the only fork for which
+			// isForkActivation is ever true -- see recipeFor). Without this the
+			// Jovian activation block would carry a transfer and op-geth's
+			// CalcDAFootprint / assertL1BlockConsistency would reject it.
+			if !isForkActivation {
+				add(transferTx(1, bg.TxNonce(senderAddr), recA, eth(1), 21_000, nil))
+			}
+
+			// Recipe non-deposit txs: every nonce is read at injection time via
+			// bg.TxNonce(senderAddr) so the key-1 txs chain 0,1,2,...
+			for w := 0; w < recipe.withdrawal; w++ {
+				withdrawalCount++
+				add(withdrawalTx(bg.TxNonce(senderAddr)))
+				slotA, slotB := withdrawalSlots(withdrawalCount)
+				if in.ExtraStorage == nil {
+					in.ExtraStorage = map[common.Address][]common.Hash{}
+				}
+				in.ExtraStorage[messagePasserAddr] = append(in.ExtraStorage[messagePasserAddr], slotA, slotB)
+			}
+			if recipe.create {
+				createNonce := bg.TxNonce(senderAddr)
+				created := crypto.CreateAddress(senderAddr, createNonce)
+				add(createTx(1, createNonce, 200_000, ladderCreateInitCode))
+				if in.ExtraStorage == nil {
+					in.ExtraStorage = map[common.Address][]common.Hash{}
+				}
+				// The created account's init phase writes slot 0; emitPostState
+				// hard-fails on undeclared slots.
+				in.ExtraStorage[created] = append(in.ExtraStorage[created], common.Hash{})
+			}
+			for _, p := range recipe.precompiles {
+				add(precompileCallTxNonce(1, bg.TxNonce(senderAddr), p.addr.Bytes(), p.input, p.gas, 0))
+			}
+
 			ins[i] = in
-			txSets[i] = []*types.Transaction{tx0, tx1}
-			outSets[i] = []json.RawMessage{outTx0, outTx1}
+			txSets[i] = txs
+			outSets[i] = outTxs
 		})
 		return nil
 	}(); err != nil {
