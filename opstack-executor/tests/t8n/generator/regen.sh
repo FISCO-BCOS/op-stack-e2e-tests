@@ -25,6 +25,8 @@
 #   - cases/                      逐 case 输入（瞬态，不入库，脚本不校验其字节）
 #   - vectors/*.json              逐 case 参考向量 + 三模式派生（corrupt/static/invalid-tx/chain）
 #   - golden/engine/*.golden.json 引擎黄金 + chained/ 链式黄金
+#   - golden/engine/{SHA256SUMS,manifest.txt}  golden 书务契约（append-only 维护，见判据 5）
+#   - golden/engine/getpayload/SHA256SUMS      getpayload 封套契约（同上；封套本体归 P2 Task 4）
 #   - vectors/manifest.txt        注册表（幂等 append；static item 3/12 强制排除，loader 不可表达）
 #   - matrix/caps.json            op-geth 反射法报出的 Engine caps（生成物，不入库）
 #   - matrix/engine_api_windows.json  op-node 在 9 fork 激活点选用的方法号（生成物，不入库）
@@ -47,6 +49,9 @@
 #      corpus 完整性由 #2 保证；op-geth 参考无漂移由本文件头部 PIN 保证。
 #   4. matrix 工件（caps.json / engine_api_windows.json）与 known_deviations.json 均存在
 #      —— 判据 3 的 git diff 对缺失路径不报错，故存在性单独判。
+#   5. golden 书务（判据 5）：三份 golden 契约的条目集合覆盖磁盘上的 golden 集合，枚举口径与
+#      OpGoldenCorpusProvenanceTest.cpp 的 corpusFilesOnDisk()/getPayloadFilesOnDisk() 对齐；
+#      缺失条目自动 append，既有行绝不改写，陈旧/缺档只告警（判定权归 provenance tripwire）。
 # =============================================================================
 set -euo pipefail
 OPGETH="${OPGETH:-/Users/octopus/octo/code/blockchain-impl/op-geth}"
@@ -116,6 +121,166 @@ done
 
 "$OPGETH/opt8n-ref" --chain-output-dir "$T8N_DIR/golden/engine/chained" \
   --op-geth-commit "$PIN"                                    # 链式对 golden（chainA/B + jovianChainA/B）
+
+# ── 判据 5：golden 书务维护（F-COV-1 复盘；append-only）──────────────────────
+# F-COV-1（WI-E3/E11）：语料新增了两个 golden，但 golden/engine/SHA256SUMS 没同步，直到
+# FISCO 侧 provenance tripwire（opstack-executor/tests/OpGoldenCorpusProvenanceTest.cpp）报
+# 「磁盘集合 != 覆盖集合」才被发现——本脚本产出 golden 却不管它的书务。此步把三份**契约**
+# 的维护机械化，枚举口径与 tripwire 的两个枚举函数逐字对齐：
+#   golden/engine/SHA256SUMS             顶层 *.golden.json + chained/*.json（tripwire (a) 两半）
+#   golden/engine/getpayload/SHA256SUMS  getpayload/*.json                 （tripwire (c)）
+#   golden/engine/manifest.txt           顶层 *.golden.json 的索引清单（人工文档，曾滞后 49 项）
+# 规则（与 vectors/manifest.txt 的 append-if-absent 同一套仪式）：
+#   1. 只**追加**缺失条目；既有行永不重写。既有 golden 的字节漂移属「有意的重新生成」，
+#      必须与该契约的刷新同提交——判据 3 的 git diff 把它变成红，这本就是仪式的一部分。
+#   2. 幂等：稳态下不动任何字节（判据 3 保持绿）。
+#   3. 陈旧/缺档只告警不失败：判定权归 tripwire（失败文案在那边），本步只把「谁陈旧了」提前
+#      打进 log，省掉「测试红了再回来查」这一趟。
+#   4. 三份契约都是入库文件：缺席 = checkout 损坏，直接 fail（判据 4 的存在性教训）。
+GOLDEN_DIR="$T8N_DIR/golden/engine"
+for contract in "$GOLDEN_DIR/SHA256SUMS" "$GOLDEN_DIR/manifest.txt" \
+                "$GOLDEN_DIR/getpayload/SHA256SUMS"; do
+  [ -f "$contract" ] || { echo "golden bookkeeping: missing tracked contract $contract" >&2; exit 1; }
+done
+python3 - "$GOLDEN_DIR" <<'PYEOF'
+import hashlib, pathlib, re, sys
+
+engine = pathlib.Path(sys.argv[1])
+getpayload = engine / "getpayload"
+
+SUMS_COMMENT = ("Appended by generator/regen.sh (append-only bookkeeping, F-COV-1): golden files "
+                "generated but not previously summed. Existing lines are never rewritten -- a "
+                "genuine regeneration refreshes them by hand in the same commit.")
+MANIFEST_COMMENT = ("Appended by generator/regen.sh (append-only bookkeeping, F-COV-1): goldens "
+                    "from batches after the original 63-set (precompile matrix, fork boundary/"
+                    "activation cells, observers, legacy/l1block/withdraw, 7702 skips, ...). Same "
+                    "set as cases/*.in.json, exactly like the 63-set above.")
+
+
+def sha256(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def read_listing(path):
+    """SHA256SUMS 的 <sha256>  <relpath> 行 -> {relpath: sha256}；注释/空行忽略。
+    坏格式行只告警不中断（一行手滑不该让整批向量生不出来），但该行不算「已覆盖」。"""
+    listed = {}
+    for line in path.read_text().splitlines():
+        if not line or line.startswith("#"):
+            continue
+        m = re.match(r"^([0-9a-f]{64})  (.+)$", line)
+        if not m:
+            print("WARNING: %s: malformed line ignored: %r" % (path, line), file=sys.stderr)
+            continue
+        listed[m.group(2)] = m.group(1)
+    return listed
+
+
+def golden_files():
+    """顶层 *.golden.json —— 与 corpusFilesOnDisk() 同口径（extension == ".json" 且
+    stem 的 extension == ".golden"）。"""
+    return [p for p in sorted(engine.iterdir())
+            if p.is_file() and p.suffix == ".json" and pathlib.Path(p.stem).suffix == ".golden"]
+
+
+def chained_files():
+    chained = engine / "chained"
+    return sorted(p for p in chained.iterdir() if p.is_file() and p.suffix == ".json")
+
+
+def drift_report(sums, base, label, gone_hint):
+    """按 tripwire 的口径逐行核验**整份**文件（不分面）：列了但不在磁盘上 / 字节已变。
+    只报告，不修：两种都得人来做有意的提交。"""
+    stale, gone = [], []
+    for rel, recorded in sorted(read_listing(sums).items()):
+        path = base / rel
+        if not path.is_file():
+            gone.append(rel)
+        elif sha256(path) != recorded:
+            stale.append(rel)
+    for rel in stale:
+        print("WARNING: %s: %s no longer matches the recorded sum -- a regeneration must refresh "
+              "this line in the same commit as the golden. OpGoldenCorpusProvenanceTest is the "
+              "judge and goes red until then; this step never rewrites an existing line."
+              % (sums, rel), file=sys.stderr)
+    if gone and len(gone) == len(read_listing(sums)):
+        # 整面缺席（本地没生成 getpayload 封套、或 checkout 残缺）：一行说清，别刷 9 条同样的话。
+        print("WARNING: %s: none of the %d listed files is present on disk (this surface is not "
+              "populated in this checkout). %s" % (sums, len(gone), gone_hint), file=sys.stderr)
+    else:
+        for rel in gone:
+            print("WARNING: %s: %s is listed but absent on disk -- the provenance tripwire reports "
+                  "a set mismatch. %s" % (sums, rel, gone_hint), file=sys.stderr)
+    print("[golden-bookkeeping] %s: %d listed, %d stale, %d listed-but-absent"
+          % (label, len(read_listing(sums)), len(stale), len(gone)))
+
+
+def maintain_sums(sums, base, files, label, gone_hint):
+    """append-if-absent 覆盖 `files`（相对 `base` 的路径），随后报告整份文件的漂移。"""
+    listed = read_listing(sums)
+    on_disk = {str(p.relative_to(base)): p for p in files}
+    pending = sorted(set(on_disk) - set(listed))
+    if pending:
+        with sums.open("a") as fh:
+            fh.write("\n# " + SUMS_COMMENT + "\n")
+            for rel in pending:
+                fh.write("%s  %s\n" % (sha256(on_disk[rel]), rel))
+        print("[golden-bookkeeping] %s: appended %d newly generated file(s) -- commit the "
+              "refreshed %s (judgment 3 goes red on purpose until then)"
+              % (label, len(pending), sums.name))
+    # 自检：追加后本面必须全被覆盖，否则是本步自己的契约破了，别静默通过（判据 4 的教训）。
+    uncovered = sorted(set(on_disk) - set(read_listing(sums)))
+    if uncovered:
+        print("ERROR: %s: %d file(s) still unlisted after the append: %s"
+              % (sums, len(uncovered), ", ".join(uncovered)), file=sys.stderr)
+        sys.exit(1)
+    drift_report(sums, base, label, gone_hint)
+
+
+def read_text_listing(manifest):
+    return {l for l in manifest.read_text().splitlines() if l and not l.startswith("#")}
+
+
+def maintain_manifest(manifest, files, label):
+    """manifest.txt 是 basename 索引（无哈希）：同样只追加，随后报告「列了但不在磁盘上」。"""
+    listed = read_text_listing(manifest)
+    on_disk = {p.name for p in files}
+    pending = sorted(on_disk - listed)
+    if pending:
+        with manifest.open("a") as fh:
+            fh.write("\n# " + MANIFEST_COMMENT + "\n")
+            for name in pending:
+                fh.write(name + "\n")
+        print("[golden-bookkeeping] %s: appended %d new entr(ies) -- commit the refreshed %s "
+              "(judgment 3 goes red on purpose until then)"
+              % (label, len(pending), manifest.name))
+    gone = sorted(listed - on_disk)
+    if gone and len(gone) == len(listed):
+        print("WARNING: %s: none of the %d indexed files is present on disk (no golden generated "
+              "in this checkout)." % (manifest, len(gone)), file=sys.stderr)
+    else:
+        for name in gone:
+            print("WARNING: %s: %s is indexed but absent on disk -- drop the line deliberately."
+                  % (manifest, name), file=sys.stderr)
+    uncovered = sorted(on_disk - read_text_listing(manifest))
+    if uncovered:
+        print("ERROR: %s: %d file(s) still unlisted after the append: %s"
+              % (manifest, len(uncovered), ", ".join(uncovered)), file=sys.stderr)
+        sys.exit(1)
+    print("[golden-bookkeeping] %s: %d indexed, %d indexed-but-absent"
+          % (label, len(read_text_listing(manifest)), len(gone)))
+
+
+maintain_sums(engine / "SHA256SUMS", engine, golden_files() + chained_files(),
+              "golden/engine/SHA256SUMS [*.golden.json + chained/*.json]",
+              "Drop the line deliberately if the golden is gone.")
+maintain_manifest(engine / "manifest.txt", golden_files(), "golden/engine/manifest.txt")
+maintain_sums(getpayload / "SHA256SUMS", getpayload,
+              sorted(p for p in getpayload.iterdir() if p.is_file() and p.suffix == ".json"),
+              "golden/engine/getpayload/SHA256SUMS",
+              "These envelopes are produced outside this script (P2 Task 4's regen.sh wiring); "
+              "the tripwire's getpayload case stays red until they are regenerated.")
+PYEOF
 
 # ── matrix 工件（P1）：两个 dumper 各自在对应 pin 树内 build ─────────────────
 # 先验 CL 引用树（HEAD == pin 且 op-node/op-service 子树干净）；该树可被其它工作改动
@@ -238,7 +403,9 @@ rm -f /tmp/opt8n-left.$$ /tmp/opt8n-right.$$
 #   - vectors/manifest.txt（corpus 契约；若合法扩 corpus，regen 会 append 它 → 本 gate
 #     失败，开发须按流程提交新 manifest，属预期仪式）
 #   - vectors/*.md（DIVERGENCES / ANCHOR-CORRECTIONS / OP_RECEIPT_FIELDMAP，手维护）
-#   - golden/engine/manifest.txt、golden/engine/SHA256SUMS（测试不读，仅契约）
+#   - golden/engine/{SHA256SUMS,manifest.txt} 与 golden/engine/getpayload/{SHA256SUMS,manifest.txt}
+#     （golden 书务契约：SHA256SUMS 由 OpGoldenCorpusProvenanceTest 逐字节读，manifest.txt 是索引。
+#     合法扩 golden 时判据 5 会 append 缺失条目 → 本 gate 失败 → 提交刷新后的契约，同为预期仪式）
 # corpus 完整性由上方判据 #2（manifest 集合 == cases∪三模式产物）保证；op-geth 参考
 # 无漂移由脚本头部 PIN 保证。
 git -C "$REPO_ROOT" diff --exit-code -- \
@@ -246,6 +413,8 @@ git -C "$REPO_ROOT" diff --exit-code -- \
   "$T8N_DIR/vectors/"*.md \
   "$T8N_DIR/golden/engine/manifest.txt" \
   "$T8N_DIR/golden/engine/SHA256SUMS" \
+  "$T8N_DIR/golden/engine/getpayload/manifest.txt" \
+  "$T8N_DIR/golden/engine/getpayload/SHA256SUMS" \
   "$T8N_DIR/matrix/manifest.txt" \
   "$T8N_DIR/matrix/SHA256SUMS" \
   "$T8N_DIR/matrix/known_deviations.json"
