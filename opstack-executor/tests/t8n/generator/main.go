@@ -407,6 +407,23 @@ type outputLegacyTx struct {
 	Sender   common.Address        `json:"sender"`
 }
 
+// outputAccessListTx is the type-0x01 (EIP-2930) arm's output object: legacy's
+// single `gasPrice` plus an `accessList` (same tuple shape as the eip1559
+// arm's; buildAccessList normalizes nil StorageKeys to [] on both sides).
+type outputAccessListTx struct {
+	OpType     string                `json:"_op_type"`
+	OpRaw      string                `json:"_op_raw"`
+	ChainID    *math.HexOrDecimal256 `json:"chainId"`
+	Nonce      math.HexOrDecimal64   `json:"nonce"`
+	To         *common.Address       `json:"to"`
+	Gas        math.HexOrDecimal64   `json:"gas"`
+	GasPrice   *math.HexOrDecimal256 `json:"gasPrice"`
+	Value      *math.HexOrDecimal256 `json:"value"`
+	Data       hexutil.Bytes         `json:"data"`
+	AccessList []outputAccessTuple   `json:"accessList,omitempty"`
+	Sender     common.Address        `json:"sender"`
+}
+
 // outputSetCodeTxCreate is the setcode_create invalid-tx output object
 // (Task 4). Unlike outputSetCodeTx, To is *common.Address so the vector can
 // carry `to: null` — the evmone opValidate CREATE_SET_CODE_TX trigger
@@ -4148,6 +4165,56 @@ func buildTx(in *inputTx, signer types.Signer, cfg *params.ChainConfig) (*types.
 			Data:                 in.Data,
 			AccessList:           outAccessList,
 			Sender:               from,
+		})
+		return tx, outJSON, err
+
+	case "accesslist":
+		// Type-0x01 (EIP-2930) tx: a single per-gas price (like legacy) plus an
+		// access list. Signing routes through the London signer's AccessListTx
+		// arm; MarshalBinary emits the 0x01-typed envelope. The access list
+		// contributes intrinsic gas (ACCESS_LIST_ADDRESS_COST per tuple +
+		// ACCESS_LIST_STORAGE_KEY_COST per key), so even a plain transfer makes
+		// the 2930 decode/intrinsic accounting observable in receipt gasUsed.
+		prv, from, err := parseKey(in.SecretKey)
+		if err != nil {
+			return nil, nil, err
+		}
+		chainID, nonce, gas, value, _, _ := txScalars(in)
+		accessList, outAccessList := buildAccessList(in.AccessList)
+		gasPrice := big.NewInt(0)
+		if in.GasPrice != nil {
+			gasPrice = (*big.Int)(in.GasPrice)
+		}
+		txdata := &types.AccessListTx{
+			ChainID:    chainID,
+			Nonce:      nonce,
+			GasPrice:   gasPrice,
+			Gas:        gas,
+			To:         in.To,
+			Value:      value,
+			Data:       []byte(in.Data),
+			AccessList: accessList,
+		}
+		tx, err := types.SignNewTx(prv, signer, txdata)
+		if err != nil {
+			return nil, nil, fmt.Errorf("signing accesslist tx: %w", err)
+		}
+		rawBin, err := tx.MarshalBinary() // iron rule: _op_raw = tx.MarshalBinary()
+		if err != nil {
+			return nil, nil, err
+		}
+		outJSON, err := json.Marshal(outputAccessListTx{
+			OpType:     "accesslist",
+			OpRaw:      hexutil.Encode(rawBin),
+			ChainID:    (*math.HexOrDecimal256)(chainID),
+			Nonce:      math.HexOrDecimal64(nonce),
+			To:         in.To,
+			Gas:        math.HexOrDecimal64(gas),
+			GasPrice:   (*math.HexOrDecimal256)(gasPrice),
+			Value:      (*math.HexOrDecimal256)(value),
+			Data:       in.Data,
+			AccessList: outAccessList,
+			Sender:     from,
 		})
 		return tx, outJSON, err
 

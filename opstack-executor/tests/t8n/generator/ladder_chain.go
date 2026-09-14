@@ -318,6 +318,14 @@ func generateLadderChain(spec ladderSpec, n int) (*chainOutput, error) {
 	for _, b := range ladderCreateCallProbeBlocks(n, createCallActivationIdxs) {
 		createCallBlocks[b] = struct{}{}
 	}
+	// P2-B: the transaction-type diversity probes (2930/legacy/7702) land on
+	// the SAME segment probe blocks, appended after the create->call probe.
+	// delegationStarted flips on the first 7702 delegation block: from there on
+	// the authority EOA exists in the trie (nonce+designator code), so every
+	// later block's postState candidate set must list it (emitPostState
+	// completeness check).
+	delegationStarted := false
+	delegationNonce := uint64(0)
 	if err := func() (err error) {
 		defer func() {
 			if r := recover(); r != nil {
@@ -453,6 +461,20 @@ func generateLadderChain(spec ladderSpec, n int) (*chainOutput, error) {
 			// every-25 receipt indices stable when they do).
 			if _, ok := createCallBlocks[i]; ok {
 				injectLadderCreateCallProbe(add, func() uint64 { return bg.TxNonce(senderAddr) })
+			}
+			// P2-B tx-type diversity probes, appended last on the same segment
+			// probe blocks. On the first 7702 delegation the authority account
+			// starts existing in the trie: flip the candidate bookkeeping so
+			// every later block declares it.
+			if _, ok := createCallBlocks[i]; ok {
+				if injectLadderTxTypeProbes(add, func() uint64 { return bg.TxNonce(senderAddr) },
+					cfg, blockTime, delegationNonce) {
+					delegationStarted = true
+					delegationNonce++
+				}
+			}
+			if delegationStarted {
+				in.ExtraCandidates = append(in.ExtraCandidates, ladderDelegateAuthority)
 			}
 
 			ins[i] = in
