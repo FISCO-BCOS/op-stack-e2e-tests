@@ -67,7 +67,7 @@ DEFAULT_FIELDS = {
     "timestamp": "0x689d5c00",
     # Jovian 17-byte extraData: version(1) || denominator u32 BE ||
     # elasticity u32 BE || minBaseFee u64 BE.
-    "extra_data": "0x00000000fa000000060000000000000000",
+    "extra_data": "0x01000000fa000000060000000000000000",
     "mix_hash": "0x" + "00" * 32,
     "nonce": "0x0000000000000000",
     "base_fee_per_gas": "0x3b9aca00",
@@ -185,7 +185,7 @@ def main(argv=None):
         allocs = parse_allocs_ini(args.allocs)
         fields["state_root"] = "0x" + compute_state_root(allocs).hex()
         # Isthmus+ genesis: withdrawalsRoot = L2ToL1MessagePasser storage root
-        # (isthmus/exec-engine.md:100-101; op-geth core/genesis.go:711-719). Phase A deploys
+        # (isthmus/exec-engine.md:100-101; op-geth core/genesis.go:711-719). The chain deploys
         # the passer with empty storage -> empty-trie root; a proxied op-deployer layout
         # carries storage and the tool must track it.
         for alloc in allocs:

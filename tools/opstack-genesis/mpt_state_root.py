@@ -26,9 +26,11 @@ MPT node encoding follows the C++ mpt module (bcos-ledger/bcos-ledger/mpt):
     hash (RLP >= 32 bytes) -> 0xa0 || keccak256(raw).
   - Root is ALWAYS a 32-byte hash, even when the top node encodes to < 32 bytes.
 
-Verified byte-identical against the C++ implementation:
-  - /tmp/op-spike/b3/config.genesis (14 allocs) -> 409e6736... (known-good anchor)
-  - setup-generated allocs + SENDER (14 allocs) -> 0f4dbf6c... (C++ derived root)
+Verified against an independent implementation: test_mpt_state_root.py
+(test_state_root_matches_independent_golden_oracle) pins compute_state_root against
+gen_trieroot_golden.py — a separate RLP/MPT implementation whose vectors predate this
+tool — so a drift in either changes the genesis hash and fails the committed test
+instead of shipping a silently different genesis.
 """
 import importlib.util
 from pathlib import Path
@@ -99,7 +101,8 @@ def common_prefix_len(a, b):
 
 def hex_prefix_encode(nibbles, is_leaf):
     """Hex-Prefix (compact) encoding, Yellow Paper Appendix C. nibbles: [0..15]."""
-    assert len(nibbles) > 0
+    if not nibbles:
+        raise ValueError("hex-prefix encoding requires at least one nibble")
     odd = len(nibbles) % 2 == 1
     first = (0x20 if is_leaf else 0) | (0x10 if odd else 0)
     out = bytearray()
@@ -205,6 +208,16 @@ def compute_storage_root(storage):
         if rlp_value is None:
             continue  # zero value: skipped
         slot_bytes = bytes.fromhex(strip0x(slot_hex))
+        # The genesis contract keccaks the slot bytes AS CONFIGURED (see
+        # bcos-ledger GenesisStateRoot.cpp: "not mpt::slotKeyHash, which right-aligns
+        # into a fixed 32 bytes"). geth instead keccaks the zero-padded slot32 — so a
+        # short slot here silently roots a DIFFERENT trie than geth would. build-allocs
+        # always emits 64-char pairs; reject anything else loudly instead of rooting
+        # over bytes the input never meant.
+        if len(slot_bytes) != 32:
+            raise ValueError(
+                f"storage slot must be exactly 32 bytes (64 hex chars), got "
+                f"{len(slot_bytes)} bytes: {slot_hex!r} — pad the slot or fix the input")
         slot_key_hash = keccak256(slot_bytes)
         entries.append((slot_key_hash, rlp_value))
     return build_trie(entries)
@@ -224,6 +237,14 @@ def compute_state_root(allocs):
             rlp_bytes(code_hash),
         ]))
         addr_bytes = bytes.fromhex(strip0x(alloc["address"]))
+        # Same loud-reject contract as the slot lane above: the state key is
+        # keccak256(address) over EXACTLY 20 bytes, so a 19/21-byte address would
+        # silently root a different trie (keccak over different-width bytes) — reject
+        # anything the input never meant instead of rooting over it.
+        if len(addr_bytes) != 20:
+            raise ValueError(
+                f"alloc address must be exactly 20 bytes (40 hex chars), got "
+                f"{len(addr_bytes)} bytes: {alloc['address']!r} — fix the allocs INI")
         addr_key_hash = keccak256(addr_bytes)
         state_entries.append((addr_key_hash, account_rlp))
     return build_trie(state_entries)
@@ -243,10 +264,22 @@ def parse_allocs_ini(path):
             if line.startswith("[") and line.endswith("]"):
                 section = line[1:-1]
                 if section.startswith("alloc.") and section.endswith(".storage"):
+                    if current is None:
+                        raise ValueError(
+                            f"{path}: [alloc.N.storage] section before any [alloc.N] — "
+                            "fix the INI section order")
                     current_storage = []
                     current["storage"] = current_storage
                 elif section.startswith("alloc."):
-                    current = {"storage": []}
+                    address = section[len("alloc."):]
+                    if any(a.get("address", "").lower() == address.lower() for a in allocs):
+                        # Two sections for one address used to survive parsing and only
+                        # fail deep inside build_branch (IndexError at depth 64); the
+                        # genesis hash for a duplicated alloc is meaningless either way.
+                        raise ValueError(
+                            f"{path}: duplicate [alloc.{address}] section — merge the "
+                            "storage entries into one section")
+                    current = {"address": address, "storage": []}
                     allocs.append(current)
                     current_storage = None
                 else:
@@ -259,6 +292,15 @@ def parse_allocs_ini(path):
             key = key.strip()
             value = value.strip()
             if current_storage is not None:
+                # Duplicate slot keys inside one section survive parsing only to crash
+                # deep inside build_branch (IndexError at depth 64) — the same
+                # late-failure mode the duplicate-address guard above closes. Two
+                # entries for one slot overwrite each other in any real MPT, so the
+                # root would be meaningless either way; reject at parse time.
+                if any(existing == key for existing, _ in current_storage):
+                    raise ValueError(
+                        f"{path}: duplicate storage slot {key!r} inside one "
+                        "[alloc.N.storage] section — merge the entries into one line")
                 current_storage.append((key, value))
             else:
                 current[key] = value

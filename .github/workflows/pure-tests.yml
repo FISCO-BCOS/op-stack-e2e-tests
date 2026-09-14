@@ -2,7 +2,9 @@ name: op-e2e pure tests
 
 on:
   pull_request:
-    paths: ["tools/op-e2e/**"]
+    paths:
+      - "tools/op-e2e/**"
+      - "tools/opstack-genesis/**"
   push:
     branches: [main]
 
@@ -20,3 +22,23 @@ jobs:
         run: python3 -m pip install 'eth-hash[pycryptodome]' trie rlp pyyaml
       - name: Run pure tests
         run: python3 -m unittest discover -s tools/op-e2e/tests -v
+
+  genesis-tooling:
+    # The genesis toolchain (allocs / eth genesis header / MPT roots) lives here and is
+    # consumed by both the e2e flow and the node's own [eth_genesis_header] checks.
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: tools/opstack-genesis
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install deps
+        # build-allocs.py imports pyyaml on its CLI path, so the suite (which loads it
+        # by path) needs pyyaml too. pytest runs the suite; eth-hash / trie / rlp back
+        # the independent root oracles the tests cross-check against.
+        run: python3 -m pip install --upgrade pip pyyaml pytest 'eth-hash[pycryptodome]' trie rlp
+      - name: Run pytest
+        run: python3 -m pytest test_build_allocs.py test_gen_rollup_config.py test_gen_eth_header_fixture.py test_mpt_state_root.py -v

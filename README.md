@@ -25,9 +25,14 @@ white-box C++ e2e/integration tests that link against the EL internals stay in
   `chain_driver.py`, ...), `versions.json` (pinned optimism monorepo commit and
   on-chain contract versions, ENFORCED by `setup_c2.sh`).
 - `tools/opstack-genesis/` — `build-allocs.py`, `gen_rollup_config.py`,
-  `gen_eth_header_fixture.py`, `mpt_state_root.py`, `op-fork-base-allocs.json`,
-  chain configs. Fed by the main repo's `tools/opstack-genesis` history; see
-  its README.
+  `gen_eth_header_fixture.py`, `mpt_state_root.py`, `gen_trieroot_golden.py`
+  (the independent RLP/MPT oracle `test_mpt_state_root.py` pins against),
+  `op-fork-base-allocs.json`, chain configs, and the pytest suite over them
+  (`tools/opstack-genesis/**` runs in the `pure-tests` workflow). This is the
+  canonical copy: the main repo reaches it through the `OPGEN` env var (its C2
+  entry points that at the harness checkout) and the B3 flow reads it in place.
+  `L2CONTRACTS` / `BASE_ALLOCS` remain overridable, so the toolchain still
+  targets the main repo's `bcos-l2-contracts` and an op-deployer run's output.
 - `opstack-executor/tests/t8n/` — `generator/` (Go case definitions +
   `regen.sh` + `ensure-vectors.sh`), `vectors/` (hand-maintained divergence
   docs + tracked anchors; the generated `vectors/*.json` are git-ignored and
@@ -40,9 +45,10 @@ white-box C++ e2e/integration tests that link against the EL internals stay in
 ## Relationship with the main repository
 
 Migrated from `FISCO-BCOS/FISCO-BCOS` (`sync-release-3.18.0`, commit
-`6f7b45c0a`). The main repo will drop the duplicated directories once the CI
-wiring (Phase 2) is green; until then this repo is the canonical source of the
-black-box assets and the main repo retains its current copies.
+`6f7b45c0a`). This repo is the canonical source of the black-box assets; the
+main repo has dropped its `tools/opstack-genesis` copy, which its CI now
+consumes from the harness checkout (pinned commit) via `OPGEN`. The
+`opstack-executor/tests/t8n/` copy is still carried in both repos.
 
 The C++ replay gate needs the generated vectors at build time. Main-repo CI
 clones this repo (pinned commit), runs `ensure-vectors.sh`, and passes the
@@ -67,4 +73,6 @@ bash opstack-executor/tests/t8n/generator/ensure-vectors.sh
 
 - Phase 1 (migration of black-box + t8n data-plane assets): done.
 - Phase 2 (CI wiring — workflows for C2/B3/static checks, main-repo job
-  handoff): pending.
+  handoff): the genesis toolchain and its pytest gate are wired here
+  (`pure-tests`), and the main repo consumes them from the harness checkout;
+  the t8n wiring stays as described above.

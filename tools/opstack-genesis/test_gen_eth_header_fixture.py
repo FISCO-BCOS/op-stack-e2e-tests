@@ -16,7 +16,7 @@ _SPEC.loader.exec_module(_FIXTURE)
 
 # keccak256 is re-exported by mpt_state_root (build-allocs.py has a hyphenated filename and
 # cannot be imported as a module).
-from mpt_state_root import compute_storage_root, keccak256  # noqa: E402
+from mpt_state_root import compute_storage_root  # noqa: E402
 
 PASSER = "0x4200000000000000000000000000000000000016"
 
@@ -36,9 +36,15 @@ class TestWithdrawalsRoot(unittest.TestCase):
         self.assertIn("withdrawals_root=" + _FIXTURE.EMPTY_TRIE_ROOT, out)
 
     def test_passer_storage_drives_withdrawals_root(self):
-        # keccak256(rlp(keccak(slot))) trie over one slot, computed independently.
+        # Independent oracle, not a re-derivation: the expected root is the spec-correct
+        # leaf keccak256(rlp([HP(keccak256(slot)), rlp(value_trimmed)])) for
+        # slot=0x..01 value=0x..02, computed outside mpt_state_root.py and pasted here
+        # (cross-checked against py-trie: HexaryTrie({})[keccak256(slot)] = rlp(2)).
+        # Using compute_storage_root() here would only pin plumbing against itself.
         slot, value = "0x" + "00" * 31 + "01", "0x" + "00" * 31 + "02"
-        expected = compute_storage_root([(slot, value)])
+        expected_hex = "6302d6aa5cf8befc2c23254172197534a8639fc400eb7a11fedbb44c388e2967"
+        self.assertEqual(
+            "0x" + compute_storage_root([(slot, value)]).hex(), "0x" + expected_hex)
         with tempfile.NamedTemporaryFile("w", suffix=".ini", delete=False) as handle:
             handle.write(f"[alloc.1]\naddress={PASSER}\nbalance=0\n")
             handle.write(f"[alloc.1.storage]\n{slot}={value}\n")
@@ -50,7 +56,7 @@ class TestWithdrawalsRoot(unittest.TestCase):
                 capture_output=True, text=True, check=True).stdout
         finally:
             pathlib.Path(path).unlink()
-        self.assertIn("withdrawals_root=0x" + expected.hex(), out)
+        self.assertIn("withdrawals_root=0x" + expected_hex, out)
 
 
 if __name__ == "__main__":
