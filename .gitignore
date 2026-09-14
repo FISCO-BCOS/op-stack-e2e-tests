@@ -18,3 +18,6 @@ opstack-executor/tests/t8n/golden/engine/chained/*.json
 opstack-executor/tests/t8n/golden/engine/getpayload/*.json
 opstack-executor/tests/t8n/matrix/caps.json
 opstack-executor/tests/t8n/matrix/engine_api_windows.json
+
+# chainexport build product (rebuild via tools/devnet/chainexport/build.sh)
+tools/devnet/chainexport/chainexport.bin

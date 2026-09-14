@@ -365,18 +365,25 @@ json.dump(s, open(p, 'w'))"
   # ---- 7) L2: geth init + start ----
   STEP="geth"
   printf '%s\n' "$JWT" >"$RUN/jwt.txt"; chmod 600 "$RUN/jwt.txt"
-  "$GETH" --datadir "$L2DIR" init "$ART/genesis.json" >"$LOGS/geth-init.log" 2>&1 \
+  "$GETH" --datadir "$L2DIR" --state.scheme hash init "$ART/genesis.json" >"$LOGS/geth-init.log" 2>&1 \
     || { tail_log "$LOGS/geth-init.log"; die "geth init failed"; }
   start_bg geth "$LOGS/geth.log" "$GETH" --datadir "$L2DIR" \
     --http --http.port "$P_GETH_HTTP" --http.api eth,debug,net,web3 \
     --authrpc.port "$P_GETH_AUTH" --authrpc.jwtsecret "$RUN/jwt.txt" \
     --ws --ws.port "$P_GETH_WS" \
-    --gcmode archive --syncmode full --nodiscover --port 0 \
+    --state.scheme hash --gcmode archive --syncmode full --nodiscover --port 0 \
     --rollup.disabletxpoolgossip
-  # 注意：不给 --rollup.sequencerhttp。op-geth 的 SendTx 在该旗标存在时把用户 raw tx
+  # 注意 1：不给 --rollup.sequencerhttp。op-geth 的 SendTx 在该旗标存在时把用户 raw tx
   # 转发到指定端点（eth/api_backend.go SendTx）；单节点 devnet 指向 op-node 时转发必败
   # （op-node 无 eth_sendRawTransaction，-32601），用户 RPC 发交易整条不可用（P1-3 实测）。
   # 单 sequencer 语义 = 用户交易进本地 txpool，由本节点 sequencer 出块。
+  # 注意 2（P3-1 实测定案）：--gcmode archive 单独不够。本 geth 缺省 state scheme=path，
+  # 路径库的历史状态随机读只覆盖 recent diff-layer 窗口（实测恰 128 块：
+  # head-129 的 debug_accountRange/eth_getBalance 即报 missing trie node /
+  # historical state not available；--history.state 0 只扩 history journal，实测
+  # 不解锁 RPC 随机读）。chainexport 需要在任意历史块上导全量状态，改用
+  # --state.scheme hash + --gcmode archive（经典归档语义，全史可查）。
+  # 改 scheme 必须重新 init：opdevnet down 已删 L2 datadir，up 每次全新 init，无残留。
   wait_rpc "$L2_HTTP" 30 || { tail_log "$LOGS/geth.log" 40; die "geth HTTP not ready on $P_GETH_HTTP"; }
   wait_listen "$P_GETH_AUTH" 10 || { tail_log "$LOGS/geth.log" 40; die "geth authrpc not listening on $P_GETH_AUTH"; }
   wait_listen "$P_GETH_WS" 10 || { tail_log "$LOGS/geth.log" 40; die "geth ws not listening on $P_GETH_WS"; }

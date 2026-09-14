@@ -293,3 +293,107 @@ fork 绝对时间 = l2_time + {300,600,…,2400} 全部 OK（ARTIFACT VERIFY 全
   本机 APFS 可用空间波动大（快照/可清除空间），campaign 期间建议清理
   `~/Library/Caches/{vscode-cpptools,ccache,go-build,pip}` 并周期性
   `tmutil thinlocalsnapshots /`。
+
+---
+
+# chain-to-vector 导出器 `chainexport`（P3-1 Task 5）
+
+状态：**已完成（2026-09-15）**。`tools/devnet/chainexport/` 把运行中的真实 devnet 链
+导出为与 ladder 逐字段同构的 chain-mode 差分向量（schema v3-block），直接供
+FISCO `OpT8nReplay` 试重放。导出面 100% 命中 ladder 的键集家族；试重放给出
+3 族真实分歧（见下），既有语料全绿。
+
+## 模块归属定案
+
+- **拷入 op-geth 树构建**（与 `generator/regen.sh` 的 `cmd/opt8n-ref` 同一模式）：
+  源码唯一真相 = 本目录 `main.go`（stdlib-only，无 op-geth import）；
+  `build.sh` 把它拷进 `$OPGETH/cmd/chainexport` 用 op-geth 的 go.mod 编译，
+  产物落回 `chainexport.bin`（.gitignore），临时目录即删——op-geth tracked 树保持干净。
+  即便当前无 op-geth import 仍走该模式：① 与既有构建仪式一致；② 构建环境被
+  pin（HEAD==e8800cffe、tracked 树干净）钉死，而 chainexport 消费的 RPC 字段
+  形状正是该 pin 的 `internal/ethapi MarshalReceipt` / `txJSON` 暴露面。
+- 用法：`bash build.sh && ./chainexport.bin --rpc http://127.0.0.1:9545
+  --rollup /tmp/opdevnet/artifacts/rollup.json --out-dir <dir> [--poststate boundary|full]`。
+  stdout 打 `DEVNET-STEM <stem>`（regen.sh 的 LADDER-STEM 惯例）与文件 SHA256。
+
+## 重大前置修复（opdevnet.sh，随本提交）
+
+**`--gcmode archive` 单独不再构成归档节点**（P3-1 实测）：本 geth（path state
+scheme）的历史状态随机读只覆盖 recent diff-layer 窗口（实测恰 128 块：
+head-129 的 `debug_accountRange`/`eth_getBalance` 即报 missing trie node /
+historical state not available）；`--history.state 0` 只扩 history journal（日志
+`state-history="entire chain"` 佐证），实测不解锁 RPC 随机读。修复 =
+`--state.scheme hash`（`geth init` 与 `geth` 启动两处都要——init 缺省仍写
+path 标记，漏改则启动报 `incompatible state scheme`）。经典 hash+archive 语义下
+全史状态可查，chainexport 的任意历史块 postState 导出才成立。
+
+## 导出实现要点（与 generator 逐字段对齐）
+
+- header：`eth_getBlockByNumber(n,true)`；withdrawalsRoot/requestsHash/blobGasUsed
+  按 RPC 存在性发射（nil→absent），与 ladder 各 fork 键集逐键一致。
+- 回执：`eth_getBlockReceipts` 的 OP 专属字段全量映射；`_op_l1_fee_scalar` 仅当
+  RPC 十进制串（scaled 值）为精确整数时发射 hex（generator 的 `big.Exact` 口径；
+  devnet raw scalar 0x558 非 1e6 倍数 → pre-Ecotone 恒 absent）；`_op_operator_fee`
+  仅当 scalar/constant 非零（devnet 全零 → 双侧 absent；公式已实现备用）；
+  `_op_da_footprint`=jovian 回执 blobGasUsed、`_op_da_footprint_gas_scalar`=同名 RPC 字段。
+- `_op_raw`：每笔非 deposit tx 经 `eth_getRawTransactionByBlockNumberAndIndex`；
+  deposit 走结构化字段（`is_system_tx` RPC 缺失补 false；`mint` 按 RPC 存在性——
+  本 devnet op-node 给 attributes 存款带 `mint:0x0`，与执行语义等价故原样保留；
+  `value` 非 0 才发射——runner 资金桥的 portal 存款带 `value=mint=1e18`，漏发会
+  造成假分歧）。
+- `output`（回执返回数据）：RPC 回执不携带，用 `debug_traceBlockByNumber + callTracer`
+  逐块取 top-level output（空补 "0x"）。
+- postState：`debug_accountRange` 分页（≤256/页；**next 光标是 base64**——Go []byte
+  JSON 序列化，`start` 参数要 0x-hex，须转码）。pre = block 0 全量状态（replayer
+  从它播种整条链）。`--poststate boundary`（缺省）采样 = 首/末 + 每 100 块 +
+  激活块 ±1，写出 `sampledBlocks`（0-based）；full 每块全量。
+- `_info.hardfork`：rollup.json fork 时间表 + 块时间戳段判定（复用 Task 3 runner
+  的语义）；**delta 段标注为 canyon**——Delta 是 devnet 本地 rollup 表 fork，本
+  pin 无任何 EL 行为（chainconfig 无 deltaTime、attributes.go 无注入分支），而
+  向量契约只认 8 个 EL fork 名（OpT8nReplay 硬校验）；stdout 打 NOTE 行存证。
+- stem：`devnet_<块数>_<digest8>`，digest8 = sha256("0:regolith,<激活块>:<fork>,…")[:8]
+  （激活块号取自**实际链上头**，1-based；与 ladderStem 同构，spec 不同块数不同的
+  导出互不覆盖）。
+
+## 导出实测（2026-09-15 04:39，复用运行中栈 + jovian 段 bcos-testing 一轮）
+
+- 链：6721 块（l2_time=1789376018，激活块 625/938/1250/1875/2500/3125/3750/4375，
+  与 rollup 公式逐一吻合）；交易 6744 deposit + 105 eip1559（bcos-testing jovian 轮，
+  块 6474–6612，included 92 / reverted 13）；`txsource` settle OK。
+- 文件 `devnet_6721_57bd1bcb.json` 67,471,802 B（boundary 采样 92 块 postState）；
+  结构自检与 ladder_1000_69292b10.json 逐键对照：顶层形状/每 block 键集
+  （pre 仅 block0）/env 8 字段/header 键集按 fork（regolith 无 withdrawals、canyon+、
+  ecotone+ 加 blobGasUsed、isthmus+ 加 requestsHash）/receipts `_op_*` 家族按 fork
+  与类型/postState 的 GenesisAlloc 形状（balance 恒有、nonce/code/storage zero 省略）
+  ——**全部为 ladder 键集家族的子集或同集，无越界键**；devnet 独有仅
+  「deposit 回执带 logs」与 delta 头部（=canyon 形状），均为契约内合法存在性。
+
+## FISCO 试重放结果（临时注册 → OpT8nReplay/Vectors → 已还原）
+
+既有语料（165 向量含 ladder）**全绿**（0 条非 devnet 失败行）；devnet 向量
+6721 块中 1254 块分歧、14988 行，全部归三族：
+
+1. **全部 pre-Ecotone 段（idx 0..1250，1251 块）**：`gasUsed`/`receiptsRoot`/
+   `stateRoot` + `receipts[0].gasUsed/.cumulativeGasUsed` + 采样块上
+   `postState.0x…0015.storage.0x0/0x1/0x2/0x3/0x4`。逐条原样：块 0
+   `gasUsed want=0x230f0 got=0x6cf5`；块 1 `want=0xcd14 got=0x6cf5`；块 1000
+   `want=0xb740 got=0x6d01`；ecotone 前一块 1249 `want=0x16c4d6 got=0x167c99`。
+   got 侧恒为本征+calldata 的近平常数（~0x6cf5/0x6d01），want 随 L1 价波动
+   63k–1.49M → FISCO 的 pre-Ecotone 系统存款 L1 data fee 计价为 0/错位，且
+   L1Block 槽 0/1/2/3/4 未写入（want=真实 L1 值，got=0x0）。与 P2 Task 4 §7.7
+   的 l1Cost 槽错位发现同根（SendTx 路径 panic、重放路径计 0）。
+2. **Ecotone 激活块（idx 1250）**：`postState.0x…0015.storage.0x6 want=
+   0x1000…00c3c9d00000558 got=0x0`——真实链在激活块写入 Ecotone scalar blob，
+   FISCO 重放未写（后续 ecotone 块正常，说明仅激活块分支分歧）；同块
+   `gasUsed want=0xf8cb got=0x27287`（方向反转：FISCO 计价反超真实）。
+3. **fjord/isthmus/jovian 激活块（idx 1874/3749/4374）**：升级存款小额 gas 差
+   （isthmus `receipts[2].gasUsed want=0x7580 got=0x7579`；fjord 块
+   `gasUsed want=0x168068 got=0x168061`）；升级部署 tx 的
+   `receipts[i].output` 不符（want=callTracer 取回的真实部署返回码）；isthmus/
+   jovian 激活块 `withdrawalsRoot want=0x8ed4baae… got=0x56e81f17…(空树根)`
+   ——prague 激活块的真实 withdrawalsRoot 非空树根，与 ecotone/fjord 激活块
+   （空根命中）行为不一致，属待裁决点；`stateRoot` 随之分歧。
+
+分歧即本管线价值：1/2 族指向 FISCO pre-Ecotone L1-cost/L1Block 写入路径，
+3 族指向激活块升级 tx 的执行细节，均为正式 DIVERGENCES 判定的输入（本任务
+不豁免、不裁决）。
