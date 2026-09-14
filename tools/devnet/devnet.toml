@@ -1,0 +1,116 @@
+# devnet.toml —— opdevnet.sh 的唯一配置输入，描述整条 devnet 链
+#
+# 所有数值均来自 Task 1（P1-1）实测定案，见同目录 README.md：
+#   - fork 时间基准 = apply 时刻 L1 起始块时间戳（rollup.json genesis.l2_time），非 L1 genesis
+#   - delta 必须显式给出且严格介于 canyon 与 ecotone 之间（缺省=0 / 与 canyon 相等都会被
+#     op-deployer 校验拒绝：fork delta set to 0 / cannot activate at the same post-Genesis block）
+#   - batcher --rpc.port 默认 8545 与 anvil 撞，改 8548
+#   - L1 chain-id 31337 不在 op-node 已知注册表，需 --rollup.l1-chain-config（含 blobSchedule）
+#
+# 格式约定（供 opdevnet.sh 的 awk 解析器）：
+#   每行 `key = value`，value 为整数或双引号字符串；注释独占一行；不要行内注释。
+
+[meta]
+name       = "d3-devnet"
+runtime_dir = "/tmp/opdevnet"   # 运行时根：artifacts/（产物，down 保留） logs/（日志，down 保留） run/（pid、jwt、intent 等） l2/（geth datadir，down 清除）
+# op-deployer 的 CREATE2 盐（实测：init 写 0x0，apply 见零盐会随机生成并持久化，导致每次 up 的
+# 代理地址（L1CrossDomainMessengerProxy 等）与 L2 genesis hash 全部漂移）。固定它 = 幂等。
+# 值 = sha256("d3-devnet-901")，无特殊含义，仅须恒定。
+create2_salt = "0x3f43ef0b2a0fef5b593d1d7fed146e1e5163cfc08454c9681cc5b488518cfb60"
+
+[l1]
+chain_id           = 31337
+# 固定 anvil genesis 时间戳（绝对值，不是相对 now 的偏移）—— 幂等的关键：
+# 产物 fork 绝对时间 = (该时间戳 + 2*pin_block) + 各阶梯偏移，
+# 不固定则两次 up 的 fork 绝对时间随墙钟漂移，genesis hash 无法一致。
+# 取值 = Task 1 第 3 次 run 的 anvil genesis（2026-09-14 08:52:46 UTC），
+# 对应实测 l2_time = 1789376018 = 1789375966 + 2*26。
+genesis_timestamp  = 1789375966
+block_time         = 2
+# apply 前把 L1 头手动矿到该块号并停住（确定性锚点）：op-deployer 在 apply 入口读 L1 头
+# 作为「L1 起始块」，其时间戳即 rollup genesis.l2_time。固定它 = 固定 l2_time = 固定产物。
+pin_block          = 26
+private_key         = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"  # anvil acct#0，deployer apply 用
+batcher_private_key = "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d"  # anvil acct#1，与 intent batcher 地址一致
+
+[l1.ports]
+rpc = 8545
+
+[l2]
+chain_id                  = 901
+gas_limit                 = 60000000
+eip1559_denominator       = 8
+eip1559_denominator_canyon = 250
+eip1559_elasticity        = 6
+min_base_fee              = 0
+da_footprint_gas_scalar   = 0
+operator_fee_scalar       = 0
+operator_fee_constant     = 0
+jwt = "bdcc784e830904d283b6c9385cbffce50ac85e2299a9a4066255fd3a303ba2c5"  # geth authrpc / op-node --l2 共用（Task 1 同值）
+
+[l2.ports]
+http        = 9545   # geth 普通 HTTP（eth 命名空间，RPC/批查询）
+authrpc     = 8551   # geth engine 命名空间（op-node --l2 必须指这里，指 9545 会刷 engine_forkchoiceUpdatedV3 does not exist）
+ws          = 8552   # geth WebSocket
+opnode_rpc  = 9546   # op-node RPC（rollup/optimism 命名空间）
+batcher_rpc = 8548   # batcher RPC；默认 8545 与 anvil 撞（Task 1 实测），固定改 8548
+
+# fork 阶梯偏移（秒，相对 rollup genesis.l2_time）。全部 8 档必须严格递增。
+# delta = 1875 是 Task 1 实测的唯一可行档位：缺省被拒（=0）、等于 canyon 1250 也被拒。
+[forks]
+canyon   = 1250
+delta    = 1875
+ecotone  = 2500
+fjord    = 3750
+granite  = 5000
+holocene = 6250
+isthmus  = 7500
+jovian   = 8750
+
+[accel]
+# 加速机制（Task 1 实测定案）：op-node sequencer 以墙钟为节拍、只把 L1 头时间当地板，
+# 单纯 RPC 跳 L1 时钟不能加速 L2。有效组合 = L1 genesis 放在过去 + apply 后把 L1 头时间
+# 跳过最后一条边界 + L2 启动后 sequencer 以机器速度（~115 blk/s）从 genesis 追赶墙钟，
+# 途中真实穿越全部 fork 边界，总耗时 ~40s。
+jump_interval_s    = 1000    # 跳时钟阶段每块的时间增量
+activation_margin_s = 600    # L1 头须越过最后边界的余量（>= max_sequencer_drift）
+target_l2_blocks   = 4450    # 最后激活块 = 8750/2 = 4375，+75 余量后开始做激活块计数检查
+catchup_timeout_s  = 900     # 等待 L2 追到 target_l2_blocks 的超时
+
+[batcher]
+max_channel_duration = 2
+da_type              = "calldata"
+
+# op-deployer intent.toml 的角色/recipient（全部非零 —— validateCustomConfig 走 CheckNoZeroAddresses）。
+# 值 = anvil 默认账户 #0..#9（Task 1 intent.toml 原值）。
+[superchain_roles]
+superchain_proxy_admin_owner = "0x23618e81E3f5cdF7f54C3d65f7FBc0aBf5B21E8f"
+superchain_guardian          = "0xa0Ee7A142d267C1f36714E4a8F75612F20a79720"
+protocol_versions_owner      = "0x23618e81E3f5cdF7f54C3d65f7FBc0aBf5B21E8f"
+challenger                   = "0x90F79bf6EB2c4f870365E785982E1f101E93b906"
+
+[chain_roles]
+l1_proxy_admin_owner = "0x15d34AAf54267DB7D7c367839AAf71A00a2C6A65"
+l2_proxy_admin_owner = "0x9965507D1a55bcC2695C58ba16FB37d819B0A4dc"
+system_config_owner  = "0x976EA74026E726554dB657fA54763abd0C3a0aa9"
+unsafe_block_signer  = "0x14dC79964da2C08b23698B3D3cc7Ca32193d9955"
+batcher              = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8"
+proposer             = "0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC"
+challenger           = "0x90F79bf6EB2c4f870365E785982E1f101E93b906"
+
+[recipients]
+base_fee_vault       = "0x9965507D1a55bcC2695C58ba16FB37d819B0A4dc"
+l1_fee_vault         = "0x976EA74026E726554dB657fA54763abd0C3a0aa9"
+sequencer_fee_vault  = "0x14dC79964da2C08b23698B3D3cc7Ca32193d9955"
+operator_fee_vault   = "0x23618e81E3f5cdF7f54C3d65f7FBc0aBf5B21E8f"
+chain_fees           = "0xa0Ee7A142d267C1f36714E4a8F75612F20a79720"
+
+[paths]
+# 二进制路径默认从 versions.lock 的 path= 字段解析；此处留空则不覆盖
+anvil       = ""
+geth        = ""
+op_node     = ""
+op_batcher  = ""
+op_deployer = ""
+versions_lock    = "/Users/octopus/.cache/fisco-t8n-corpus/tools/devnet/versions.lock"
+contracts_bedrock = "/Users/octopus/octo/code/optimism-d3-precheck/packages/contracts-bedrock"

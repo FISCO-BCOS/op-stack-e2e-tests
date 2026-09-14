@@ -115,6 +115,72 @@ op-batcher --l1-eth-rpc http://127.0.0.1:8545 --l2-eth-rpc http://127.0.0.1:9545
 3. 两份文件在 `geth init` 之前定稿即可 —— geth/op-node 均在启动时读取，链上无其他东西校验产物来源；本次实验虽由 deployer 生成，但机制上与手改等价（时间数值一致即等价）。
 4. 若想省事：把 jovian 之后还想再穿的 fork（如 interop）留空即可（nil=禁用）；或者把全部边界放进过去 9000s 窗口 + L1 跳时钟，40 秒内穿完（见加速机制）。
 
+---
+
+# 配置驱动的 devnet 启动器 `opdevnet`（P1-2）
+
+状态：**已完成（2026-09-14）**。Task 1 的实测流程固化为 `opdevnet.sh up|status|down|clean`，
+全部参数来自 `devnet.toml` + `versions.lock`。验收：up 一条命令起全栈并自动穿越 8 个 fork 边界；
+激活块计数 0/0/**6/3**/0/0/**8/5** 全命中；`down` 后重复 `up` 的 L2 genesis hash **完全一致**（幂等）；
+`down` 后无残留进程/端口。
+
+## 文件
+
+- `devnet.toml` —— 唯一配置输入：fork 阶梯偏移（含 Delta 显式 1875）、链参数（chainId 901 /
+  gasLimit / denominator/elasticity / minBaseFee / DA scalar）、加速参数、端口（anvil 8545 /
+  geth 9545+8551+8552 / op-node 9546 / batcher 8548）、角色、固定 L1 genesis 时间戳与
+  create2Salt、contracts-bedrock 路径。
+- `versions.lock` —— 二进制路径（`path=` 字段）与 sha256 记录；脚本从 `path=` 解析二进制。
+- `opdevnet.sh` —— up/status/down/clean。产物 `artifacts/`（genesis.json / rollup.json /
+  l1-chain-config.json）与 `logs/` 在 down 后保留供导出；`clean` 才删运行时目录。
+- `check_activations.py` —— 独立激活块检查：`--rollup artifacts/rollup.json --rpc
+  http://127.0.0.1:9545`，逐 fork 找激活块、数 type-0x7E 升级交易并对照 attributes.go 预期
+  （Ecotone 6 / Fjord 3 / Isthmus 8 / Jovian 5，其余 0），父块 ts 断言，退出码 0/1/2。
+
+## 与 Task 1 流程的显式差异（全部为幂等服务，稳态行为等价）
+
+1. **L1 genesis 时间戳固定为绝对值**（toml `l1.genesis_timestamp = 1789375966`，Task 1 第 3 次
+   run 的值）。fork 绝对时间 = 该锚 + 阶梯偏移，不固定则两次 up 产物漂移。
+2. **anvil 以 `--no-mining` 启动 + 手动矿**（Task 1 用 `--block-time 2`）。实测：
+   - `evm_mine` **不读** `anvil_setBlockTimestampInterval`（那只作用于间隔矿 tick）；
+   - `evm_setNextBlockTimestamp(T)` + `evm_mine` → 块 ts **精确 = T**（T 必须 > 父块 ts）；
+   - 未再设置时下一块沿用上次值（不跳回墙钟）；
+   - `evm_setIntervalMining 2` 可从无矿状态启用，tick 块 ts 恒 = parent+2（与 --block-time 等价）。
+   流程：逐块精确矿到 `pin_block=26` 停住 → apply 期间代矿（parent+2）→ 跳时钟逐块 +1000 →
+   `evm_setIntervalMining 2` 恢复稳态。
+3. **apply 后产物归一化**（README 上节「post-edit 路径」的工具化）：deployer 的
+   `set-start-block strategy=live` 在部署完成后才读 L1 头（apply 日志 stage 实证），起始块随代矿
+   节奏漂移。脚本把 rollup/genesis 的 fork 时间整体平移到锚点
+   `l2_time = 1789375966 + 2*26 = 1789376018`，同时：
+   - **geth genesis 头部 `timestamp` 必须一并平移**（漏掉则整条 L2 阶梯相对 rollup 偏移，
+     激活块全部错位——run7 实测）；
+   - `rollup.genesis.l1` 重指到 pin_block（其 ts 恰 = 新 l2_time，保持推导起点构造一致）；
+   - 归一化改变 genesis 内容 → genesis 块 hash 变化，rollup 的 `genesis.l2.hash` 由 **geth 链上
+     block 0 回填**（不重新实现 RLP；不回填则 op-node 报 expected L2 genesis hash to match——run8 实测）。
+4. **CREATE2 盐固定**（幂等头号杀手，run9/10/11 三跑三异后定位）：op-deployer `init` 把
+   state.json 的 `create2Salt` 写成 0x0，`apply` 见零盐**随机生成**并持久化 →
+   L1CrossDomainMessengerProxy 等 3 处 storage 引用的代理地址每次不同 → genesis hash 漂移。
+   脚本在 init 后、apply 前把盐改写为 toml 固定值（sha256("d3-devnet-901")）。
+
+## 实测记录（opdevnet 版本）
+
+- up 全程 ~90s（apply ~25s + L2 机器速度追赶 ~30s + 检查）；激活块计数与 Task 1 表格逐格一致：
+  canyon 625 块 0 笔 / delta 938 块 0 笔 / ecotone 1250 块 **6** 笔 / fjord 1875 块 **3** 笔 /
+  granite 2500 块 0 笔 / holocene 3125 块 0 笔 / isthmus 3750 块 **8** 笔 / jovian 4375 块 **5** 笔。
+- 幂等：`down` → `up` 两次，L2 genesis hash 均为 `0x43e8fa885515167608aba63bf5ee378ffe212b87acb5e862635585e679c4add7`，
+  脚本输出 `IDEMPOTENT`。
+- status：组件 pid/端口 + L2 unsafe 块高与 fork 段 + safe/unsafe 差；safe 以派生速度追赶 unsafe
+  （batcher 生效，与 Task 1 行为一致）。
+- 其他踩坑追加（全部已修并留断言）：
+  - RPC 数值参数必须传 JSON 字符串 `"0x1a"`；裸 `0x1a` 不是合法 JSON，anvil 回 Invalid Request。
+  - op-node RPC 没有 `eth_chainId`，探活用 `optimism_syncStatus`；该构建返回 snake_case 字段
+    （`safe_l2`/`unsafe_l2`）。
+  - bash `rpc()` 类 helper 传参遗漏会静默变成空 params（run5 教训：`evm_setIntervalMining []`）；
+  - bash 后台启动勿写 `( cd X && nohup cmd ... & echo $! )`：`&&` 列表会被整体后台化，`$!` 记到
+    外壳 subshell 的 pid，down 杀壳不杀真进程（孤儿实测）；须换行分隔语句；
+  - 日志串里 `$var` 后紧跟全角字符（如 `$stuck（`）会被 bash 并进变量名，`set -u` 下报
+    unbound variable 直接崩（down 的 WARN 分支首次执行时踩中）；`${var}` 花括号可解。
+
 ## 产物与日志
 
 - 产物：`/tmp/d3-run/artifacts/{genesis.json,rollup.json,l1-chain-config.json}`；intent：`/tmp/d3-deployer/intent.toml`；state：`/tmp/d3-deployer/state.json`
