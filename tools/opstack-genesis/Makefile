@@ -2,7 +2,9 @@
 # Merge the FISCO predeploy overlay onto op-deployer terminal allocs and emit
 # the L2 genesis [alloc.N] INI fragment.
 
-# Path to the contracts package (relative to this dir by default).
+# Path to the contracts package. The Solidity suite lives in the FISCO-BCOS
+# checkout (bcos-l2-contracts/), so pass CONTRACTS=<FISCO-BCOS>/bcos-l2-contracts;
+# the relative default only fits a checkout laid out as siblings.
 CONTRACTS ?= ../../bcos-l2-contracts
 # op-deployer terminal alloc JSON — the REQUIRED base. Every OP account
 # (0x42... proxies, 0xc0d3... implementations, ProxyAdmin ownership,

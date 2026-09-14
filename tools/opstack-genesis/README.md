@@ -28,9 +28,15 @@ at `verify_base_provenance`.
 
 ## Usage
 
+The self-written contracts and their forge artifacts live in the FISCO-BCOS
+checkout (`bcos-l2-contracts/`), so point CONTRACTS at it — the Makefile's
+relative default only fits a checkout laid out as siblings.
+
 ```bash
+FISCO_REPO=/path/to/FISCO-BCOS
+
 # 1. build the self-written contracts (SystemConfig / L2ValidatorSet)
-make contracts CONTRACTS=../../bcos-l2-contracts
+make contracts CONTRACTS="$FISCO_REPO/bcos-l2-contracts"
 
 # 2. copy the template and adjust the checklist/overlay for your chain
 cp chain-config.template.yaml chain-config.yaml
@@ -38,7 +44,7 @@ cp chain-config.template.yaml chain-config.yaml
 # 3. emit allocs.ini (and optionally the geth-style alloc JSON that feeds the
 #    op-reth oracle so both chains share one account set)
 python3 build-allocs.py --config chain-config.yaml \
-    --contracts ../../bcos-l2-contracts \
+    --contracts "$FISCO_REPO/bcos-l2-contracts" \
     --base-allocs /path/to/op-deployer-l2genesis.json \
     --out allocs.ini --out-json allocs.json
 ```
