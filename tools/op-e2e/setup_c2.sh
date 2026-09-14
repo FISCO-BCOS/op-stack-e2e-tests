@@ -339,6 +339,9 @@ $(cat "$C2/eth_genesis_header.ini")
     enable=true
     listen_ip=127.0.0.1
     listen_port=$FISCO_WEB3
+    ; op-batcher's DA-throttle handshake (miner_setMaxDASize) is opt-in; the devnet's L2
+    ; listener is bound to loopback, which is the only place it should be enabled.
+    enable_miner_api=true
 [op_engine_rpc]
     enable=true
     listen_ip=127.0.0.1
