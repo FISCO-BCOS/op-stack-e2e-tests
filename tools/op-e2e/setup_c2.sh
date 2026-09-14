@@ -26,7 +26,7 @@
 #   - rollup.json 的 L1 genesis 必须 = anvil block 0 哈希(非部署块)
 #   - rollup.json 的 L2 genesis 必须 = FISCO 实际创世哈希(非 op-deployer 计算值)
 #   - eth_genesis_header.timestamp 用秒(L1 时间戳;C++ 侧 ×1000 存内部毫秒)
-#   - [features] feature_op_jovian=true(否则 9B extraData,op-node 拒绝)
+#   - [op_fork_timestamps] jovian_time=0(Jovian 自创世激活;否则 9B extraData,op-node 拒绝)
 #   - op-node: --l1.beacon.ignore + --rollup.l1-chain-config(anvil 需 cancunTime)
 set -euo pipefail
 
@@ -302,8 +302,6 @@ if step_run 4; then
     sm_crypto=false
     chain_id=$L2_CHAIN
     group_id=1
-    isthmus_time=0
-    jovian_time=0
 [consensus]
     consensus_type=pbft
     block_tx_count_limit=1000
@@ -321,12 +319,14 @@ if step_run 4; then
     is_auth_check=false
     is_serial_execute=true
     version=3
-    evm_revision=prague
-    evm_revision_forks=0:prague
     auth_admin_account=$AUTH_ADMIN
+; OP lane: Isthmus is the baseline and needs no entry; Jovian active from genesis. The EVM
+; revision is derived from this schedule (Isthmus/Jovian = Prague), so executor.evm_revision
+; must not be set on this lane.
+[op_fork_timestamps]
+    jovian_time=0
 [features]
     feature_l2_ethereum_compat=true
-    feature_op_jovian=true
 $(cat "$C2/eth_genesis_header.ini")
 [web3]
     chain_id=$L2_CHAIN

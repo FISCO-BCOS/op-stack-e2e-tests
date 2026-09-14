@@ -90,8 +90,8 @@ def calc_op_base_fee(parent, parent_is_jovian, parent_is_isthmus):
     min_base_fee = None
     extra = parent.get("extraData", "0x")[2:]  # strip 0x
     # Isthmus = 9B (0x00 ver || u32 denom || u32 elas); Jovian = 17B (+ u64 minBaseFee).
-    # The B3 fixture runs Isthmus-shaped extraData (feature_op_jovian off), so guard by
-    # length instead of assuming the Jovian layout.
+    # The B3 fixture runs Isthmus-shaped extraData (Jovian scheduled far in the future), so
+    # guard by length instead of assuming the Jovian layout.
     if parent_is_isthmus and len(extra) >= 18:
         denominator = int(extra[2:10], 16)   # bytes 1-4
         elasticity = int(extra[10:18], 16)   # bytes 5-8

@@ -17,7 +17,8 @@
 # 关键配置事实(踩坑后固化,见 memory op-e2e-node-rebuilt-config-blueprint):
 #   - 单一合并 config.genesis 同时当 -c 和 -g(restart_b3.sh / start.sh 都是
 #     `-c config.genesis -g config.genesis`)
-#   - [executor] version=3(不是 executor_version)+ evm_revision_forks=0:prague
+#   - [executor] version=3(不是 executor_version);OP 车道禁止 executor.evm_revision,revision
+#     由 [op_fork_timestamps] 推导
 #   - [rpc] listen_port(不是 rpc_listen_port)
 #   - [web3] chain_id 决定 eth_chainId;套件签名用 CHAIN_ID=11155111
 #   - without_tars_framework=true 需要 conf/tars_proxy.ini 存在
@@ -54,8 +55,10 @@ SIGN_SECP_SRC="$ROOT/tools/op-e2e/sign_secp.c"                 # sign_secp 源�
 # OP 链参数 —— 套件签名固定用 11155111,group 名决定存储路径 data/<group>
 CHAIN_ID="${CHAIN_ID:-11155111}"
 GROUP_ID="${GROUP_ID:-group}"
-ISTHMUS_TIME="${ISTHMUS_TIME:-1000}"
-JOVIAN_TIME="${JOVIAN_TIME:-2000}"
+# B3 夹具迁移前即 feature_op_jovian off(见 state_verify.py 的 Isthmus 形状注释),即只跑 Isthmus。
+# 新模型下 Isthmus 是该车道基线、Jovian/Karst 都是它的超集,所以"仅 Isthmus"只能由"Jovian 排在
+# 远未来"表达,不能用 UINT64_MAX(空/未知条目会被 config 装载拒绝)。
+JOVIAN_TIME="${JOVIAN_TIME:-4102444800}"                     # 2100-01-01,实操上不可达 = 未调度
 # 预资助账户(chain_driver/b3_contracts 的 SENDER)
 SENDER="${SENDER:-0x6afa9580383E6627dA926B6f6ed9Ab2B9c8cC693}"
 SENDER_BAL="${SENDER_BAL:-1000000000000000000000000}"          # 10^24 wei
@@ -235,8 +238,6 @@ if step_run 5; then
     sm_crypto=false
     chain_id=$CHAIN_ID
     group_id=$GROUP_ID
-    isthmus_time=$ISTHMUS_TIME
-    jovian_time=$JOVIAN_TIME
 [consensus]
     consensus_type=pbft
     block_tx_count_limit=1000
@@ -254,9 +255,11 @@ if step_run 5; then
     is_auth_check=false
     is_serial_execute=true
     version=3
-    evm_revision=prague
-    evm_revision_forks=0:prague
     auth_admin_account=$AUTH_ADMIN
+; OP 车道:Isthmus 为基线无需配置项,EVMC revision 由调度推导(Isthmus/Jovian = Prague),
+; 因此该车道禁止设置 executor.evm_revision / evm_revision_forks。
+[op_fork_timestamps]
+    jovian_time=$JOVIAN_TIME
 [features]
     feature_l2_ethereum_compat=true
 $(cat "$ETH_HEADER")
