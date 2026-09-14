@@ -239,6 +239,20 @@ func generateLadderChain(spec ladderSpec, n int) (*chainOutput, error) {
 	genesisPre[ladderStorageProbeAddr] = types.Account{Balance: big.NewInt(0), Nonce: 1, Code: ladderStorageChurnCode()}
 	genesisPre[ladderRevertProbeAddr] = types.Account{Balance: big.NewInt(0), Nonce: 1, Code: ladderRevertReasonCode()}
 	genesisPre[ladderInvalidProbeAddr] = types.Account{Balance: big.NewInt(0), Nonce: 1, Code: ladderInvalidOpcodeCode()}
+	// P2-C fork-sensitivity predeploys: one cross-tx SELFDESTRUCT probe per
+	// fork segment (1 ETH each, destruct-to-recA runtime), the EIP-150 63/64
+	// gas-boundary caller (all-gas CALL into the INVALID predeploy), and the
+	// fork-gated opcode probe (PUSH0/MCOPY/BLOBHASH arms; dispatch is
+	// London-safe). See ladder_forksens.go for the shapes and the fork
+	// semantics each probe captures.
+	for k := 0; k < ladderSelfdestructProbeCount; k++ {
+		genesisPre[ladderSelfdestructProbeAddr(k)] = types.Account{
+			Balance: big.NewInt(1_000_000_000_000_000_000), Nonce: 1, Code: ladderSelfdestructCode(recA)}
+	}
+	genesisPre[ladderGasBoundaryCallerAddr] = types.Account{
+		Balance: big.NewInt(0), Nonce: 1, Code: ladderGasBoundaryCallerCode(ladderInvalidProbeAddr)}
+	genesisPre[ladderOpcodeProbeAddr] = types.Account{
+		Balance: big.NewInt(0), Nonce: 1, Code: ladderOpcodeProbeCode()}
 
 	// Fork-activation block timestamps (from the EFFECTIVE activations map, so a
 	// skipped fork coupled to the next activation is covered too). Used to keep
@@ -326,6 +340,9 @@ func generateLadderChain(spec ladderSpec, n int) (*chainOutput, error) {
 	// completeness check).
 	delegationStarted := false
 	delegationNonce := uint64(0)
+	// P2-C: which cross-tx SELFDESTRUCT probe the current segment uses (one
+	// per segment, in order).
+	selfdestructProbeSeq := 0
 	if err := func() (err error) {
 		defer func() {
 			if r := recover(); r != nil {
@@ -370,6 +387,15 @@ func generateLadderChain(spec ladderSpec, n int) (*chainOutput, error) {
 			// pre chain between the every-25-blocks probes. See
 			// ladderContractProbeAddrs for the failure mode this avoids.
 			in.ExtraCandidates = append(in.ExtraCandidates, ladderContractProbeAddrs...)
+			// P2-C predeploys join the every-block candidate set for the same
+			// reason: their code (and the 1-ETH balances of the cross-tx
+			// SELFDESTRUCT probes) must survive the per-block pre chain.
+			// Pre-Ecotone segments DELETED their probe in-chain; the candidate
+			// row then turns into the explicit all-zero {"balance":"0x0"} shape
+			// emitPostState derives from statedb defaults (and the FISCO-side
+			// compare treats absent == all-zero), making the deletion visible
+			// per block instead of silently dropping the account.
+			in.ExtraCandidates = append(in.ExtraCandidates, ladderForkSensitivityProbeAddrs()...)
 			var txs []*types.Transaction
 			var outTxs []json.RawMessage
 			// add builds + injects one tx, keeping ins[i].Transactions in EXACT
@@ -466,12 +492,17 @@ func generateLadderChain(spec ladderSpec, n int) (*chainOutput, error) {
 			// probe blocks. On the first 7702 delegation the authority account
 			// starts existing in the trie: flip the candidate bookkeeping so
 			// every later block declares it.
+			// P2-C fork-sensitivity probes (SELFDESTRUCT both shapes, 63/64
+			// gas boundary, fork-gated opcodes) append after the tx-type ones.
 			if _, ok := createCallBlocks[i]; ok {
 				if injectLadderTxTypeProbes(add, func() uint64 { return bg.TxNonce(senderAddr) },
 					cfg, blockTime, delegationNonce) {
 					delegationStarted = true
 					delegationNonce++
 				}
+				injectLadderForkSensitivityProbes(add,
+					func() uint64 { return bg.TxNonce(senderAddr) }, in, selfdestructProbeSeq)
+				selfdestructProbeSeq++
 			}
 			if delegationStarted {
 				in.ExtraCandidates = append(in.ExtraCandidates, ladderDelegateAuthority)

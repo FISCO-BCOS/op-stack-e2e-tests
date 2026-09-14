@@ -128,6 +128,7 @@ func TestLadderTxTypeProbesInjected(t *testing.T) {
 	auth := addrOfKey(4)
 	wantDesignator := append([]byte{0xef, 0x01, 0x00}, ladderLogsProbeAddr.Bytes()...)
 	delegations := 0
+	var st outputSignedTx
 	for _, b := range blocks {
 		blk := out.Blocks[b]
 		rs := ladderProbeReceipts(t, blk)
@@ -209,9 +210,25 @@ func TestLadderTxTypeProbesInjected(t *testing.T) {
 	}
 
 	// Auth nonce chaining: the 2nd delegation's authorization nonce must be 1.
-	sc := outputSetCodeTx{}
-	if err := json.Unmarshal(out.Blocks[92].Block.Transactions[len(out.Blocks[92].Block.Transactions)-2], &sc); err != nil {
-		t.Fatal(err)
+	// (Locate the setcode tx by its _op_type: the P2-C probes append more txs
+	// after it, so the index is not stable across stages.)
+	var sc outputSetCodeTx
+	foundSetcode := false
+	for _, raw := range out.Blocks[92].Block.Transactions {
+		if err := json.Unmarshal(raw, &st); err != nil {
+			t.Fatal(err)
+		}
+		if st.OpType != "setcode" {
+			continue
+		}
+		if err := json.Unmarshal(raw, &sc); err != nil {
+			t.Fatal(err)
+		}
+		foundSetcode = true
+		break
+	}
+	if !foundSetcode {
+		t.Fatal("block 92: setcode tx missing")
 	}
 	if len(sc.OpAuthorizationList) != 1 || uint64(sc.OpAuthorizationList[0].Nonce) != 1 {
 		t.Fatalf("2nd delegation auth nonce = %+v, want [nonce 1]", sc.OpAuthorizationList)
