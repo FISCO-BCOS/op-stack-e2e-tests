@@ -1,0 +1,6 @@
+# real-derivation pipeline binary locks（记录而非断言：op-node/op-batcher plain build 不内嵌 commit）
+geth        sha256=2a5f65ea2166b362c91cf2adf0703a199b21cdd0e9c263f507695f28d6a8ce32  src=/Users/octopus/octo/code/blockchain-impl/op-geth @ e8800cffe53d459cde8a07c8e8f1de9d86e79e07
+op-node     sha256=c1f9824403d43b897585241f9c4376bf765a34b036db114d19f1dd482d6a3401  src=/Users/octopus/octo/code/optimism-d3-precheck @ 76e4fad54244ec6bd07dad07e42c82a16ab5113a
+op-batcher  sha256=c7be5c73bb2fee3d5a1c0c1ae1d26a40af233f4ad82aee8f43925cf72c21a2b1  src=/Users/octopus/octo/code/optimism-d3-precheck @ 76e4fad54244ec6bd07dad07e42c82a16ab5113a
+anvil       version=1.7.1  path=/Users/octopus/.foundry/bin/anvil
+go          toolchain=1.24.0（GOTOOLCHAIN=auto）
