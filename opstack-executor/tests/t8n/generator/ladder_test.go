@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strings"
 	"testing"
 
@@ -21,6 +22,55 @@ import (
 
 const ladderFull8 = "0:regolith,125:canyon,250:ecotone,375:fjord,500:granite," +
 	"625:holocene,750:isthmus,875:jovian"
+
+// TestLadderSenderFundAnchors pins the ladderSenderFund table: the n<=500 floor
+// keeps the historical eth(1000) genesis pre-fund byte-for-byte compatible with
+// the existing small-ladder vectors, 501 is the first n where the linear 2n arm
+// takes over (1002, NOT 1000), and n=1000 -> 2000 is the registered ladder's
+// value (the original hard-coded eth(1000) ran ~0.19 ETH short at n=1000).
+func TestLadderSenderFundAnchors(t *testing.T) {
+	for _, n := range []int{2, 3, 4, 12, 100, 499, 500} {
+		if got := ladderSenderFund(n); got != 1000 {
+			t.Fatalf("ladderSenderFund(%d): want the historical floor 1000, got %d", n, got)
+		}
+	}
+	if got := ladderSenderFund(501); got != 1002 {
+		t.Fatalf("ladderSenderFund(501): want 1002 (first 2n value above the floor), got %d", got)
+	}
+	if got := ladderSenderFund(1000); got != 2000 {
+		t.Fatalf("ladderSenderFund(1000): want 2000 (the registered ladder), got %d", got)
+	}
+	if got := ladderSenderFund(5000); got != 10000 {
+		t.Fatalf("ladderSenderFund(5000): want 10000, got %d", got)
+	}
+}
+
+// TestLadderSenderFundDerivation asserts the derivation invariant the fund is
+// built on: fund >= n ETH (one 1-ETH transfer per block) + n * ladderBlockGasLimit
+// * 2 gwei (every block's gas spend is bounded by the block gas limit by
+// construction; 2 gwei is the ladder's base fee). 2n leaves ~2x headroom over
+// the 1.02n worst case for every n.
+func TestLadderSenderFundDerivation(t *testing.T) {
+	gwei := new(big.Int).SetUint64(2) // per-gas price ceiling: the 1559 probes set MaxFeePerGas = 2 gwei
+	perBlockGasCost := new(big.Int).Mul(big.NewInt(int64(ladderBlockGasLimit)), gwei)
+	for _, n := range []int64{2, 3, 4, 12, 100, 250, 500, 501, 625, 750, 875, 1000, 2000, 10_000} {
+		need := new(big.Int).Mul(big.NewInt(n), big.NewInt(1_000_000_000_000_000_000)) // n ETH
+		need.Add(need, new(big.Int).Mul(big.NewInt(n), perBlockGasCost))
+		fund := eth(ladderSenderFund(int(n)))
+		if fund.Cmp(need) < 0 {
+			t.Fatalf("fund invariant broken at n=%d: fund %s < need %s (n ETH + n*blockGasLimit*2gwei)",
+				n, fund, need)
+		}
+		// The ~2x headroom claim, precisely: on the linear arm (2n > 1000) the
+		// fund is exactly twice the per-block 1-ETH transfer need, and still
+		// covers the gas-inclusive need (2n >= 1.02n for every n).
+		if 2*n > 1000 {
+			if fund.Cmp(new(big.Int).Mul(big.NewInt(n), big.NewInt(2_000_000_000_000_000_000))) != 0 {
+				t.Fatalf("linear arm drift at n=%d: fund %s != 2n ETH", n, fund)
+			}
+		}
+	}
+}
 
 func TestParseLadderFlagFull8(t *testing.T) {
 	spec, err := parseLadderFlag(ladderFull8, 1000)
@@ -597,12 +647,72 @@ func TestLadderWithdrawalReceiptCarriesLogs(t *testing.T) {
 	}
 }
 
+// ladderStemFor builds the expected digest stem for a flag string (test helper:
+// parse + ladderStem, the same normalization the production path uses).
+func ladderStemFor(t *testing.T, ladder string, blocks int) string {
+	t.Helper()
+	spec, err := parseLadderFlag(ladder, blocks)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ladderStem(blocks, spec)
+}
+
+// TestLadderStemDigestNormalization pins the stem rule ladder_<blocks>_<digest8>:
+// the digest8 is the first 8 hex chars of the sha256 over the NORMALIZED spec
+// (parseLadderFlag's output joined as "<block>:<fork>" with lowercase forks), so
+// whitespace/case variants of the same spec collapse to one name while genuinely
+// different specs of the same length stay distinct.
+func TestLadderStemDigestNormalization(t *testing.T) {
+	canonical := ladderStemFor(t, ladderFull8, 1000)
+	// The registered ladder's stem, anchored to the literal digest8 of its
+	// normalized spec ("0:regolith,125:canyon,…,875:jovian").
+	if canonical != "ladder_1000_69292b10" {
+		t.Fatalf("registered ladder stem changed: want ladder_1000_69292b10, got %s", canonical)
+	}
+	// Normalization: extra whitespace and mixed-case fork names must not move
+	// the digest (parseLadderFlag already trims + lowercases).
+	for _, variant := range []string{
+		" 0:REGOLITH ,125:Canyon ,250:ECOTONE,375:Fjord,500:granite,625:Holocene,750:ISTHMUS,875:Jovian",
+		"0:regolith,125:canyon,250:ecotone,375:fjord,500:granite,625:holocene,750:isthmus,875:jovian",
+		"  0:regolith  ,  125:canyon,250:ecotone ,375:fjord,500:granite , 625:holocene ,750:isthmus, 875:jovian ",
+	} {
+		if got := ladderStemFor(t, variant, 1000); got != canonical {
+			t.Fatalf("spec %q normalized to stem %s, want %s", variant, got, canonical)
+		}
+	}
+	// Distinct specs at the SAME block count must produce distinct stems (the
+	// old ladder_<blocks> stem made them overwrite each other).
+	a := ladderStemFor(t, "0:regolith,2:canyon", 12)
+	b := ladderStemFor(t, "0:regolith,5:canyon", 12)
+	if a == b {
+		t.Fatalf("distinct specs share a stem %s (collision not fixed)", a)
+	}
+	// Stem shape: ladder_<blocks>_<8 lowercase hex chars>.
+	for _, stem := range []string{a, b} {
+		digest := strings.TrimPrefix(stem, "ladder_12_")
+		if digest == stem || len(digest) != 8 {
+			t.Fatalf("stem %s does not have the ladder_12_<8 hex> shape", stem)
+		}
+		for _, c := range digest {
+			if !strings.ContainsRune("0123456789abcdef", c) {
+				t.Fatalf("stem %s digest char %q is not lowercase hex", stem, c)
+			}
+		}
+	}
+	// Determinism: same spec parsed twice -> same stem.
+	if ladderStemFor(t, "0:regolith,5:canyon", 12) != b {
+		t.Fatal("ladderStem not deterministic")
+	}
+}
+
 func TestRunLadderModeWritesVectorAndSums(t *testing.T) {
 	dir := t.TempDir()
 	if err := runLadderMode(dir, "0:regolith,2:canyon", 4, "testcommit", "boundary"); err != nil {
 		t.Fatalf("runLadderMode: %v", err)
 	}
-	vec := filepath.Join(dir, "ladder_4.json")
+	stem := ladderStemFor(t, "0:regolith,2:canyon", 4)
+	vec := filepath.Join(dir, stem+".json")
 	if _, err := os.Stat(vec); err != nil {
 		t.Fatalf("vector missing: %v", err)
 	}
@@ -611,7 +721,7 @@ func TestRunLadderModeWritesVectorAndSums(t *testing.T) {
 		t.Fatalf("SHA256SUMS missing: %v", err)
 	}
 	data, _ := os.ReadFile(vec)
-	want := fmt.Sprintf("%x  ladder_4.json\n", sha256.Sum256(data))
+	want := fmt.Sprintf("%x  %s.json\n", sha256.Sum256(data), stem)
 	if string(sums) != want {
 		t.Fatalf("SHA256SUMS mismatch:\n got %q\nwant %q", sums, want)
 	}
@@ -624,6 +734,102 @@ func TestRunLadderModeWritesVectorAndSums(t *testing.T) {
 	}
 }
 
+// TestRunLadderModeSumsMultiStem pins the multi-line SHA256SUMS contract
+// (hardening 3): two different-spec ladders in one directory coexist (two
+// lines, sorted by stem), and regenerating one of them replaces ONLY its own
+// line -- the other stem's line is kept byte-for-byte. Unparsable lines are
+// preserved verbatim rather than silently dropped.
+func TestRunLadderModeSumsMultiStem(t *testing.T) {
+	dir := t.TempDir()
+	specA, specB := "0:regolith,2:canyon", "0:regolith,5:canyon"
+	stemA := ladderStemFor(t, specA, 12)
+	stemB := ladderStemFor(t, specB, 12)
+	if stemA == stemB {
+		t.Fatalf("test premise broken: distinct specs share stem %s", stemA)
+	}
+	if err := runLadderMode(dir, specA, 12, "testcommit", "boundary"); err != nil {
+		t.Fatalf("ladder A: %v", err)
+	}
+	if err := runLadderMode(dir, specB, 12, "testcommit", "boundary"); err != nil {
+		t.Fatalf("ladder B: %v", err)
+	}
+	// Both vectors exist on disk (the old single-line SUMS + ladder_<blocks>
+	// stem would have overwritten A with B).
+	for _, stem := range []string{stemA, stemB} {
+		if _, err := os.Stat(filepath.Join(dir, stem+".json")); err != nil {
+			t.Fatalf("vector %s.json missing: %v", stem, err)
+		}
+	}
+	sumsPath := filepath.Join(dir, "SHA256SUMS")
+	sumsBytes, err := os.ReadFile(sumsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sumsLines := nonEmptyLines(string(sumsBytes))
+	if len(sumsLines) != 2 {
+		t.Fatalf("want 2 SUMS lines, got %d: %q", len(sumsLines), sumsLines)
+	}
+	// Both stems present, exactly once each, in sorted-by-stem order.
+	sortedStems := []string{stemA, stemB}
+	sort.Strings(sortedStems)
+	lineFor := map[string]string{}
+	for i, stem := range sortedStems {
+		if !strings.HasSuffix(sumsLines[i], "  "+stem+".json") {
+			t.Fatalf("SUMS line %d is not %s.json in sorted order: %q", i, stem, sumsLines)
+		}
+		lineFor[stem] = sumsLines[i]
+	}
+
+	// Regenerate A: B's line must be byte-identical, still 2 lines.
+	if err := runLadderMode(dir, specA, 12, "testcommit", "boundary"); err != nil {
+		t.Fatalf("ladder A regen: %v", err)
+	}
+	sumsBytes, err = os.ReadFile(sumsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sumsLines = nonEmptyLines(string(sumsBytes))
+	if len(sumsLines) != 2 {
+		t.Fatalf("after regen: want 2 SUMS lines, got %d: %q", len(sumsLines), sumsLines)
+	}
+	if sumsLines[0] != lineFor[sortedStems[0]] || sumsLines[1] != lineFor[sortedStems[1]] {
+		t.Fatalf("regen changed the line order/set:\n got %q\nwant %q",
+			sumsLines, []string{lineFor[sortedStems[0]], lineFor[sortedStems[1]]})
+	}
+	// Determinism: regenerating A also reproduces A's own line exactly.
+	data, _ := os.ReadFile(filepath.Join(dir, stemA+".json"))
+	wantA := fmt.Sprintf("%x  %s.json", sha256.Sum256(data), stemA)
+	if lineFor[stemA] != wantA {
+		t.Fatalf("A's SUMS line drifted:\n got %q\nwant %q", lineFor[stemA], wantA)
+	}
+
+	// An unparsable line survives the next update verbatim (no silent drops).
+	corrupt := "this is not a sums line"
+	if err := os.WriteFile(sumsPath, []byte(corrupt+"\n"+sumsLines[0]+"\n"+sumsLines[1]+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := runLadderMode(dir, specA, 12, "testcommit", "boundary"); err != nil {
+		t.Fatalf("regen over corrupt SUMS: %v", err)
+	}
+	final, _ := os.ReadFile(sumsPath)
+	if !strings.Contains(string(final), corrupt+"\n") {
+		t.Fatalf("unparsable line was dropped, got %q", string(final))
+	}
+	if got := nonEmptyLines(string(final)); len(got) != 3 {
+		t.Fatalf("want corrupt line + 2 stems, got %q", got)
+	}
+}
+
+func nonEmptyLines(s string) []string {
+	var out []string
+	for _, l := range strings.Split(s, "\n") {
+		if l != "" {
+			out = append(out, l)
+		}
+	}
+	return out
+}
+
 // TestRunLadderModePostStateModes 验证 D1h 的 --poststate 导出粒度开关：
 //   - full：每块都带 postState，且不写 sampledBlocks（缺省 = 全量采样的旧契约）；
 //   - boundary：保持采样（sampledBlocks 键存在，未采样块无 postState）；
@@ -633,24 +839,25 @@ func TestRunLadderModePostStateModes(t *testing.T) {
 		Blocks        []map[string]json.RawMessage `json:"blocks"`
 		SampledBlocks *[]int                       `json:"sampledBlocks"`
 	}
+	// canyon@5（1-based 块号）=> 0-based 索引 4；总 12 块 => 采样集必为真子集。
+	const spec, blocks = "0:regolith,5:canyon", 12
 	load := func(t *testing.T, dir string) ladderDoc {
 		t.Helper()
-		data, err := os.ReadFile(filepath.Join(dir, "ladder_12.json"))
+		stem := ladderStemFor(t, spec, blocks)
+		data, err := os.ReadFile(filepath.Join(dir, stem+".json"))
 		if err != nil {
-			t.Fatalf("read ladder_12.json: %v", err)
+			t.Fatalf("read %s.json: %v", stem, err)
 		}
 		var top map[string]json.RawMessage
 		if err := json.Unmarshal(data, &top); err != nil {
 			t.Fatalf("unmarshal outer: %v", err)
 		}
 		var doc ladderDoc
-		if err := json.Unmarshal(top["ladder_12"], &doc); err != nil {
+		if err := json.Unmarshal(top[stem], &doc); err != nil {
 			t.Fatalf("unmarshal ladder doc: %v", err)
 		}
 		return doc
 	}
-	// canyon@5（1-based 块号）=> 0-based 索引 4；总 12 块 => 采样集必为真子集。
-	const spec, blocks = "0:regolith,5:canyon", 12
 
 	fullDir := t.TempDir()
 	if err := runLadderMode(fullDir, spec, blocks, "testcommit", "full"); err != nil {
@@ -731,9 +938,10 @@ func TestPostStateDefaultIsFull(t *testing.T) {
 	if err := runLadderMode(dir, spec, blocks, "testcommit", f.DefValue); err != nil {
 		t.Fatalf("runLadderMode with default %q: %v", f.DefValue, err)
 	}
-	data, err := os.ReadFile(filepath.Join(dir, "ladder_12.json"))
+	stem := ladderStemFor(t, spec, blocks)
+	data, err := os.ReadFile(filepath.Join(dir, stem+".json"))
 	if err != nil {
-		t.Fatalf("read ladder_12.json: %v", err)
+		t.Fatalf("read %s.json: %v", stem, err)
 	}
 	var top map[string]json.RawMessage
 	if err := json.Unmarshal(data, &top); err != nil {
@@ -743,7 +951,7 @@ func TestPostStateDefaultIsFull(t *testing.T) {
 		Blocks        []map[string]json.RawMessage `json:"blocks"`
 		SampledBlocks *[]int                       `json:"sampledBlocks"`
 	}
-	if err := json.Unmarshal(top["ladder_12"], &doc); err != nil {
+	if err := json.Unmarshal(top[stem], &doc); err != nil {
 		t.Fatalf("unmarshal ladder doc: %v", err)
 	}
 	if doc.SampledBlocks != nil {

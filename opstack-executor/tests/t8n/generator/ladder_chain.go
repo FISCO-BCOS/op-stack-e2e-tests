@@ -19,11 +19,8 @@ package main
 //     删除处注释）。fp.daScalar=400 仅在梯顶为 jovian 时设置（与 chainN 的
 //     jovian 臂一致，DA 足迹可观察）；后续 fork 的槽位（3/7/8）由各 fork 第一个
 //     真实 attributes 存款写入，assertL1BlockConsistencyAt 为这些过渡块保留窄
-//     豁免。message passer 携带真实部署 runtime（Task 3 提款要用，现在携带无害）；sender 预充值 max(1000, 2n)
-//     ETH（下限比 chainN 的 eth(100) 大，且线性覆盖每块一笔的 1 ETH transfer +
-//     gas：原硬编码 eth(1000) 在 --blocks=1000 时差最后一块 ~0.19 ETH 就 panic，
-//     实测 999 块 OK / 1000 块 insufficient funds；2n 对所有 n 都留有余量，
-//     小数点以下的 gas 最坏 ~8.5e-4 ETH/块）。
+//     豁免。message passer 携带真实部署 runtime（Task 3 提款要用，现在携带无害）；
+//     sender 预充值 ladderSenderFund(n) ETH（推导见该函数）。
 //
 // 每块配方 = L1-attributes deposit + recipeFor(fork, blockIdx, isForkActivation)
 // 的用户存款 / 提款 / CREATE / precompile 探针 + 一笔真链上 nonce 的 sender
@@ -33,11 +30,13 @@ package main
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"math/big"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -129,6 +128,28 @@ func init() {
 	}
 }
 
+// ladderBlockGasLimit 是 ladder 链的 genesis/每块 gas 上限（generateLadderChain
+// 的 gasLimit 常量提升到包级，供资金推导的测试引用：任何块的 tx gas 消耗都不可能
+// 超过它，因此它是一个由构造保证的每块 gas 支出上界）。
+const ladderBlockGasLimit = uint64(10_000_000)
+
+// ladderSenderFund 返回 ladder genesis 给 key-1 sender 预充值的整 ETH 数：
+// max(1000, 2n)。推导（不变量，由 TestLadderSenderFundDerivation 锚定）：
+//   - 每块至多一笔 1 ETH 的 sender transfer（recipeFor），n 块最多 n ETH；
+//   - 所有 tx 都从 key1 出，每块 gas 支出 ≤ ladderBlockGasLimit（块 gas 上限，
+//     由构造保证），最坏 10M gas × 2 gwei = 0.02 ETH/块；
+//   - 故需求 ≤ n×(1 + 0.02) = 1.02n ETH，fund = 2n 留有约 2× 余量；
+//   - 下限 1000 保持小 ladder 的历史金额不变（n≤500 时仍是 eth(1000)，与既有
+//     smoke/采样向量逐字节兼容）：历史背景是原硬编码 eth(1000) 在
+//     --blocks=1000 时差最后一块 ~0.19 ETH 就 panic（实测 999 块 OK / 1000 块
+//     insufficient funds），2n 即为修法。
+func ladderSenderFund(n int) int64 {
+	if f := int64(n) * 2; f > 1000 {
+		return f
+	}
+	return 1000
+}
+
 func generateLadderChain(spec ladderSpec, n int) (*chainOutput, error) {
 	if n < 2 {
 		return nil, fmt.Errorf("generateLadderChain: n must be >= 2 (got %d)", n)
@@ -215,22 +236,14 @@ func generateLadderChain(spec ladderSpec, n int) (*chainOutput, error) {
 	const (
 		denom      = uint64(50)
 		elasticity = uint64(6)
-		gasLimit   = uint64(10_000_000)
+		gasLimit   = ladderBlockGasLimit
 	)
 	beaconRoot := common.HexToHash("0x0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c")
 	senderAddr := addrOfKey(1)
-	// 每块至多一笔 1 ETH 的 sender transfer（recipeFor），n 块最多 n ETH；所有
-	// tx 都从 key1 出，gas 上界 ≈ 4.2e5 gas × 2 gwei ≈ 8.5e-4 ETH/块。故 2n
-	// 对任意 n 都有余量；下限 1000 保持小 ladder 的历史金额不变（n=3 仍是
-	// eth(1000)，既有 smoke/采样向量逐字节不变）。
-	senderFund := int64(n) * 2
-	if senderFund < 1000 {
-		senderFund = 1000
-	}
 	genesisPre := types.GenesisAlloc{
 		l1BlockAddr:       {Balance: big.NewInt(0), Nonce: 1, Code: l1BlockCodeForLadder(), Storage: fp.l1BlockGenesisSeeds(activatedForks)},
 		messagePasserAddr: {Balance: big.NewInt(0), Nonce: 1, Code: realMessagePasserCode},
-		senderAddr:        {Balance: eth(senderFund)},
+		senderAddr:        {Balance: eth(ladderSenderFund(n))},
 	}
 	// P2-A contract-layer probes: four deterministic predeploys (extended logs,
 	// storage churn, revert-with-reason, INVALID). Nonce 1 + code keeps each
@@ -604,6 +617,14 @@ func generateLadderChainSampled(spec ladderSpec, n int) (*chainOutput, error) {
 //     sampledBlocks（缺省 = 每块都采样，即旧向量契约；C++ 侧据此做全量比对）；
 //   - "boundary"（opt-in）：generateLadderChainSampled，只在采样点携带 postState
 //     并写出 sampledBlocks 键。
+//
+// stem 规则（加固 2）：ladder_<blocks>_<digest8>。digest8 = 对**规范化 spec**
+// （parseLadderFlag 的输出按 "<块号>:<fork名>" 以逗号连接，fork 名已小写化）的
+// sha256 前 8 个 hex 字符——单一真相在 Go 侧（regen.sh 只捕获 LADDER-STEM 行，
+// 绝不自己复算 digest），保证 " 0:REGOLITH ,125:Canyon " 与
+// "0:regolith,125:canyon" 落到同一文件名，两个不同 spec 的同块数 ladder 不再
+// 互相覆盖。产出的 stem 以 "LADDER-STEM <stem>" 行打到 stdout，供 regen.sh 做
+// manifest/判据 2 枚举。
 func runLadderMode(outDir, ladderFlag string, blocks int, opGethCommit, poststate string) error {
 	if outDir == "" {
 		return fmt.Errorf("--out-dir is required for --mode=ladder")
@@ -633,7 +654,8 @@ func runLadderMode(outDir, ladderFlag string, blocks int, opGethCommit, poststat
 	if err := os.MkdirAll(outDir, 0o755); err != nil {
 		return err
 	}
-	stem := fmt.Sprintf("ladder_%d", blocks)
+	stem := ladderStem(blocks, spec)
+	fmt.Printf("LADDER-STEM %s\n", stem)
 	if err := writeChainVector(outDir, stem, out, opGethCommit); err != nil {
 		return err
 	}
@@ -642,6 +664,63 @@ func runLadderMode(outDir, ladderFlag string, blocks int, opGethCommit, poststat
 		return err
 	}
 	sum := sha256.Sum256(data)
-	line := fmt.Sprintf("%x  %s.json\n", sum, stem)
-	return os.WriteFile(filepath.Join(outDir, "SHA256SUMS"), []byte(line), 0o644)
+	return updateLadderSHA256SUMS(filepath.Join(outDir, "SHA256SUMS"), stem, sum)
+}
+
+// ladderStem 从 parseLadderFlag 的规范化输出推导向量 stem：
+// ladder_<blocks>_<digest8>（digest 规则见 runLadderMode 注释）。
+func ladderStem(blocks int, spec ladderSpec) string {
+	parts := make([]string, len(spec.Activations))
+	for i, a := range spec.Activations {
+		parts[i] = fmt.Sprintf("%d:%s", a.Block, a.Fork)
+	}
+	digest := sha256.Sum256([]byte(strings.Join(parts, ",")))
+	return fmt.Sprintf("ladder_%d_%s", blocks, hex.EncodeToString(digest[:])[:8])
+}
+
+// updateLadderSHA256SUMS 维护 vectors/SHA256SUMS 的多行契约（加固 3）：读现有
+// 文件（缺席 = 首次生成，从空表开始），替换本 stem 的行、保留其他 stem 的行，
+// 按 stem 排序后整文件重写——多条 ladder 共存时互不覆盖，重生成其中一条不会
+// 丢掉另一条。无法解析的非空行（手滑损坏）保留原样并告警，不静默丢弃。
+func updateLadderSHA256SUMS(sumsPath, stem string, sum [32]byte) error {
+	entries := map[string]string{}
+	var preserved []string // unparsable lines kept verbatim, order preserved
+	if data, err := os.ReadFile(sumsPath); err == nil {
+		for _, line := range strings.Split(string(data), "\n") {
+			if line == "" {
+				continue
+			}
+			name, ok := parseSumsLine(line)
+			if !ok {
+				fmt.Fprintf(os.Stderr, "WARNING: %s: unparsable line kept verbatim: %q\n", sumsPath, line)
+				preserved = append(preserved, line)
+				continue
+			}
+			entries[name] = line
+		}
+	}
+	entries[stem+".json"] = fmt.Sprintf("%x  %s.json", sum, stem)
+	names := make([]string, 0, len(entries))
+	for name := range entries {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	lines := append(preserved, make([]string, 0, len(names))...)
+	for _, name := range names {
+		lines = append(lines, entries[name])
+	}
+	return os.WriteFile(sumsPath, []byte(strings.Join(lines, "\n")+"\n"), 0o644)
+}
+
+// parseSumsLine 解析 sha256sum 的 "<64 hex>  <name>" 行（双空格分隔符）。
+func parseSumsLine(line string) (name string, ok bool) {
+	if len(line) < 66 || line[64:66] != "  " {
+		return "", false
+	}
+	for _, c := range line[:64] {
+		if !strings.ContainsRune("0123456789abcdef", c) {
+			return "", false
+		}
+	}
+	return line[66:], true
 }

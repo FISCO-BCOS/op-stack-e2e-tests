@@ -213,5 +213,8 @@ ecotone_boundary_ecotone_last.json
 canyon_boundary_ecotone_activation.json
 regolith_boundary_regolith_last.json
 
-# Ladder differential vector (D1g): 1000-block regolith->canyon ladder (mode product, no golden)
-ladder_1000.json
+# Ladder differential vector (D1g): 1000-block 8-fork regolith->jovian ladder (mode product, no golden).
+# Stem carries the spec digest (hardening): ladder_<blocks>_<digest8>, digest8 = first 8 hex of
+# sha256 over the normalized spec ("0:regolith,125:canyon,250:ecotone,375:fjord,500:granite,625:holocene,750:isthmus,875:jovian");
+# the generator prints the produced stem (LADDER-STEM) and regen.sh captures it — Go side is the single source of truth.
+ladder_1000_69292b10.json

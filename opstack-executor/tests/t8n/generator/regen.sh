@@ -128,8 +128,17 @@ done
 "$OPGETH/opt8n-ref" --mode="chain:${N_CHAIN}:break" --out-dir "$T8N_DIR/vectors" --op-geth-commit "$PIN"
 # ladder（D1g）：1000 块 8-fork（regolith→jovian）差分向量。无 golden——ladder 是 mode
 # 产物而非 case，判据 1 的 per-case golden 不适用，判据 5 只枚举 golden/ 目录，故此处不产生 golden。
-"$OPGETH/opt8n-ref" --mode ladder --ladder "$LADDER_SPEC" --blocks "$N_LADDER_BLOCKS" \
-  --out-dir "$T8N_DIR/vectors" --op-geth-commit "$PIN"
+# stem 由生成器决定（ladder_<blocks>_<specdigest8>，digest 规则单一真相在 Go 侧），
+# 本脚本只捕获其 LADDER-STEM 行用于 manifest/判据 2 的枚举——绝不在此复算 digest。
+ladder_stdout="$("$OPGETH/opt8n-ref" --mode ladder --ladder "$LADDER_SPEC" --blocks "$N_LADDER_BLOCKS" \
+  --out-dir "$T8N_DIR/vectors" --op-geth-commit "$PIN")"
+printf '%s\n' "$ladder_stdout"
+ladder_stem="$(printf '%s\n' "$ladder_stdout" | sed -n 's/^LADDER-STEM //p')"
+if [ -z "$ladder_stem" ]; then
+  echo "ladder: generator emitted no LADDER-STEM line" >&2
+  exit 1
+fi
+[ -f "$T8N_DIR/vectors/$ladder_stem.json" ] || { echo "ladder vector $ladder_stem.json missing" >&2; exit 1; }
 
 "$OPGETH/opt8n-ref" --chain-output-dir "$T8N_DIR/golden/engine/chained" \
   --op-geth-commit "$PIN"                                    # 链式对 golden（chainA/B + jovianChainA/B）
@@ -422,8 +431,9 @@ append_if_absent "$manifest" "Phase-3 enhanced corpus (Task 6): corrupt 12 + sta
 sorted_obs=()
 while IFS= read -r line; do sorted_obs+=("$line"); done < <(printf '%s\n' "${observer_vectors[@]}" | sort)
 append_if_absent "$manifest" "Dual-path observer vectors (gaslimit/basefee, bothForks)" "${sorted_obs[@]}"
-# D1g：ladder 差分向量（mode 产物；无 golden，见上方生成步骤）。
-append_if_absent "$manifest" "Ladder differential vector (D1g): ${N_LADDER_BLOCKS}-block 8-fork regolith->jovian ladder (mode product, no golden)" "ladder_${N_LADDER_BLOCKS}.json"
+# D1g：ladder 差分向量（mode 产物；无 golden，见上方生成步骤）。stem 由生成器
+# 产出并经 LADDER-STEM 捕获（含 spec digest，见上方注释）。
+append_if_absent "$manifest" "Ladder differential vector (D1g): ${N_LADDER_BLOCKS}-block 8-fork regolith->jovian ladder (mode product, no golden)" "${ladder_stem}.json"
 
 # ── diff 源重定义（Task 7 Step 1，审查 R10）：cases ∪ 三模式产物 ∪ ladder == manifest ──
 # cases basename 展开（.in.json → .json）∪ 派生名（corrupt/static 注册项/invalid-tx/chain）
@@ -444,7 +454,7 @@ append_if_absent "$manifest" "Ladder differential vector (D1g): ${N_LADDER_BLOCK
   printf 'invalid_jovian_chain_%d_fork.json\n' "$N_CHAIN"
   printf 'invalid_isthmus_chain_%d_break.json\n' "$N_CHAIN"
   printf 'invalid_jovian_chain_%d_break.json\n' "$N_CHAIN"
-  printf 'ladder_%d.json\n' "$N_LADDER_BLOCKS"          # D1g ladder mode product
+  printf '%s.json\n' "$ladder_stem"                     # D1g ladder mode product (stem captured from the generator)
 } | sort > /tmp/opt8n-left.$$
 grep -v '^#' "$manifest" | sed '/^$/d' | sort > /tmp/opt8n-right.$$
 if ! diff /tmp/opt8n-left.$$ /tmp/opt8n-right.$$; then
