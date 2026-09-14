@@ -221,3 +221,75 @@ safe 追平 unsafe）。
    **不修则 Task 4 的 bcos-testing（hardhat 发 raw tx）无法工作。**
 6. **settle 实测**：轮末快照 unsafe，op-node `optimism_syncStatus`（snake_case
    safe_l2/unsafe_l2）轮询 safe 追平，batcher 生效下数秒内完成。
+
+---
+
+# campaign 模式 + bcos-testing 交易源适配（P2 Task 4）
+
+状态：**已完成（2026-09-14）**。`opdevnet.sh up --campaign` 起真实派生 devnet 且 fork 边界
+按**墙钟**逐段到来；bcos-testing（Hardhat，19 测试文件）经 `txsource/plugins/bcos_testing/`
+插件作为交易源接入 runner，逐段触发、交易入块、链级分布可核查。适配细节与踩坑全录见
+`txsource/README.md` §7；本节只记 A（campaign）侧定案。
+
+## A. `up --campaign [--forks "..."] [--segment-seconds N]`
+
+问题：默认 up 的跳时钟策略把 L1 头时间一次性推过全部边界，L2 以机器速度追墙钟时瞬间穿完
+8750s 阶梯 —— runner 启动时只剩最后一段可观察。campaign = 反其道：**链时间贴着墙钟走，
+边界留给墙钟逐个穿越**。
+
+实现方式：**生成临时 toml**（`/tmp/opdevnet-campaign.toml`，`OPDEVNET_CAMPAIGN_TOML` 可改），
+基准 devnet.toml 一字不改（默认 up 的幂等语义完全不受影响；campaign 每次 up 重新锚定墙钟，
+genesis hash 随墙钟漂移属预期，WARN 行如实报告）。派生时只改四处并做与基准的一致性自检
+（runtime_dir/端口/chain-id 相同 → status/down 与 txsource run.sh 用缺省 devnet.toml 即可
+操作 campaign 栈）：
+
+1. `l1.genesis_timestamp = 墙钟 - 500s`（`CAMPAIGN_ANCHOR_OFFSET_S`）：l2_time = 锚 + 2·pin_block
+   ≈ 墙钟 - 448s。up 本身耗时 ~110s，L2 追平墙钟后头块链时偏移 ≈ +480~580s →
+   bedrock 段在 up 的追平阶段被结构性消耗（runner 标 missed），第一可观察段（canyon，
+   窗口 ~120s）+ 后续 7 段全部可触发 —— 8 轮 8 段。
+2. `[forks]` 压缩阶梯：第 i 个 fork 偏移 = i × `--segment-seconds`（缺省 300s）→
+   8 边界跨 40min 链时间，全 9 段观察 ≤ 1h；`--forks "canyon delta ecotone"` 可取子集
+   试点（intent/normalize/verify/status 走 `RUN_FORKS` 子集，delta=600 恒严格介于
+   canyon=300 与 ecotone=900 之间，部署校验天然满足）。
+3. `[accel].target_l2_blocks` 重算为末 fork 激活块 + 75（campaign catch-up 不用它，仅展示）。
+4. `meta.name` 打标。
+
+流程分支（`CAMPAIGN=1`）：**不做 L1 跳时钟**（anvil 稳态 2s interval 照旧，L1 头时间贴墙钟）
+→ L2 catch-up 完成条件改为「头块时间进入墙钟 ±30s」（实测追平偏差 0s）→ **跳过激活块计数
+检查**（边界未到，属预期；逐段覆盖由 runner 验证）。其余 pin/deployer/normalize/verify/
+genesis-hash 回填全路径复用。
+
+实测（2026-09-14 23:46，campaign #4，全 8 fork）：up 全程 ~34s；锚 = 生成时墙钟-500，
+fork 绝对时间 = l2_time + {300,600,…,2400} 全部 OK（ARTIFACT VERIFY 全绿）；L2 catch-up
+完成时头块时间追平墙钟（behind 0~1s）。
+
+**campaign 链时间语义（实测修正）**：不跳时钟后，L2 时间以 **L1 头时间为地板**，而 L1
+头时间以 2s/2s 从「墙钟-470s」的 genesis 逐块追赶 → L2 时间恒落后墙钟 ~440s，但速度仍是
+2s/2s —— 每段窗口仍 = 300s 墙钟，边界按段序逐一穿越，只是整体后移。8 边界全穿完 ≈
+40min 链时间 → **全段观察 ≈ 45min 墙钟，runner 需 `--run-timeout 3600`**（默认 1800s
+会在第 7 段后被掐断；实测 jovian 段在同栈上补触发一轮即可，runner 中途加入语义原生支持）。
+
+## B. bcos-testing 适配（要点；全文见 txsource/README.md §7）
+
+- 套件 clone 至 `/tmp/bcos-testing`（`BCOS_TESTING_DIR` 可改，HTTPS 失败自动回落 SSH），
+  上游文件零改动；bcos-testing HEAD = `f9b8338`（GitHub 公共仓）。
+- **chainId 必须外部配置**：上游 bcosnet 硬编码 chainId=20200，hardhat
+  `ChainIdValidatorProvider` 首个 RPC 即校验，devnet 901 由插件生成的 wrapper
+  `--config` 提供（运行后清理，git 树零改动）。
+- funding = anvil key0（与上游测试内硬编码默认私钥一致），实测 L2 余额 0 → 必须走
+  runner L1 资金桥（key0 自存自，每轮 1 ether 足够，实测 gas ≈ 0）。
+- **实测（campaign #4，2026-09-14 23:46–00:33，同一栈生命周期）**：8 段触发 8 轮
+  （bedrock 段被 up 追平结构性消耗，runner 标 missed）；canyon/delta 两轮被
+  pre-ecotone 闸门跳过（见下）；ecotone/fjord/granite/holocene/isthmus/jovian 六段
+  全套件交易 **378 笔入块**（逐段 69/92/101/103/13/12，included 349、reverted 29，
+  全部 eip1559）+ jovian 补轮 12/12；`check_distribution.py` 链级核查 = 用户交易分布
+  6/9 段（exit 0）。断言失败为 FISCO 语义噪音（如 coinbase==0x0），与入块解耦呈现。
+- **重大发现（fork 审计信号）**：本 op-geth 构建 pre-ecotone 段校验用户交易时，bedrock
+  L1-cost 路径的 L1Block 槽位读取与部署的（jovian 代）L1Block 存储布局错位 →
+  `panic("overflow in total rollup cost: l1Cost")`（rollup_cost.go:373）→ SendTx 崩溃且
+  payload builder 死锁（链永久卡死）。插件对 bedrock/canyon/delta 三段设发送闸门
+  （`tx_gate: "pre_ecotone_no_send"`），ecotone 起不受影响。详见 txsource/README.md §7.7。
+- 运维踩坑：geth 磁余 <1.6GiB 会自杀（"Low disk space. Gracefully shutting down"），
+  本机 APFS 可用空间波动大（快照/可清除空间），campaign 期间建议清理
+  `~/Library/Caches/{vscode-cpptools,ccache,go-build,pip}` 并周期性
+  `tmutil thinlocalsnapshots /`。

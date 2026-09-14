@@ -39,9 +39,8 @@ run.sh ── 每个 fork 段触发一轮插件 ──▶ plugins/<插件>（自
 
 **两类原型**（新插件对齐其一即可，管线零改动接入）：
 
-- **RPC 套件型**：配置端点后让既有套件自发交易。如 bcos-testing：改 `hardhat.config.js` 的
-  network（url=`--endpoint`、chainId=`--chain-id`、accounts=[`--funding-key`]）→
-  `npx hardhat test --network bcosnet`，结束后由测试输出汇总出报告（Task 4 接入）。
+- **RPC 套件型**：配置端点后让既有套件自发交易。实装：`plugins/bcos_testing/run.sh`
+  （Task 4，bcos-testing/Hardhat 全套件，见其头注释与 §7）。
 - **程序生成型**：插件自构造 raw tx 直接 `eth_sendRawTransaction`。原型见
   `plugins/demo_transfer.sh`（cast 串行发 3 笔转账，逐笔等回执计数）。
 
@@ -108,6 +107,11 @@ test/run_tests.sh    # 期望 RESULT: PASS=18 FAIL=0
 ```bash
 ../opdevnet.sh up                                     # 起栈（~90s，见 P1-2）
 ./run.sh --plugin plugins/demo_transfer.sh            # 单段全通路：资金桥→3 笔转账→报告→settle
+# campaign 栈（fork 边界按墙钟逐段到来，见 ../README.md P2 节）：
+../opdevnet.sh up --campaign
+./run.sh --plugin plugins/bcos_testing/run.sh --funding-key 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80 \
+         --run-timeout 3600                           # 全段扫掠 ≈ 45min 墙钟，默认 1800s 不够
+python3 check_distribution.py --rollup /tmp/opdevnet/artifacts/rollup.json --rpc http://127.0.0.1:9545
 ```
 
 多段调度演示（插件触发次数 = 段数）由桩场景承担：`test/run_tests.sh` 的 T2（head 从 0 走到
@@ -131,3 +135,67 @@ test/run_tests.sh    # 期望 RESULT: PASS=18 FAIL=0
 - genesis 处激活的 fork（l2_time 处）不在段表（本 devnet 全部 fork 在 genesis 后激活，Task 1 同）。
 - funding 走 cast（依赖 foundry）；stub 单测用 `--no-fund`。
 - 轮内插件失败/沉降失败：不中断后续段，summary + 退出码呈现（`rounds_failed`/`settle_failed`）。
+
+## 7. bcos_testing 插件（P2 Task 4：bcos-testing 全套件作为交易源）
+
+```
+runner（per-segment 调度 + L1 资金桥 + settle）
+   └── plugins/bcos_testing/run.sh
+         ├── prepare：clone https://github.com/FISCO-BCOS/bcos-testing（缺省 /tmp/bcos-testing，
+         │            环境变量 BCOS_TESTING_DIR 可改）+ npm ci + 补装上游缺声明依赖（见下）
+         ├── run：逐文件 `npx hardhat test --config .hardhat.devnet.config.js --network bcosnet <file>`
+         │        （mocha passing/failing/pending + 区块扫描该账户入块交易，逐文件入账）
+         └── report：stdout 一行 JSON（tx_total/included/reverted/by_type + files[]/skipped[]，
+                      断言失败 tests_failed 与未入块 tx_total 分列 —— 对应验收 C.4）
+```
+
+适配原则与实测定案（详见插件头注释）：
+
+1. **上游文件零改动**。chainId 必须由外部 wrapper 提供：上游 hardhat.config.js 把 bcosnet
+   硬编码为 chainId=20200，而 hardhat 的 `ChainIdValidatorProvider` 会在首个 RPC 请求校验
+   config.chainId == 节点 eth_chainId（`INVALID_GLOBAL_CHAIN_ID`）→ 插件生成
+   `.hardhat.devnet.config.js`（require 上游配置以保留插件注册/编译设置，仅覆写
+   bcosnet 与 paths），`--config` 指入；文件由插件生成并在退出时清理，套件 git 树保持干净。
+2. **项目根陷阱（HH1007）**：hardhat 项目根 = --config 文件所在目录且会对 config 路径做
+   realpath —— macOS /tmp 是 /private/tmp 的符号链接，wrapper 内一切路径必须
+   `realpathSync` 对齐，否则上游 contracts 被判 "outside the project"。
+3. **上游 package.json 缺直接依赖**：`scripts/utils/transactionCreator.js` require
+   `ethereum-cryptography/utils`、`@ethereumjs/rlp`，上游未声明；顶层被传递依赖钉在
+   ethereum-cryptography@0.1.3（无 utils 子路径）→ 3 个 tx 测试 MODULE_NOT_FOUND。
+   插件 prepare 检缺补装 `ethereum-cryptography@^2`（`--no-save`，不触碰上游清单）。
+4. **断言失败 ≠ 轮失败**（验收 C.4）：bcos-testing 部分断言按 FISCO 语义写（如
+   block.coinbase==0x0，sequencer 链上 coinbase=fee recipient），在 op-geth devnet 上
+   必然失败 —— 属允许噪音，如实计入 report（`tests_failed`/`files_assert_fail`），不跳过、
+   不算 rounds_failed；「交易未入块」由 tx_total/included/reverted 与
+   `check_distribution.py` 的链级分布独立呈现。静态跳过表 SKIP 保留机制，当前为空
+   （首轮实测未发现结构性不兼容文件）。
+5. **轮预算/超时**：单文件 hardhat 进程上限 `BCOS_TESTING_FILE_TIMEOUT`（缺省 240s）、
+   整轮预算 `BCOS_TESTING_ROUND_BUDGET`（缺省 270s，超时剩余文件记 skipped_budget），
+   轮间按 ROUND_ROTATE 轮转起始文件。实测全套 19 文件一轮 ~260s（2s 块距），恰容纳于
+   300s 段宽；超预算轮仍完成，交易会溢入后续段（段覆盖不受影响，见 §2 补触发语义）。
+6. **funding**：bcos-testing 用 anvil key0（0xac09…ff80，其测试内默认私钥也是它）——
+   实测该账户 L2 余额为 0（intent fundDevAccounts=false），必须走 runner 资金桥；
+   runner 传 `--funding-key 0xac09…ff80`（L1 富账户自存自，每轮 1 ether 足够）。
+7. **pre-ecotone 发送闸门（重要实测发现，fork 审计信号）**：本 op-geth 构建（d3 worktree
+   `blockchain-impl/op-geth`）在 pre-ecotone 段校验用户交易时走 bedrock L1-cost 路径，
+   硬编码槽位读取（rollup_cost.go `L1BaseFeeSlot=1/OverheadSlot=5/ScalarSlot=6`）与部署的
+   （jovian 代 contracts-bedrock）L1Block 存储布局错位 —— 实测 canyon 段 slot6 已是 ecotone
+   打包 scalars（读出 2.8e70 被当裸 scalar）→ `panic("overflow in total rollup cost: l1Cost")`
+   （rollup_cost.go:373）→ RPC 层 recover（`method handler crashed`）但 payload builder
+   死锁，链永久卡死（实测）。ecotone 起走 calldata 解码路径不受影响（jovian 段 106 笔全过）。
+   插件因此对 `--segment ∈ {bedrock, canyon, delta}` 整轮跳过发交易（`tx_gate:
+   "pre_ecotone_no_send"`，轮 rc=0），报告如实记录；段覆盖调度不受影响。
+
+### 链级分布核查（验收 C.3）
+
+`check_distribution.py --rollup <rollup.json> --rpc <L2 RPC> [--funding-addr 0x..]`：
+逐块统计非 L1-attributes 交易（from != 0xdead…0001 且 type != 0x7E）按块 ts 落段分布，
+退出码 0 = 用户交易覆盖 ≥2 段。
+
+## 8. 文件（Task 4 增量）
+
+| 文件 | 作用 |
+|---|---|
+| `plugins/bcos_testing/run.sh` | bcos-testing 套件插件（RPC 套件型实装） |
+| `plugins/bcos_testing/txscan.py` | 区块扫描账本（入块/回执状态/类型，余额查询） |
+| `check_distribution.py` | 非 attributes 交易按 fork 段分布核查（验收 C.3） |
