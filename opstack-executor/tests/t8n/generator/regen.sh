@@ -118,10 +118,13 @@ done
 # static：§4c 12 项（item 3/12 生成但强制不入 manifest——GoldenSample loader 不可表达）
 "$OPGETH/opt8n-ref" --mode=static --base isthmus_transfer_basic --out-dir "$T8N_DIR/vectors" --op-geth-commit "$PIN"
 # invalid-tx：9 kinds × 2 forks → invalid_<fork>_<kind>.json（18）
+#   + activation_deposits_only（WI-E12）：Jovian-only kind（deposits-only 是 Jovian
+#   激活块规则）→ invalid_jovian_activation_deposits_only.json（1）。
 for kind in intrinsic_gas nonce_low nonce_high insufficient_funds fee_cap_low sender_no_eoa setcode_create empty_auth_list blob; do
   "$OPGETH/opt8n-ref" --mode=invalid-tx --base "isthmus_${kind}" --out-dir "$T8N_DIR/vectors" --op-geth-commit "$PIN"
   "$OPGETH/opt8n-ref" --mode=invalid-tx --base "jovian_${kind}" --out-dir "$T8N_DIR/vectors" --op-geth-commit "$PIN"
 done
+"$OPGETH/opt8n-ref" --mode=invalid-tx --base "jovian_activation_deposits_only" --out-dir "$T8N_DIR/vectors" --op-geth-commit "$PIN"
 # chain：线性 + fork + break（N=3）。fork/break 带 invalid_ 前缀（E2E invalid 子集消费）。
 "$OPGETH/opt8n-ref" --mode="chain:${N_CHAIN}" --out-dir "$T8N_DIR/vectors" --op-geth-commit "$PIN"
 "$OPGETH/opt8n-ref" --mode="chain:${N_CHAIN}:fork" --out-dir "$T8N_DIR/vectors" --op-geth-commit "$PIN"
@@ -448,6 +451,7 @@ append_if_absent "$manifest" "Ladder differential vector (D1g): ${N_LADDER_BLOCK
     printf 'invalid_isthmus_%s.json\n' "$kind"
     printf 'invalid_jovian_%s.json\n' "$kind"
   done
+  printf 'invalid_jovian_activation_deposits_only.json\n'   # WI-E12 (Jovian-only kind)
   printf 'isthmus_chain_%d.json\n' "$N_CHAIN"
   printf 'jovian_chain_%d.json\n' "$N_CHAIN"
   printf 'invalid_isthmus_chain_%d_fork.json\n' "$N_CHAIN"

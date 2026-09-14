@@ -2426,4 +2426,35 @@ var invalidTxCaseSpecs = []invalidTxCaseSpec{
 			return tx, outJSON, err
 		}
 	}},
+
+	// activation_deposits_only (WI-E12): the Jovian ACTIVATION block — genesis
+	// Isthmus, the single block crosses JovianTime, attributes stay in the
+	// Isthmus 176B form (the activation block cannot carry the DA-footprint
+	// scalar yet) — carrying a plain EIP-1559 transfer AFTER the L1-attributes
+	// deposit. op-geth CalcDAFootprint (core/types/rollup_cost.go:571-576)
+	// hard-requires that 176B form to be deposits-only and InsertChain rejects
+	// with "unexpected non-deposit transactions in Jovian activation block";
+	// FISCO's executor throws the same sentence from
+	// validateJovianL1AttributesShape (OpBlockExecute.h) — the shared substring
+	// anchors both sides to one op-geth golden. Jovian-ONLY: deposits-only is a
+	// Jovian rule (ladder recipeFor; checked against the pin) — the Isthmus
+	// activation block has no such constraint and is deliberately not generated.
+	// The frame is upgrade_jovian_activation's (deposits-only, VALID) with the
+	// ladder-suppressed per-block transfer appended: the INVALID twin.
+	{"activation_deposits_only", []string{"jovian"}, "executor", "unexpected non-deposit transactions in Jovian activation block", "unexpected non-deposit transactions in Jovian activation block", "", func(fork string) (inputCase, invalidTxBuilder) {
+		fp := defaultFeeParams()
+		fp.isthmusLayout = true
+		c := upgradeFrame("isthmus", "activation_deposits_only",
+			"Jovian activation block (genesis Isthmus, block 1 crosses JovianTime; Isthmus 176B attributes) carrying a non-deposit transfer after the L1 attributes deposit (CalcDAFootprint deposits-only activation rule)",
+			fp, 10_000_000, "jovian", 1005)
+		fund(&c, 1, eth(100))
+		// The block-level invalidity is a plain VALID transfer (same shape the
+		// ladder recipe suppresses on Jovian activation blocks, ladder_chain.go);
+		// the builder below must build the IDENTICAL tx from the same inputTx.
+		c.Transactions = append(c.Transactions, transferTx(1, 0, recA, eth(1), 21_000, nil))
+		return c, func(signer types.Signer, cfg *params.ChainConfig) (*types.Transaction, json.RawMessage, error) {
+			in := transferTx(1, 0, recA, eth(1), 21_000, nil)
+			return buildTx(&in, signer, cfg)
+		}
+	}},
 }

@@ -3244,11 +3244,21 @@ func buildInvalidTxVector(kind, fork string) (invalidVectorDoc, *types.Block, *c
 		ParentBeaconBlockRoot: in.ParentBeaconBlockRoot.Hex(),
 		ParentHash:            blk.ParentHash().Hex(),
 	}
+	// WI-E12: every other kind is a tx-level invalidity, so the generic tail
+	// "(invalid <kind> tx inserted after the L1 attributes deposit)" reads
+	// truthfully. activation_deposits_only is a BLOCK-level invalidity (the
+	// transfer itself is valid; the activation-block shape is not), so it gets
+	// its own sentence instead of the misleading "invalid tx" tail.
+	desc := fmt.Sprintf("%s: %s (invalid %s tx inserted after the L1 attributes deposit)",
+		spec.kind, spec.opGeth, spec.kind)
+	if spec.kind == "activation_deposits_only" {
+		desc = fmt.Sprintf("%s: %s (valid EIP-1559 transfer making the Jovian ACTIVATION block violate the deposits-only rule)",
+			spec.kind, spec.opGeth)
+	}
 	doc := invalidVectorDoc{
 		Info: caseInfo{
-			Hardfork: fork,
-			Description: fmt.Sprintf("%s: %s (invalid %s tx inserted after the L1 attributes deposit)",
-				spec.kind, spec.opGeth, spec.kind),
+			Hardfork:    fork,
+			Description: desc,
 		},
 		Pre:   emitPre(in.Pre),
 		Env:   &env,

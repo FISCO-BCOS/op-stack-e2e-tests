@@ -586,15 +586,22 @@ var invalidTxAnchorTable = []invalidTxAnchor{
 	// blob: op-geth rejects at block validation ("data blobs present in block
 	// body"); FISCO rejects at raw-tx DECODE ("unsupported tx type byte 0x03").
 	{"blob", "data blobs present in block body", "unsupported tx type byte 0x03"},
+	// activation_deposits_only (WI-E12): op-geth rejects the Jovian ACTIVATION
+	// block (176B Isthmus-form attributes) at InsertChain via CalcDAFootprint
+	// (core/types/rollup_cost.go:571-576, wrapped as "failed to calculate DA
+	// footprint: ..."); FISCO's executor throws the same sentence from
+	// validateJovianL1AttributesShape — one shared substring anchors both.
+	{"activation_deposits_only", "unexpected non-deposit transactions in Jovian activation block", "unexpected non-deposit transactions in Jovian activation block"},
 }
 
 func TestInvalidTxCaseSpecsIndependentTable(t *testing.T) {
-	// The 9 §4b kinds must live in the INDEPENDENT invalidTxCaseSpecs table and
+	// The §4b kinds must live in the INDEPENDENT invalidTxCaseSpecs table and
 	// must NOT be reachable from the shared caseSpecs table (review R7:
 	// GenerateChainWithGenesis.AddTx rejects invalid txs → emitCases would emit
-	// an .in.json that the valid pipeline cannot regenerate).
-	if len(invalidTxCaseSpecs) != 9 {
-		t.Fatalf("invalidTxCaseSpecs must enumerate 9 kinds, got %d", len(invalidTxCaseSpecs))
+	// an .in.json that the valid pipeline cannot regenerate). 9 original kinds
+	// + activation_deposits_only (WI-E12, Jovian-only).
+	if len(invalidTxCaseSpecs) != 10 {
+		t.Fatalf("invalidTxCaseSpecs must enumerate 10 kinds, got %d", len(invalidTxCaseSpecs))
 	}
 	for _, tc := range invalidTxAnchorTable {
 		spec, err := invalidTxSpec(tc.kind)
@@ -709,7 +716,13 @@ func buildInvalidTxVectorForTest(t *testing.T, kind, fork string) (invalidVector
 
 func TestInvalidTxAllKindsRejectSchemaAndAnchors(t *testing.T) {
 	for _, tc := range invalidTxAnchorTable {
-		for _, fork := range []string{"isthmus", "jovian"} {
+		// Per-kind fork axes (WI-E12): activation_deposits_only is Jovian-only
+		// (deposits-only is a Jovian rule), every other kind spans both forks.
+		spec, err := invalidTxSpec(tc.kind)
+		if err != nil {
+			t.Fatalf("invalidTxSpec(%s): %v", tc.kind, err)
+		}
+		for _, fork := range spec.forks {
 			doc, blk, genesis := buildInvalidTxVectorForTest(t, tc.kind, fork)
 			rej := rejectOf(doc)
 			if rej == nil {
@@ -799,16 +812,120 @@ func TestInvalidTxManualTxRootAndBlockHash(t *testing.T) {
 	// 非法交易参与 txRoot + 占位 stateRoot + blockHash 重算：payload blockHash ==
 	// recomputeOpHeaderHash(block.Header())。FISCO 只有过 step-2 blockHash 检查才进执行。
 	for _, tc := range invalidTxAnchorTable {
-		doc, blk, _ := buildInvalidTxVectorForTest(t, tc.kind, "isthmus")
-		if doc.OpPayload["blockHash"] != recomputeOpHeaderHash(blk.Header()).Hex() {
-			t.Fatalf("%s: payload blockHash %v != recomputed %v",
-				tc.kind, doc.OpPayload["blockHash"], recomputeOpHeaderHash(blk.Header()).Hex())
+		spec, err := invalidTxSpec(tc.kind)
+		if err != nil {
+			t.Fatalf("invalidTxSpec(%s): %v", tc.kind, err)
 		}
-		// 占位 stateRoot：不必等于真实执行结果（执行前先失败），但必须是 32 字节哈希。
-		root, ok := doc.OpPayload["stateRoot"].(string)
-		if !ok || !strings.HasPrefix(root, "0x") || len(root) != 66 {
-			t.Fatalf("%s: placeholder stateRoot malformed: %v", tc.kind, doc.OpPayload["stateRoot"])
+		for _, fork := range spec.forks {
+			doc, blk, _ := buildInvalidTxVectorForTest(t, tc.kind, fork)
+			if doc.OpPayload["blockHash"] != recomputeOpHeaderHash(blk.Header()).Hex() {
+				t.Fatalf("%s/%s: payload blockHash %v != recomputed %v",
+					tc.kind, fork, doc.OpPayload["blockHash"], recomputeOpHeaderHash(blk.Header()).Hex())
+			}
+			// 占位 stateRoot：不必等于真实执行结果（执行前先失败），但必须是 32 字节哈希。
+			root, ok := doc.OpPayload["stateRoot"].(string)
+			if !ok || !strings.HasPrefix(root, "0x") || len(root) != 66 {
+				t.Fatalf("%s/%s: placeholder stateRoot malformed: %v", tc.kind, fork, doc.OpPayload["stateRoot"])
+			}
 		}
+	}
+}
+
+// TestActivationDepositsOnlyShape (WI-E12): the Jovian ACTIVATION block golden.
+// Pins the generator-side shape — genesis Isthmus, block 1 crosses JovianTime,
+// attributes stay in the Isthmus 176B form, a VALID EIP-1559 transfer follows
+// the L1-attributes deposit — and the op-geth oracle: InsertChain rejects with
+// CalcDAFootprint's activation deposits-only sentence wrapped in the DA
+// footprint error (core/types/rollup_cost.go:571-576 via block_validator.go:125).
+// The emitted invalid_jovian_activation_deposits_only.json carries exactly this
+// captured message as the op_geth anchor; FISCO's executor throws the same
+// sentence from validateJovianL1AttributesShape, so the vector is a REAL
+// two-sided differential gate, not a self-graded test.
+func TestActivationDepositsOnlyShape(t *testing.T) {
+	const kind = "activation_deposits_only"
+	spec, err := invalidTxSpec(kind)
+	if err != nil {
+		t.Fatalf("invalidTxSpec(%s): %v", kind, err)
+	}
+	if len(spec.forks) != 1 || spec.forks[0] != "jovian" {
+		t.Fatalf("%s must be Jovian-only, forks = %v", kind, spec.forks)
+	}
+	in, buildInvalid, err := buildInvalidTxCase(kind, "jovian")
+	if err != nil {
+		t.Fatalf("buildInvalidTxCase: %v", err)
+	}
+	// Genesis Isthmus, jovian activating between genesis (1000) and block (1010).
+	if in.Info.Hardfork != "jovian" {
+		t.Fatalf("_info.hardfork want jovian (block-time fork), got %q", in.Info.Hardfork)
+	}
+	cfg, err := buildConfigForCase(&in)
+	if err != nil {
+		t.Fatalf("buildConfigForCase: %v", err)
+	}
+	blockTime := uint64(in.Genesis.Timestamp) + 10
+	if !cfg.IsIsthmus(uint64(in.Genesis.Timestamp)) || cfg.IsJovian(uint64(in.Genesis.Timestamp)) {
+		t.Fatal("genesis must be Isthmus-period (pre-Jovian)")
+	}
+	if cfg.JovianTime == nil || !cfg.IsJovian(blockTime) {
+		t.Fatal("block 1 must be the Jovian activation block")
+	}
+	// Attributes: Isthmus 176B form (no DA-footprint scalar yet) — the length-keyed
+	// trigger of CalcDAFootprint's deposits-only branch.
+	data := []byte(in.Transactions[0].Data)
+	if len(data) != types.IsthmusL1AttributesLen {
+		t.Fatalf("attributes want Isthmus %d bytes, got %d", types.IsthmusL1AttributesLen, len(data))
+	}
+	if !bytes.Equal(data[0:4], types.IsthmusL1AttributesSelector) {
+		t.Fatalf("attributes selector want Isthmus, got %x", data[0:4])
+	}
+	// Exactly one non-deposit transfer after the attributes deposit.
+	if len(in.Transactions) != 2 {
+		t.Fatalf("case must carry [attributes deposit, transfer], got %d txs", len(in.Transactions))
+	}
+	genesis, err := buildGenesisForCase(&in, cfg)
+	if err != nil {
+		t.Fatalf("buildGenesisForCase: %v", err)
+	}
+	signer := types.MakeSigner(cfg, big.NewInt(1), blockTime)
+	deposit, _, err := buildTx(&in.Transactions[0], signer, cfg)
+	if err != nil {
+		t.Fatalf("buildTx(deposit): %v", err)
+	}
+	transfer, _, err := buildInvalid(signer, cfg)
+	if err != nil {
+		t.Fatalf("buildTx(transfer): %v", err)
+	}
+	if transfer.IsDepositTx() {
+		t.Fatal("the second tx must be a NON-deposit (the block-level trigger)")
+	}
+	blk, err := buildInvalidTxBlock(&in, cfg, genesis, signer, deposit, transfer)
+	if err != nil {
+		t.Fatalf("buildInvalidTxBlock: %v", err)
+	}
+	// op-geth oracle: InsertChain rejects with the activation deposits-only rule.
+	msg, err := captureInsertChainRejection(genesis, blk)
+	if err != nil {
+		t.Fatalf("captureInsertChainRejection: %v", err)
+	}
+	const anchor = "unexpected non-deposit transactions in Jovian activation block"
+	if !strings.Contains(msg, anchor) {
+		t.Fatalf("InsertChain want %q, got %q", anchor, msg)
+	}
+	if !strings.Contains(msg, "failed to calculate DA footprint") {
+		t.Fatalf("InsertChain rejection must come from the DA-footprint gate, got %q", msg)
+	}
+	// The vector's reject schema anchors both surfaces on the shared sentence.
+	doc, _, _, err := buildInvalidTxVector(kind, "jovian")
+	if err != nil {
+		t.Fatalf("buildInvalidTxVector: %v", err)
+	}
+	rej := rejectOf(doc)
+	if rej == nil || rej.Fisco.Consumer != "executor" {
+		t.Fatalf("%s: reject schema must be executor-consumer, got %+v", kind, rej)
+	}
+	if !strings.Contains(rej.Fisco.ValidationErrorContains, anchor) || !strings.Contains(rej.OpGeth, anchor) {
+		t.Fatalf("%s: anchors must carry %q, got op_geth=%q t8n=%q",
+			kind, anchor, rej.OpGeth, rej.Fisco.ValidationErrorContains)
 	}
 }
 

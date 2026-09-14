@@ -218,3 +218,6 @@ regolith_boundary_regolith_last.json
 # sha256 over the normalized spec ("0:regolith,125:canyon,250:ecotone,375:fjord,500:granite,625:holocene,750:isthmus,875:jovian");
 # the generator prints the produced stem (LADDER-STEM) and regen.sh captures it — Go side is the single source of truth.
 ladder_1000_69292b10.json
+
+# Phase-3 enhanced corpus (Task 6): corrupt 12 + static 10 + invalid-tx 18 + chain 6 + legacy 2 = 48 vectors (idempotent; §4c item 3/12 excluded — loader 不可表达)
+invalid_jovian_activation_deposits_only.json
