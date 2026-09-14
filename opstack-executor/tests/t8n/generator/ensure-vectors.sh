@@ -36,6 +36,10 @@ PIN="${OPGETH_PIN:-$(sed -nE 's/^PIN="([0-9a-f]{40})"/\1/p' "$REGEN")}"
 # provisioned too -- the composite action used to set up op-geth only.
 OP_NODE_PIN="${OP_NODE_PIN:-$(sed -nE 's/^OP_NODE_PIN="\$\{OP_NODE_PIN:-([0-9a-f]{40})\}".*/\1/p' "$REGEN")}"
 [ -n "$OP_NODE_PIN" ] || { echo "无法从 regen.sh 提取 OP_NODE_PIN" >&2; exit 1; }
+# op-node pin 76e4fad5 携带本地审计提交、不在 ethereum-optimism/optimism 的任何 ref 上
+# （上游匿名取它必报 not our ref）。默认从 ywy2090 fork 的 op-node-pin-76e4fad5 分支取
+# （公开、匿名可读），OP_NODE_FETCH_URL 可覆盖；OP_NODE_REPO 语义不变。
+OP_NODE_FETCH_URL="${OP_NODE_FETCH_URL:-https://github.com/ywy2090/optimism.git}"
 
 USER_OPGETH="${OPGETH:-}"   # 用户显式传入则视为自有 checkout，绝不删除
 if [ -z "$USER_OPGETH" ]; then
@@ -119,7 +123,7 @@ ensure_op_node() {
     mkdir -p "$(dirname "$OP_NODE_REPO")"
     rm -rf "$OP_NODE_REPO"
     echo "克隆 optimism@${OP_NODE_PIN:0:8} -> $OP_NODE_REPO"
-    git clone --filter=blob:none https://github.com/ethereum-optimism/optimism.git "$OP_NODE_REPO"
+    git clone --filter=blob:none "$OP_NODE_FETCH_URL" "$OP_NODE_REPO"
     fetch_pin "$OP_NODE_REPO" "$OP_NODE_PIN"
     git -C "$OP_NODE_REPO" checkout --detach "$OP_NODE_PIN"
   fi
