@@ -150,6 +150,29 @@
           "gasUsed": "0xb140",
           "cumulativeGasUsed": "0x12a22",
           "logsCount": 3,
+          "logs": [
+            {
+              "address": "0xc0de000000000000000000000000000000000002",
+              "topics": [
+                "0xd95ca58f83f1b9ae6f746318d4b85f5ffbe2753f2558e9ae1c424de4c563de7d"
+              ],
+              "data": "0x"
+            },
+            {
+              "address": "0xc0de000000000000000000000000000000000002",
+              "topics": [
+                "0xe68c474eefa1172d3ead809bebdee417b12c18858e9f8d2d5e752fc659c2611b"
+              ],
+              "data": "0x"
+            },
+            {
+              "address": "0xc0de000000000000000000000000000000000002",
+              "topics": [
+                "0xbe0377c39fe76b826c957fda6da08360f7fa64f3b24c87a7f884aa333ee8bcc9"
+              ],
+              "data": "0x"
+            }
+          ],
           "output": "0x",
           "_op_l1_fee": "0xf4eb688f4",
           "_op_da_footprint": "0x0",

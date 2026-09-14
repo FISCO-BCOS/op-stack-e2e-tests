@@ -1,0 +1,44 @@
+# SHA256SUMS -- provenance tripwire for the engine_getPayload golden corpus
+# (P2 Task 1).
+#
+# WHY THIS FILE EXISTS
+# --------------------
+# The same reason as golden/engine/SHA256SUMS: the corpus-derived tests only
+# have judging power while these bytes are op-geth's output and not this
+# repository's own. A silent refresh of a golden would otherwise pass. The
+# sums are the machine-checked half of the op-geth pin
+# e8800cffe53d459cde8a07c8e8f1de9d86e79e07 (v1.101702.2), the same pin the
+# rest of golden/engine/ is generated from.
+#
+# WHAT IT DOES AND DOES NOT PROVE
+# -------------------------------
+# It proves: these 9 envelopes have not changed since the values were generated
+# from the pinned op-geth through the real engine API path (ForkchoiceUpdated
+# -> GetPayloadV<2|3|4|5>), whose determinism was established by two
+# consecutive byte-identical runs per cell.
+# It does NOT prove: that a regenerator who also refreshes this file used
+# op-geth. Updating SHA256SUMS is a deliberate, reviewable act.
+#
+# REGENERATING (per cell; see manifest.txt for the case/fork mapping)
+# ------------------------------------------------------------------
+#   cd opstack-executor/tests/t8n
+#   <opt8n-ref> --input cases/<case>.in.json \
+#     --output golden/engine/getpayload/<fork>_v<version>.json \
+#     --engine-getpayload [--engine-fork karst]
+#   (opt8n-ref is generator/ built inside the op-geth pin tree; Task 4 wires
+#   this into generator/regen.sh.)
+# Verify from a shell with:
+#   grep -v '^#' SHA256SUMS | shasum -a 256 -c
+#
+# Known data point (not a defect): karst_v5.json and jovian_v4.json have equal
+# sums because the pinned op-geth returns the same envelope bytes for this
+# input under V4 and V5; see manifest.txt.
+54f9615f2fa0c7d10f966e3a7081fa0a24bd9bbbefd63544ccdc47fcbfc01005  canyon_v2.json
+1dd3747e144d2058b14a961f79c129ca94993154107e70d0d0f2e468ef56313a  ecotone_v3.json
+c349917f1f8e5c2a2d4efe8bb47f624d26aa6f2295a0f4ed1838c78678bc0a64  fjord_v3.json
+87efbebe9240f83e1db448671ec50fd1600b98d977eb7f5a6dfe1bc8042270fe  granite_v3.json
+5d8b8ee9483a262e9466833f10a4a0fe9fabe1707909921a7552cc64690629e4  holocene_v3.json
+178aff8197cea669cd776b3512252498e68bada93dbe7667e97dbf81418a710c  isthmus_v4.json
+392ce0116092d9108c69781ef4443c111f7898c1efa4fc697e5e31e6b3bdd217  jovian_v4.json
+392ce0116092d9108c69781ef4443c111f7898c1efa4fc697e5e31e6b3bdd217  karst_v5.json
+56f3971a0c88eb7d1af9430eb786363c732f34b05a1192c2b095353c69d32ce4  regolith_v2.json

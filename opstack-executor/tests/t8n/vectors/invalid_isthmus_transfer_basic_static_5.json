@@ -56,7 +56,7 @@
     },
     "_op_expected": {
       "reject": {
-        "op_geth": "withdrawalsRoot is required on the OP path (Isthmus+)",
+        "op_geth": "expected withdrawals root in OP-Stack post-Isthmus block header",
         "fisco": {
           "consumer": "engine",
           "classification": "INVALID",

@@ -38,6 +38,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/ecdsa"
 	"encoding/binary"
 	"encoding/json"
@@ -49,7 +50,9 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
+	"github.com/ethereum/go-ethereum/beacon/engine"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/common/math"
@@ -63,7 +66,13 @@ import (
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/crypto"
+	geth "github.com/ethereum/go-ethereum/eth"
+	"github.com/ethereum/go-ethereum/eth/catalyst"
+	"github.com/ethereum/go-ethereum/eth/ethconfig"
 	"github.com/ethereum/go-ethereum/ethdb"
+	"github.com/ethereum/go-ethereum/miner"
+	"github.com/ethereum/go-ethereum/node"
+	"github.com/ethereum/go-ethereum/p2p"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/ethereum/go-ethereum/trie"
@@ -73,6 +82,16 @@ import (
 
 // schemaVersion is `_op_test_vectors.version` (v3-block, plan schema).
 const schemaVersion = "3-block"
+
+// defaultPostStateMode is the ladder export's postState granularity default.
+// Full-state comparison (postState on every block, no sampledBlocks key) is the
+// default; boundary sampling is opt-in via --poststate boundary.
+const defaultPostStateMode = "full"
+
+// postStateMode is the --poststate flag. Declared at package scope (rather than
+// inside main) so a test can assert the registered default directly and catch a
+// silent revert to boundary sampling.
+var postStateMode = flag.String("poststate", defaultPostStateMode, "D1h: ladder postState granularity: full|boundary (with --mode=ladder; default full = postState on every block)")
 
 // Fixed OP-Stack / system addresses (op-geth params + rollup_cost.go).
 var (
@@ -105,9 +124,24 @@ func main() {
 		// the ASSEMBLED valid product of a base case and re-emit it as an invalid
 		// vector). corrupt emits invalid_<base>_<field>.json for every §4a field;
 		// static emits invalid_<base>_static_<n>.json for every §4c item.
-		invalidMode = flag.String("mode", "", "corrupt|static|invalid-tx: emit invalid vectors from a base case stem; chain:<N>[:fork|:break]: emit a linear chain / fork / break vector")
+		invalidMode = flag.String("mode", "", "corrupt|static|invalid-tx: emit invalid vectors from a base case stem; chain:<N>[:fork|:break]: emit a linear chain / fork / break vector; ladder: emit a ladder vector")
 		baseStem    = flag.String("base", "isthmus_transfer_basic", "base case stem for --mode=corrupt/static (e.g. isthmus_transfer_basic)")
 		invalidOut  = flag.String("out-dir", "", "output dir for --mode=corrupt/static invalid vectors")
+		// D1: ladder mode activation table + total block count. The ladder starts
+		// at 0:regolith and must stay inside one L1Block layout family (see
+		// generateLadderChain's forkLayout guard).
+		ladderSpec   = flag.String("ladder", "", "D1: fork activation table <block>:<fork>,… (block-number semantics; karst rejected; with --mode=ladder)")
+		ladderBlocks = flag.Int("blocks", 1000, "D1: total blocks for --mode=ladder")
+		// P2 Task 1 probe: drive the real miner/engine getPayload path (not
+		// GenerateChainWithGenesis) for the case's fork and dump the raw engine
+		// response JSON. Takes --input + --output like the vector path.
+		engineGetPayload = flag.Bool("engine-getpayload", false, "P2 Task 1 probe: build the case's fork through ForkchoiceUpdated+GetPayload<version> and write the raw engine response JSON to --output, then exit")
+		// engineFork overrides the case's _info.hardfork for the engine-getpayload
+		// path only. Needed for karst, which has no cases/*.in.json of its own
+		// (the corpus has no karst case): the karst cell reuses the jovian case
+		// body (same 17-byte Jovian extraData + minBaseFee shape) with the karst
+		// chain config. Empty means "use the case's own hardfork".
+		engineFork = flag.String("engine-fork", "", "P2 Task 1: override the getPayload cell's fork (only with --engine-getpayload), e.g. karst reusing cases/jovian_transfer_basic.in.json")
 	)
 	flag.Parse()
 
@@ -159,8 +193,18 @@ func main() {
 			fmt.Fprintf(os.Stderr, "opt8n-ref: %v\n", err)
 			os.Exit(1)
 		}
+	case *invalidMode == "ladder":
+		if err := runLadderMode(*invalidOut, *ladderSpec, *ladderBlocks, *opGethCommit, *postStateMode); err != nil {
+			fmt.Fprintf(os.Stderr, "opt8n-ref: %v\n", err)
+			os.Exit(1)
+		}
 	case *invalidMode == "corrupt" || *invalidMode == "static" || *invalidMode == "invalid-tx":
 		if err := runInvalidMode(*invalidMode, *baseStem, *invalidOut, *opGethCommit); err != nil {
+			fmt.Fprintf(os.Stderr, "opt8n-ref: %v\n", err)
+			os.Exit(1)
+		}
+	case *engineGetPayload:
+		if err := runEngineGetPayload(*inputPath, *outputPath, *engineFork); err != nil {
 			fmt.Fprintf(os.Stderr, "opt8n-ref: %v\n", err)
 			os.Exit(1)
 		}
@@ -170,7 +214,7 @@ func main() {
 			os.Exit(1)
 		}
 	default:
-		fmt.Fprintln(os.Stderr, "usage: opt8n-ref --write-cases <dir> | --probe-receipt-fields <case.in.json> | --probe-spec | --probe-genesis-number | --probe-precompile <fork> | --input <case.in.json> --output <vector.json> [--golden-output <golden.json>] [--op-geth-commit <sha>] | --chain-output-dir <dir> [--op-geth-commit <sha>] | --mode corrupt|static|invalid-tx --base <stem> --out-dir <dir> [--op-geth-commit <sha>] | --mode chain:<N>[:fork|:break] --out-dir <dir> [--op-geth-commit <sha>]")
+		fmt.Fprintln(os.Stderr, "usage: opt8n-ref --write-cases <dir> | --probe-receipt-fields <case.in.json> | --probe-spec | --probe-genesis-number | --probe-precompile <fork> | --input <case.in.json> --output <vector.json> [--golden-output <golden.json>] [--op-geth-commit <sha>] | --input <case.in.json> --output <engine-response.json> --engine-getpayload [--engine-fork <fork>] | --chain-output-dir <dir> [--op-geth-commit <sha>] | --mode corrupt|static|invalid-tx --base <stem> --out-dir <dir> [--op-geth-commit <sha>] | --mode chain:<N>[:fork|:break] --out-dir <dir> [--op-geth-commit <sha>] | --mode ladder --ladder <块号:fork名,…> --blocks N --out-dir <dir> [--poststate full|boundary (default full)]")
 		os.Exit(2)
 	}
 }
@@ -430,6 +474,8 @@ type expectedReceipt struct {
 	GasUsed           string `json:"gasUsed"`
 	CumulativeGasUsed string `json:"cumulativeGasUsed"`
 	LogsCount         int    `json:"logsCount"`
+	// D2 logs 逐字段对拍（设计 v2 §3.5）：旧向量无此键，FISCO 侧 isMember 跳过。
+	Logs []outputLog `json:"logs,omitempty"`
 	// Tx return data (receipt output), hex-encoded; always emitted ("0x" for
 	// empty). Captured by reexecuting the block (chain-maker AddTx discards it).
 	Output                  string  `json:"output"`
@@ -448,6 +494,34 @@ type expectedReceipt struct {
 	OpOperatorFeeScalar    *string `json:"_op_operator_fee_scalar,omitempty"`
 	OpOperatorFeeConstant  *string `json:"_op_operator_fee_constant,omitempty"`
 	OpDaFootprintGasScalar *string `json:"_op_da_footprint_gas_scalar,omitempty"`
+}
+
+// outputLog 是 receipt logs 的向量形状。address/topics/data 一律全小写 0x-hex：
+// Go 的 Address.Hex() 是 EIP-55 混合大小写，FISCO 侧 bcos::toHex 全小写，
+// 必须归一化（设计 v2 §3.5）。
+type outputLog struct {
+	Address string   `json:"address"`
+	Topics  []string `json:"topics"`
+	Data    string   `json:"data"`
+}
+
+func outputLogsOf(r *types.Receipt) []outputLog {
+	if len(r.Logs) == 0 {
+		return nil
+	}
+	logs := make([]outputLog, 0, len(r.Logs))
+	for _, l := range r.Logs {
+		topics := make([]string, 0, len(l.Topics))
+		for _, t := range l.Topics {
+			topics = append(topics, "0x"+common.Bytes2Hex(t.Bytes()))
+		}
+		logs = append(logs, outputLog{
+			Address: "0x" + common.Bytes2Hex(l.Address.Bytes()),
+			Topics:  topics,
+			Data:    hexutil.Encode(l.Data),
+		})
+	}
+	return logs
 }
 
 type opExpected struct {
@@ -580,6 +654,17 @@ func buildChainConfig(fork string) (*params.ChainConfig, error) {
 	conf := *params.OptimismTestConfig
 	conf.ChainID = big.NewInt(8453) // 0x2105, Base mainnet, matches the plan's schema example
 	switch fork {
+	case "karst":
+		// Karst is the OP fork after Jovian. OptimismTestConfig nils both
+		// KarstTime and OsakaTime; Karst activates the Osaka EL ruleset in this
+		// pin, which is what GetPayloadV5 gates on (eth/catalyst/api.go:497 ->
+		// getPayload(..., forks.Osaka, forks.BPO1..BPO5); params/config.go:1371
+		// LatestFork returns Osaka when OsakaTime is set and PragueTime <= time).
+		// The EL twin coupling (Prague==Isthmus) already holds from JovianTime.
+		// BlobScheduleConfig stays nil: the OP-Stack short-circuit in
+		// consensus/misc/eip4844 (CalcExcessBlobGas/CalcBlobFee) requires exactly that.
+		conf.KarstTime = uint64Ptr(0)
+		conf.OsakaTime = uint64Ptr(0)
 	case "jovian":
 		// OptimismTestConfig already sets JovianTime = 0 (Regolith..Jovian at 0).
 	case "isthmus":
@@ -627,7 +712,7 @@ func buildChainConfig(fork string) (*params.ChainConfig, error) {
 		conf.JovianTime = nil
 		conf.PragueTime = nil
 	default:
-		return nil, fmt.Errorf("unknown hardfork %q (want regolith|canyon|ecotone|fjord|granite|holocene|isthmus|jovian)", fork)
+		return nil, fmt.Errorf("unknown hardfork %q (want regolith|canyon|ecotone|fjord|granite|holocene|isthmus|jovian|karst)", fork)
 	}
 	if err := conf.CheckOptimismValidity(); err != nil {
 		return nil, fmt.Errorf("chain config invalid: %w", err)
@@ -1459,6 +1544,242 @@ func writeJSON(path string, v any) error {
 }
 
 // ---------------------------------------------------------------------
+// P2 Task 1 probe: getPayload golden through the real miner/engine path.
+//
+// The existing --golden-output path (buildGoldenRecord, above) drives
+// core.GenerateChainWithGenesis and never touches the Engine API. The
+// getPayload golden must instead come out of the pipeline op-node talks to:
+// eth.New -> catalyst.ForkchoiceUpdated<v>(attrs) -> GetPayload<v>(id).
+// This probe adds exactly that for one (fork, version) cell at a time; the
+// 9-cell spread is deliberately NOT done here (plan §2 cost checkpoint).
+//
+// Determinism is the whole point:
+//   - NoTxPool=true makes miner.buildPayload build synchronously from the
+//     provided attributes.Transactions (no background recommit goroutine, no
+//     txpool ordering). The hash-derived payloadID never appears in the dumped
+//     envelope, so it cannot leak into the artifact.
+//   - Every response field is a pure function of genesis + attrs: timestamp
+//     comes from the case (genesis+10), prevRandao is zeroed, coinbase is the
+//     case coinbase. No wall-clock input.
+// ---------------------------------------------------------------------
+
+// getPayloadVersionForFork returns the engine_getPayload version legal for
+// each OP fork, mirroring matrix/engine_api_windows.json (op-node's own
+// selection). Karst is the one registered deviation: op-node emits V4, while
+// this op-geth pin implements GetPayloadV5 (params/config.go:519 KarstTime,
+// eth/catalyst/api.go:498).
+func getPayloadVersionForFork(fork string) (int, error) {
+	switch fork {
+	case "regolith", "canyon":
+		return 2, nil
+	case "ecotone", "fjord", "granite", "holocene":
+		return 3, nil
+	case "isthmus", "jovian":
+		return 4, nil
+	case "karst":
+		return 5, nil
+	default:
+		return 0, fmt.Errorf("unknown hardfork %q for getPayload golden", fork)
+	}
+}
+
+// startEngineEthService builds the in-memory node the engine API needs. It is
+// the non-test analogue of eth/catalyst/api_test.go:438
+// (startEthServiceWithConfigFn) with the same config the op-geth tests use.
+func startEngineEthService(genesis *core.Genesis) (*node.Node, *geth.Ethereum, error) {
+	n, err := node.New(&node.Config{P2P: p2p.Config{ListenAddr: "127.0.0.1:0", NoDiscovery: true, MaxPeers: 0}})
+	if err != nil {
+		return nil, nil, fmt.Errorf("node.New: %w", err)
+	}
+	ethcfg := &ethconfig.Config{
+		Genesis:        genesis,
+		SyncMode:       ethconfig.FullSync,
+		TrieTimeout:    time.Minute,
+		TrieDirtyCache: 256,
+		TrieCleanCache: 256,
+		Miner:          miner.DefaultConfig,
+	}
+	svc, err := geth.New(n, ethcfg)
+	if err != nil {
+		n.Close()
+		return nil, nil, fmt.Errorf("eth.New: %w", err)
+	}
+	if err := n.Start(); err != nil {
+		n.Close()
+		return nil, nil, fmt.Errorf("node.Start: %w", err)
+	}
+	return n, svc, nil
+}
+
+// runEngineGetPayload builds one case's fork through the engine API and writes
+// the raw ExecutionPayloadEnvelope JSON to outputPath. See the header comment
+// above for why this is a separate path from run()/processBlockVector.
+//
+// forkOverride (--engine-fork), when non-empty, replaces the case's
+// _info.hardfork for this run only -- used by the karst@V5 cell, which reuses
+// the jovian case body. Upgrade-boundary cases (with _info.activations) are
+// rejected under an override: the override names a single pure-fork config.
+func runEngineGetPayload(inputPath, outputPath, forkOverride string) error {
+	if inputPath == "" || outputPath == "" {
+		return fmt.Errorf("--engine-getpayload requires --input and --output")
+	}
+	raw, err := os.ReadFile(inputPath)
+	if err != nil {
+		return err
+	}
+	var in inputCase
+	if err := json.Unmarshal(raw, &in); err != nil {
+		return fmt.Errorf("parsing %s: %w", inputPath, err)
+	}
+	fork := in.Info.Hardfork
+	if forkOverride != "" {
+		if len(in.Info.Activations) > 0 {
+			return fmt.Errorf("--engine-fork %s: case %s carries _info.activations; a fork override is only valid for pure-fork cells", forkOverride, inputPath)
+		}
+		fork = forkOverride
+	}
+	version, err := getPayloadVersionForFork(fork)
+	if err != nil {
+		return err
+	}
+	var cfg *params.ChainConfig
+	if forkOverride != "" {
+		cfg, err = buildChainConfig(fork)
+	} else {
+		cfg, err = buildConfigForCase(&in)
+	}
+	if err != nil {
+		return err
+	}
+	if err := assertL1BlockConsistency(cfg, &in); err != nil {
+		return fmt.Errorf("L1Block slot<->calldata consistency: %w", err)
+	}
+	if err := assertDepositsFirst(in.Transactions); err != nil {
+		return err
+	}
+
+	// Genesis + transactions: the verbatim front half of processBlockVector.
+	// The single block is built by the miner below, not by GenerateChainWithGenesis.
+	genesisTime := uint64(in.Genesis.Timestamp)
+	blockTime := genesisTime + 10 // chain_makers.makeHeader: parent+10; miner forceTime keeps it exact
+	denom := uint64(in.Genesis.EIP1559Denominator)
+	elasticity := uint64(in.Genesis.EIP1559Elasticity)
+	var minBaseFee *uint64
+	if cfg.IsJovian(blockTime) {
+		if in.Genesis.MinBaseFee == nil {
+			return fmt.Errorf("jovian case must set genesis.minBaseFee")
+		}
+		v := uint64(*in.Genesis.MinBaseFee)
+		minBaseFee = &v
+	}
+	var genesisBaseFee *big.Int
+	if in.Genesis.BaseFee != nil {
+		genesisBaseFee = (*big.Int)(in.Genesis.BaseFee)
+	}
+	genesis := &core.Genesis{
+		Config:     cfg,
+		Timestamp:  genesisTime,
+		GasLimit:   uint64(in.Genesis.GasLimit),
+		BaseFee:    genesisBaseFee,
+		Difficulty: big.NewInt(0),
+		ExtraData:  eip1559.EncodeOptimismExtraData(cfg, genesisTime, denom, elasticity, minBaseFee),
+		Alloc:      in.Pre,
+	}
+	signer := types.MakeSigner(cfg, big.NewInt(1), blockTime)
+	rawTxs := make([][]byte, 0, len(in.Transactions))
+	for i := range in.Transactions {
+		tx, _, err := buildTx(&in.Transactions[i], signer, cfg)
+		if err != nil {
+			return fmt.Errorf("tx %d: %w", i, err)
+		}
+		b, err := tx.MarshalBinary()
+		if err != nil {
+			return fmt.Errorf("tx %d MarshalBinary: %w", i, err)
+		}
+		rawTxs = append(rawTxs, b)
+	}
+
+	// PayloadAttributes, fork-gated exactly like checkOptimismPayloadAttributes.
+	gasLimit := uint64(in.Genesis.GasLimit)
+	attrs := &engine.PayloadAttributes{
+		Timestamp:             blockTime,
+		Random:                common.Hash{},
+		SuggestedFeeRecipient: in.Coinbase,
+		GasLimit:              &gasLimit,
+		Transactions:          rawTxs,
+		NoTxPool:              true,
+	}
+	if cfg.IsCanyon(blockTime) {
+		attrs.Withdrawals = []*types.Withdrawal{} // Shanghai twin: non-nil, empty
+	}
+	if cfg.IsCancun(big.NewInt(1), blockTime) {
+		br := in.ParentBeaconBlockRoot
+		attrs.BeaconRoot = &br
+	}
+	if cfg.IsHolocene(blockTime) {
+		attrs.EIP1559Params = eip1559.EncodeHolocene1559Params(denom, elasticity)
+	}
+	attrs.MinBaseFee = minBaseFee
+
+	n, ethsvc, err := startEngineEthService(genesis)
+	if err != nil {
+		return err
+	}
+	defer n.Close()
+	api := catalyst.NewConsensusAPI(ethsvc)
+	ctx := context.Background()
+	fcState := engine.ForkchoiceStateV1{HeadBlockHash: ethsvc.BlockChain().CurrentBlock().Hash()}
+
+	var resp engine.ForkChoiceResponse
+	switch {
+	case version == 2 && fork == "regolith":
+		resp, err = api.ForkchoiceUpdatedV1(ctx, fcState, attrs)
+	case version == 2:
+		resp, err = api.ForkchoiceUpdatedV2(ctx, fcState, attrs)
+	default:
+		resp, err = api.ForkchoiceUpdatedV3(ctx, fcState, attrs)
+	}
+	if err != nil {
+		return fmt.Errorf("forkchoiceUpdated: %w", err)
+	}
+	if resp.PayloadStatus.Status != engine.VALID {
+		return fmt.Errorf("forkchoiceUpdated status %q (want VALID)", resp.PayloadStatus.Status)
+	}
+	if resp.PayloadID == nil {
+		return fmt.Errorf("forkchoiceUpdated returned nil payloadID")
+	}
+	var env *engine.ExecutionPayloadEnvelope
+	switch version {
+	case 2:
+		env, err = api.GetPayloadV2(*resp.PayloadID)
+	case 3:
+		env, err = api.GetPayloadV3(*resp.PayloadID)
+	case 4:
+		env, err = api.GetPayloadV4(*resp.PayloadID)
+	case 5:
+		env, err = api.GetPayloadV5(*resp.PayloadID)
+	default:
+		return fmt.Errorf("unsupported getPayload version V%d", version)
+	}
+	if err != nil {
+		return fmt.Errorf("getPayload V%d: %w", version, err)
+	}
+	if env == nil || env.ExecutionPayload == nil {
+		return fmt.Errorf("getPayload V%d returned no payload", version)
+	}
+	if env.ExecutionPayload.ParentHash != fcState.HeadBlockHash {
+		return fmt.Errorf("payload parent %s != head %s", env.ExecutionPayload.ParentHash, fcState.HeadBlockHash)
+	}
+	if err := writeJSON(outputPath, env); err != nil {
+		return err
+	}
+	fmt.Fprintf(os.Stderr, "opt8n-ref: getPayload V%d %s -> %s (block %s, %d txs, gas %d)\n",
+		version, fork, outputPath, env.ExecutionPayload.BlockHash.Hex(),
+		len(env.ExecutionPayload.Transactions), env.ExecutionPayload.GasUsed)
+	return nil
+}
+
+// ---------------------------------------------------------------------
 // Off-line chained pair (Task 2 Step 2, spec §7.1 rev.3 decision A2): a
 // dedicated 1->2 block chain generated in ONE GenerateChainWithGenesis(n=2)
 // call (real chain_makers parent-chaining -- block B's pre-state IS block
@@ -1924,9 +2245,13 @@ func l1FeeOfTransfer(receipts types.Receipts) *big.Int {
 // per-block files of runChainPair (:1546). The replayer (OpT8nReplayTest.cpp
 // replayChainVector :1044) inherits the running chain state across blocks:
 // blocks[0] carries `pre`, blocks[i>0] emit NO pre (null/absent -- a real pre
-// object would reset the state). Each block MUST carry its own
-// _op_expected.header/receipts + postState (Task 1 handoff: replaySingleBlockInto
-// reads them with .at(), missing = out_of_range). Recipe constraint (review
+// object would reset the state). generateChainN (legacy chain mode) blocks
+// always carry their own _op_expected.header/receipts + postState (Task 1
+// handoff: replaySingleBlockInto reads them with .at(), missing = out_of_range).
+// Ladder vectors from generateLadderChainSampled intentionally omit postState
+// on unsampled blocks (json omitempty); consumers MUST treat an absent
+// postState as "not sampled" and consult chainOutput.sampledBlocks (absent
+// sampledBlocks = every block sampled, the legacy shape). Recipe constraint (review
 // R13): chain blocks must not read historical blockhashes (ParentOnlyBlockHashes
 // only answers number-1) -- the attributes-deposit + transfer recipe is safe.
 // ---------------------------------------------------------------------
@@ -1938,7 +2263,7 @@ type chainBlockOutput struct {
 	Env        outputEnv                         `json:"env"`
 	Pre        *map[common.Address]outputAccount `json:"pre,omitempty"`
 	Block      outputBlock                       `json:"block"`
-	PostState  types.GenesisAlloc                `json:"postState"`
+	PostState  types.GenesisAlloc                `json:"postState,omitempty"`
 	OpExpected opExpected                        `json:"_op_expected"`
 }
 
@@ -1947,6 +2272,8 @@ type chainBlockOutput struct {
 // as every other vector.
 type chainOutput struct {
 	Blocks []chainBlockOutput `json:"blocks"`
+	// postState 采样块号列表（设计 v2 §3.4/§4.3）；缺省（旧向量）= 每块都采样。
+	SampledBlocks []int `json:"sampledBlocks,omitempty"`
 }
 
 // chainContext is the internal (non-JSON) chain result the fork/break arms
@@ -3214,6 +3541,26 @@ type staticItem struct {
 	fork         string
 	mutate       func(payload map[string]interface{}) error
 	fiscoMessage string
+	// opGethMessage is the EXTERNAL anchor: op-geth's own rejection wording for
+	// the same malformation, pinned from the op-geth commit recorded in
+	// _op_test_vectors.generator_commit. Format verbs are truncated at the first
+	// verb (both anchors are consumed as substrings). Empty means op-geth has no
+	// counterpart surface for the item -- the field is FISCO-only
+	// (rawTransactions, expectedBlobVersionedHashes), or op-geth accepts the shape
+	// (executionRequests may be non-empty post-Prague). emitStaticSurfaceVector
+	// then falls back to fiscoMessage, the corpus's documented weak anchor
+	// (main_test.go:741). Per-item pins against op-geth e8800cffe53d:
+	//   item 2  eth/catalyst/api_optimism.go:17   checkOptimismPayload
+	//   item 4  eth/catalyst/api.go:754           NewPayloadV4 param check
+	//   item 5  core/block_validator.go:190       post-Isthmus withdrawals root
+	//   item 7  core/block_validator.go:111       Cancun blob-gas branch (derived:
+	//                                             Isthmus takes it, body has no
+	//                                             blobs, so calculated = 0)
+	//   item 10 consensus/misc/eip1559/eip1559_optimism.go:149 via api_optimism.go:22
+	//   item 11 core/block_validator.go:129       equality gate; the range gate at
+	//                                             :132 reads "DA footprint %d
+	//                                             exceeds block gas limit %d"
+	opGethMessage string
 }
 
 // staticSurfaceItems enumerates the 12 §4c items. ⚠️ Expressibility through the
@@ -3234,55 +3581,61 @@ var staticSurfaceItems = []staticItem{
 	{1, "rawTransactions_missing", "isthmus", func(p map[string]interface{}) error {
 		p["transactions"] = nil
 		return nil
-	}, "executionPayload.rawTransactions is required on the OP path"},
+	}, "executionPayload.rawTransactions is required on the OP path", ""},
 	{2, "withdrawals_nonempty", "isthmus", func(p map[string]interface{}) error {
 		p["withdrawals"] = []map[string]interface{}{
 			{"index": "0x0", "validatorIndex": "0x0", "amount": "0x1", "address": "0x0000000000000000000000000000000000000001"},
 		}
 		return nil
-	}, "withdrawals must be present and empty on the OP path"},
+	}, "withdrawals must be present and empty on the OP path", "non-empty withdrawals post-Canyon"},
 	{3, "expectedBlobVersionedHashes_nonempty", "isthmus", func(p map[string]interface{}) error {
 		p["expectedBlobVersionedHashes"] = []string{"0x0000000000000000000000000000000000000000000000000000000000000001"}
 		return nil
-	}, "expectedBlobVersionedHashes must be an empty array on the OP path"},
+	}, "expectedBlobVersionedHashes must be an empty array on the OP path", ""},
 	{4, "parentBeaconBlockRoot_missing", "isthmus", func(p map[string]interface{}) error {
 		delete(p, "parentBeaconBlockRoot")
 		return nil
-	}, "parentBeaconBlockRoot must be a 32-byte hash for newPayloadV4"},
+	}, "parentBeaconBlockRoot must be a 32-byte hash for newPayloadV4", "nil beaconRoot post-cancun"},
 	{5, "withdrawalsRoot_missing", "isthmus", func(p map[string]interface{}) error {
 		delete(p, "withdrawalsRoot")
 		return nil
-	}, "withdrawalsRoot is required on the OP path (Isthmus+)"},
+	}, "withdrawalsRoot is required on the OP path (Isthmus+)", "expected withdrawals root in OP-Stack post-Isthmus block header"},
 	{6, "excessBlobGas_nonzero", "isthmus", func(p map[string]interface{}) error {
 		p["excessBlobGas"] = "0x1"
 		return nil
-	}, "excessBlobGas must be present and zero on the OP path"},
+	}, "excessBlobGas must be present and zero on the OP path", ""},
 	{7, "isthmus_blobGasUsed_nonzero", "isthmus", func(p map[string]interface{}) error {
 		p["blobGasUsed"] = "0x1"
 		return nil
-	}, "blobGasUsed must be zero before Jovian (OP Isthmus)"},
+	}, "blobGasUsed must be zero before Jovian (OP Isthmus)", "blob gas used mismatch"},
 	{8, "blockNumber_negative", "isthmus", func(p map[string]interface{}) error {
 		p["blockNumber"] = "0x8000000000000000" // uint64 2^63 wraps to negative int64
 		return nil
-	}, "blockNumber must not be negative"},
+	}, "blockNumber must not be negative", ""},
 	{9, "gasLimit_overlimit", "isthmus", func(p map[string]interface{}) error {
 		p["gasLimit"] = "0xffffffffffffffff" // 2^64-1 > 2^63-1
 		return nil
-	}, "gasLimit exceeds the maximum block gas limit (2^63-1)"},
+	}, "gasLimit exceeds the maximum block gas limit (2^63-1)", ""},
 	{10, "extraData_shape", "isthmus", func(p map[string]interface{}) error {
 		p["extraData"] = "0x0000000000000000" // 8 bytes, not 9
 		return nil
-	}, "extraData must be exactly 9 bytes on the OP path (Isthmus)"},
+	}, "extraData must be exactly 9 bytes on the OP path (Isthmus)", "holocene extraData should be 9 bytes"},
 	{11, "jovian_da_footprint_over_gaslimit", "jovian", func(p map[string]interface{}) error {
+		// The engine evaluates the DA equality gate BEFORE the range gate, mirroring
+		// op-geth's block validator (core/block_validator.go:129 equality, :132 range).
+		// A payload whose blobGasUsed differs from the locally recomputed footprint is
+		// therefore rejected by the equality branch even when it also exceeds gasLimit.
+		// The stable prefix is used as a substring: the remote/local numbers are
+		// payload-specific.
 		p["blobGasUsed"] = "0x2000000" // 2^25 = 33554432 > 10M gasLimit
 		return nil
-	}, "DA footprint (blobGasUsed) exceeds the block gas limit"},
+	}, "invalid DA footprint in blobGasUsed field", "invalid DA footprint in blobGasUsed field"},
 	{12, "executionRequests_nonempty", "isthmus", func(p map[string]interface{}) error {
 		p["executionRequests"] = []map[string]interface{}{
 			{"type": "0x0", "data": "0xdeadbeef"},
 		}
 		return nil
-	}, "executionRequests must be absent or empty on the OP path"},
+	}, "executionRequests must be absent or empty on the OP path", ""},
 }
 
 // buildBasePayload assembles the FULL valid payload of a base block (all base
@@ -3290,6 +3643,16 @@ var staticSurfaceItems = []staticItem{
 // and malform one field.
 func buildBasePayload(base *blockVector) map[string]interface{} {
 	return buildOpPayload(base, base.block.Header(), common.HexToHash(base.golden.BlockHash))
+}
+
+// opGethAnchor returns the external (op-geth) anchor for a static item. When
+// op-geth has no counterpart surface the FISCO message stands in for it, the
+// corpus's documented weak anchor (main_test.go:741).
+func opGethAnchor(item staticItem) string {
+	if item.opGethMessage != "" {
+		return item.opGethMessage
+	}
+	return item.fiscoMessage
 }
 
 // emitStaticSurfaceVector builds the invalid vector document for one §4c static
@@ -3315,7 +3678,7 @@ func emitStaticSurfaceVector(base *blockVector, item staticItem) (invalidVectorD
 		OpPayload: payload,
 		OpExpected: invalidExpected{
 			Reject: &rejectExpected{
-				OpGeth: item.fiscoMessage,
+				OpGeth: opGethAnchor(item),
 				Fisco: fiscoReject{
 					Consumer:                "engine",
 					Classification:          "INVALID",
@@ -3419,6 +3782,19 @@ func parentBeaconRootOrZero(h *common.Hash) string {
 }
 
 func assertL1BlockConsistency(cfg *params.ChainConfig, in *inputCase) error {
+	// Single-block / fork-at-0 vectors have exactly one block, at
+	// genesis.Timestamp+10 (chain_makers.makeHeader's fixed parent+10s step).
+	// Multi-block ladders must judge EVERY block by its own time, so they call
+	// assertL1BlockConsistencyAt directly with blocks[i].Time() (ladder_chain.go).
+	// This wrapper keeps every pre-existing call site's behavior byte-identical.
+	return assertL1BlockConsistencyAt(cfg, in, uint64(in.Genesis.Timestamp)+10)
+}
+
+// assertL1BlockConsistencyAt is assertL1BlockConsistency with an EXPLICIT block
+// time. blockTime decides the block's fork (blockFork) and hence the expected
+// L1-attributes layout. knobs.Timestamp is the CHAIN GENESIS timestamp and must
+// NOT be overloaded to carry a block time.
+func assertL1BlockConsistencyAt(cfg *params.ChainConfig, in *inputCase, blockTime uint64) error {
 	if len(in.Transactions) == 0 {
 		return fmt.Errorf("case has no transactions (needs the L1 attributes deposit)")
 	}
@@ -3444,9 +3820,49 @@ func assertL1BlockConsistency(cfg *params.ChainConfig, in *inputCase) error {
 	// whose single block crosses IsthmusTime/JovianTime must be judged by the
 	// block-time fork -- op-geth switches the attributes deposit format at the
 	// fork boundary. For pure fork-at-0 recipes blockFork == the case hardfork.
-	blockTime := uint64(in.Genesis.Timestamp) + 10 // chain_makers.makeHeader: block time fixed at parent+10
 	jovianCfg := cfg.IsJovian(blockTime)
 	layout := forkLayout(blockFork(cfg, blockTime))
+
+	// S7: the Ecotone ACTIVATION block still carries the pre-Ecotone Bedrock
+	// attributes form (setL1BlockValues) because the L1Block upgrade lands later
+	// in the same block (specs/protocol/ecotone/l1-attributes.md:15-20, :112-119).
+	// op-geth accepts it by calldata selector (rollup_cost.go:426-431) and its
+	// execution-side cost function picks Bedrock while the Ecotone slots are
+	// unset (firstEcotoneBlock, rollup_cost.go:174-179). This is the ONE place
+	// the otherwise-forbidden first-Ecotone fallback state is REQUIRED, so detect
+	// exactly (genesis < EcotoneTime <= blockTime) + a Bedrock-shaped 260B
+	// calldata, validate the Bedrock slot mirror, and require the Ecotone slots
+	// to stay zero. Every other post-Ecotone block keeps the 164B rule (with the
+	// A2 first-format transition carve-out in the layoutEcotone branch below)
+	// and the fallback trap guard.
+	genesisTime := uint64(in.Genesis.Timestamp)
+	ecotoneActivationBlock := cfg.EcotoneTime != nil &&
+		genesisTime < *cfg.EcotoneTime && *cfg.EcotoneTime <= blockTime
+	// First Isthmus block: like S7/Ecotone, it still carries the PREVIOUS
+	// (Ecotone 164B) attributes form -- op-geth extractL1GasParams detects this
+	// by selector (rollup_cost.go:410-415) and uses the Ecotone cost function.
+	// Detect it as the first block whose OWN fork is Isthmus (parent still
+	// pre-Isthmus): chain_makers.makeHeader advances exactly +10s per block, the
+	// same interval the assert's default wrapper already assumes.
+	const makeHeaderInterval = uint64(10)
+	firstIsthmusBlock := cfg.IsthmusTime != nil && blockTime >= makeHeaderInterval &&
+		cfg.IsIsthmus(blockTime) && !cfg.IsIsthmus(blockTime-makeHeaderInterval)
+	if ecotoneActivationBlock && len(data) == 4+32*8 && bytes.Equal(data[0:4], types.BedrockL1AttributesSelector) {
+		slot5, slot6 := slot(5), slot(6)
+		if !bytes.Equal(slot1[:], data[68:100]) {
+			return fmt.Errorf("activation-block slot1 (l1BaseFee) %x != calldata[68:100] %x", slot1, data[68:100])
+		}
+		if !bytes.Equal(slot5[:], data[196:228]) {
+			return fmt.Errorf("activation-block slot5 (overhead) %x != calldata[196:228] %x", slot5, data[196:228])
+		}
+		if !bytes.Equal(slot6[:], data[228:260]) {
+			return fmt.Errorf("activation-block slot6 (scalar) %x != calldata[228:260] %x", slot6, data[228:260])
+		}
+		if slot7 != (common.Hash{}) || !isZero(slot3[16:24]) {
+			return fmt.Errorf("Ecotone activation block must leave the Ecotone slots unset (slot7/blobBaseFee and slot3 scalars zero) so op-geth selects the Bedrock cost function; got slot7=%x slot3[16:24]=%x", slot7, slot3[16:24])
+		}
+		return nil
+	}
 
 	checkCommon := func(layout l1AttributesLayout) error {
 		if !bytes.Equal(slot1[:], data[36:68]) {
@@ -3473,7 +3889,8 @@ func assertL1BlockConsistency(cfg *params.ChainConfig, in *inputCase) error {
 		}
 		// First-Ecotone fallback trap (rollup_cost.go:169-179): blob slot and
 		// BOTH 4-byte scalars all zero would silently select the Bedrock cost
-		// function. Forbidden corpus-wide.
+		// function. Forbidden corpus-wide -- EXCEPT at the Ecotone activation
+		// block, which is handled (and requires exactly this state) above.
 		if slot7 == (common.Hash{}) && isZero(slot3[16:24]) {
 			return fmt.Errorf("first-Ecotone fallback trap: slot7 and both slot3 scalars are all zero")
 		}
@@ -3530,9 +3947,35 @@ func assertL1BlockConsistency(cfg *params.ChainConfig, in *inputCase) error {
 			return err
 		}
 		if !bytes.Equal(slot8[18:20], data[176:178]) {
+			// A2 ladder transition: the FIRST full-format (178B) Jovian block's
+			// PRE still has the DA scalar unset. The preceding Jovian ACTIVATION
+			// block carries the 176B Isthmus form (CalcDAFootprint's activation
+			// branch, rollup_cost.go:568-575) and writes no DA byte, and the
+			// ladder's genesis seeding deliberately does NOT pre-seed a DA value
+			// (genesis is pre-Jovian). This 178B deposit introduces the scalar, so
+			// the Pre mirror cannot hold yet. Gate on a chain whose genesis is
+			// strictly pre-Jovian, so a fork-at-0 Jovian vector that forgot to
+			// seed the DA scalar still fails here.
+			if genesisTime < *cfg.JovianTime && isZero(slot8[18:20]) {
+				return nil
+			}
 			return fmt.Errorf("slot8[18:20] (daFootprintGasScalar) %x != calldata[176:178] %x", slot8[18:20], data[176:178])
 		}
 		return nil
+	case firstIsthmusBlock && len(data) == 164 && bytes.Equal(data[0:4], types.EcotoneL1AttributesSelector):
+		// Task 5 (A2), symmetric to the Ecotone S7 exception above: the FIRST
+		// ISTHMUS block still carries the pre-Isthmus (Ecotone 164B) attributes
+		// form because the L1Block upgrade lands later in the block. op-geth
+		// accepts it by selector (extractL1GasParams, rollup_cost.go:410-415,
+		// "edge case: for the very first Isthmus block we still need to use the
+		// Ecotone function") and the generator's parent-layout rule emits exactly
+		// this form (ladder_chain.go). Validate the Ecotone slot mirror; the
+		// operator-fee slot-8 segment does not exist yet and is not checked (the
+		// next, full-format Isthmus block introduces it -- its own default-branch
+		// checkCommon covers it). The alternative -- making the generator emit
+		// the 176B Isthmus form here -- would deviate from op-node and from
+		// op-geth's activation-block semantics.
+		return checkCommon(layoutEcotone)
 	case layout == layoutEcotone:
 		// Ecotone/Fjord/Granite/Holocene: exactly 164B with the Ecotone
 		// selector and NO operator-fee/DA segment. extractL1GasParamsPostEcotone
@@ -3543,6 +3986,21 @@ func assertL1BlockConsistency(cfg *params.ChainConfig, in *inputCase) error {
 		}
 		if !bytes.Equal(data[0:4], types.EcotoneL1AttributesSelector) {
 			return fmt.Errorf("Ecotone-family attributes selector mismatch: got %x", data[0:4])
+		}
+		// A2 first-format transition: on a chain whose genesis is pre-Ecotone,
+		// the FIRST block carrying the 164B Ecotone form runs it because the
+		// L1Block upgrade landed in the previous (activation) block -- that
+		// activation block used the Bedrock 260B form and wrote only slots 1/5/6
+		// (S7 branch above), so the PRE state still has the Ecotone slots unset
+		// and THIS deposit writes them. The strict Pre mirror cannot hold yet.
+		// Gate on (genesis < EcotoneTime <= blockTime) plus the actually-unset
+		// state, so fork-at-0 Ecotone vectors (genesis pre-seeds 3/7) keep the
+		// strict mirror and the fallback-trap guard. The deposit's real effect
+		// is anchored by the post-state assertion in the A2 cross-family smoke
+		// (PostState L1Block slots == l1BlockStorage("ecotone")).
+		if slot7 == (common.Hash{}) && isZero(slot3[16:24]) &&
+			cfg.EcotoneTime != nil && genesisTime < *cfg.EcotoneTime && *cfg.EcotoneTime <= blockTime {
+			return nil
 		}
 		return checkCommon(layoutEcotone)
 	default: // isthmus
@@ -4184,6 +4642,7 @@ func buildExpectedReceipts(cfg *params.ChainConfig, in *inputCase, txs []*types.
 			LogsCount:         len(r.Logs),
 			Output:            hexutil.Encode(outputs[i]),
 		}
+		er.Logs = outputLogsOf(r)
 		if r.DepositNonce != nil {
 			s := hexutil.EncodeUint64(*r.DepositNonce)
 			er.OpDepositNonce = &s

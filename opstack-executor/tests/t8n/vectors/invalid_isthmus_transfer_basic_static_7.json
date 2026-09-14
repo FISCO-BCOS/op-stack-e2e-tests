@@ -57,7 +57,7 @@
     },
     "_op_expected": {
       "reject": {
-        "op_geth": "blobGasUsed must be zero before Jovian (OP Isthmus)",
+        "op_geth": "blob gas used mismatch",
         "fisco": {
           "consumer": "engine",
           "classification": "INVALID",

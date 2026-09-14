@@ -1,0 +1,14 @@
+{
+  "note": "Synthetic activation times for the 9 modeled EL forks; each row must be strictly increasing so a timestamp sweep lands exactly on each activation.",
+  "forks": [
+    {"name": "regolith", "time": 0},
+    {"name": "canyon",   "time": 1000},
+    {"name": "ecotone",  "time": 2000},
+    {"name": "fjord",    "time": 3000},
+    {"name": "granite",  "time": 4000},
+    {"name": "holocene", "time": 5000},
+    {"name": "isthmus",  "time": 6000},
+    {"name": "jovian",   "time": 7000},
+    {"name": "karst",    "time": 8000}
+  ]
+}
