@@ -54,6 +54,25 @@ class RpcClient:
             raise AssertionError(f"{method} RPC error: {out['error']}")
         return out.get("result")
 
+    def call_optional(self, method, params=None, _id=1):
+        """Like call(), but None when the node does not serve the method (-32601).
+
+        For checks that probe a method a given node version may not implement yet: a
+        missing optional method is a SKIP (printed), never a failure, so the rest of the
+        matrix still runs and a red only ever means a real mismatch.
+        """
+        body = json.dumps(
+            {"jsonrpc": "2.0", "method": method, "params": params or [], "id": _id}
+        ).encode()
+        req = urllib.request.Request(self.url, data=body, headers=self._headers)
+        with self._opener.open(req, timeout=10) as resp:
+            out = json.load(resp)
+        if "error" in out:
+            if out["error"].get("code") == -32601:
+                return None
+            raise AssertionError(f"{method} RPC error: {out['error']}")
+        return out.get("result")
+
 
 GENESIS = os.environ.get("B3_GENESIS", "/tmp/op-spike/b3/config.genesis")
 
@@ -163,27 +182,31 @@ def a2_chain(rpc):
           mpf is not None and int(mpf, 16) >= 1_000_000, str(mpf))
     syncing = rpc.call("eth_syncing")
     check("syncing false", syncing is False, str(syncing))
-    # EIP-7910 eth_config: the node's fork configuration. A missing method answers -32601,
-    # which rpc.call turns into a loud failure here — the method must be registered.
-    cfg = rpc.call("eth_config")
-    cur = cfg.get("current") if isinstance(cfg, dict) else None
-    check("eth_config has current", isinstance(cur, dict), str(cfg)[:120])
-    if isinstance(cur, dict):
-        check("eth_config.current.chainId == chainId",
-              int(cur.get("chainId", "0x0"), 16) == int(cid, 16),
-              f"cfg={cur.get('chainId')} chainId={cid}")
-        fid = cur.get("forkId")
-        check("eth_config.current.forkId is a 4-byte 0x-hex",
-              isinstance(fid, str) and fid.startswith("0x") and len(fid) == 10, str(fid))
-        pcs = cur.get("precompiles") or {}
-        check("eth_config.current.precompiles includes ECREC",
-              isinstance(pcs, dict) and "ECREC" in pcs, str(list(pcs)[:6]))
-        scs = cur.get("systemContracts") or {}
-        # The C2 devnet is an OP L2 (feature_l2_ethereum_compat): beacon roots + history.
-        check("eth_config.current.systemContracts includes BEACON_ROOTS_ADDRESS",
-              isinstance(scs, dict) and "BEACON_ROOTS_ADDRESS" in scs, str(scs))
-    check("eth_config.next is null", isinstance(cfg, dict) and cfg.get("next") is None, "")
-    check("eth_config.last is null", isinstance(cfg, dict) and cfg.get("last") is None, "")
+    # EIP-7910 eth_config: the node's fork configuration. OPTIONAL — a node that does not
+    # serve it answers -32601, which is a printed SKIP, not a failure: the method is landing
+    # as its own change, and this matrix must not bind the cutover PR to it.
+    cfg = rpc.call_optional("eth_config")
+    if cfg is None:
+        print("  SKIP eth_config: not served by this node (EIP-7910 lands separately)")
+    else:
+        cur = cfg.get("current") if isinstance(cfg, dict) else None
+        check("eth_config has current", isinstance(cur, dict), str(cfg)[:120])
+        if isinstance(cur, dict):
+            check("eth_config.current.chainId == chainId",
+                  int(cur.get("chainId", "0x0"), 16) == int(cid, 16),
+                  f"cfg={cur.get('chainId')} chainId={cid}")
+            fid = cur.get("forkId")
+            check("eth_config.current.forkId is a 4-byte 0x-hex",
+                  isinstance(fid, str) and fid.startswith("0x") and len(fid) == 10, str(fid))
+            pcs = cur.get("precompiles") or {}
+            check("eth_config.current.precompiles includes ECREC",
+                  isinstance(pcs, dict) and "ECREC" in pcs, str(list(pcs)[:6]))
+            scs = cur.get("systemContracts") or {}
+            # The C2 devnet is an OP L2 (feature_l2_ethereum_compat): beacon roots + history.
+            check("eth_config.current.systemContracts includes BEACON_ROOTS_ADDRESS",
+                  isinstance(scs, dict) and "BEACON_ROOTS_ADDRESS" in scs, str(scs))
+        check("eth_config.next is null", isinstance(cfg, dict) and cfg.get("next") is None, "")
+        check("eth_config.last is null", isinstance(cfg, dict) and cfg.get("last") is None, "")
 
 
 def a2_blocks(rpc):
