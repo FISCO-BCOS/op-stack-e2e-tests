@@ -221,3 +221,9 @@ ladder_1000_69292b10.json
 
 # Phase-3 enhanced corpus (Task 6): corrupt 12 + static 10 + invalid-tx 18 + chain 6 + legacy 2 = 48 vectors (idempotent; §4c item 3/12 excluded — loader 不可表达)
 invalid_jovian_activation_deposits_only.json
+
+# WI-E13 blob/requests static vectors: §4c items 3/12 (bothForks) + the jovian static base, registered once the GoldenSample loader passes engine_newPayloadV4 params[1]/params[3] through
+invalid_isthmus_transfer_basic_static_12.json
+invalid_isthmus_transfer_basic_static_3.json
+invalid_jovian_transfer_basic_static_12.json
+invalid_jovian_transfer_basic_static_3.json

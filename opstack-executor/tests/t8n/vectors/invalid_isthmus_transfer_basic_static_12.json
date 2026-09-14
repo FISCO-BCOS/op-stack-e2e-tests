@@ -38,10 +38,7 @@
       "blockNumber": "0x1",
       "excessBlobGas": "0x0",
       "executionRequests": [
-        {
-          "data": "0xdeadbeef",
-          "type": "0x0"
-        }
+        "0xdeadbeef"
       ],
       "extraData": "0x000000003200000006",
       "feeRecipient": "0x4200000000000000000000000000000000000011",
@@ -63,12 +60,12 @@
     },
     "_op_expected": {
       "reject": {
-        "op_geth": "executionRequests must be absent or empty on the OP path",
+        "op_geth": "requests should be empty for Isthmus blocks",
         "fisco": {
           "consumer": "engine",
           "classification": "INVALID",
           "latest_valid_hash": null,
-          "validation_error_contains": "executionRequests must be absent or empty on the OP path"
+          "validation_error_contains": "executionRequests must be a present-but-empty list on the OP path"
         }
       }
     }

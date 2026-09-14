@@ -13,6 +13,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"math/big"
+	"os"
 	"strings"
 	"testing"
 
@@ -281,6 +282,105 @@ func TestStaticSurfaceAllItemsCarryFiscoMessage(t *testing.T) {
 		if string(rej.Fisco.LatestValidHash) != "null" {
 			t.Fatalf("static item %s: latest_valid_hash want null, got %s", item.name, rej.Fisco.LatestValidHash)
 		}
+	}
+}
+
+// TestStaticBlobFaceAnchors (WI-E13): items 3/12 — the two static faces that were
+// forced out of the manifest while the GoldenSample loader could not express the
+// engine_newPayloadV4 blob/requests parameters — now carry REAL op-geth anchors
+// (no weak fallback) and a loader-expressible WIRE-form payload member.
+func TestStaticBlobFaceAnchors(t *testing.T) {
+	find := func(name string) staticItem {
+		for _, item := range staticSurfaceItems {
+			if item.name == name {
+				return item
+			}
+		}
+		panic("static item not found: " + name)
+	}
+	item3 := find("expectedBlobVersionedHashes_nonempty")
+	item12 := find("executionRequests_nonempty")
+
+	// Item 3: the op-geth anchor is ExecutableDataToBlockNoHash's count mismatch
+	// (beacon/engine/types.go:309) — an L2 payload never carries blob txs, so any
+	// non-empty list can only mismatch. The FISCO anchor is the engine gate's
+	// exact wording (validateOpBlobVersionedHashes).
+	const fisco3 = "expectedBlobVersionedHashes must be an empty array on the OP path"
+	if item3.fiscoMessage != fisco3 {
+		t.Fatalf("item 3 fiscoMessage drifted: %q", item3.fiscoMessage)
+	}
+	if item3.opGethMessage != "invalid number of versionedHashes" {
+		t.Fatalf("item 3 op_geth anchor must be the real ExecutableDataToBlockNoHash wording, got %q", item3.opGethMessage)
+	}
+	if got := opGethAnchor(item3); got != item3.opGethMessage {
+		t.Fatalf("item 3 must anchor hard (no weak fallback), got %q", got)
+	}
+
+	// Item 12: the op-geth anchor is ExecutableDataToBlockNoHash's Isthmus
+	// requests gate (beacon/engine/types.go:344); the FISCO anchor is the V4
+	// window gate's exact wording (validateOpPayloadWindowFields). The mutated
+	// payload member must be WIRE-form (a list of hex byte strings) — the
+	// engine_newPayloadV4 params[3] shape both parseNewPayloadRequest and
+	// convertRequests read.
+	const fisco12 = "executionRequests must be a present-but-empty list on the OP path"
+	if item12.fiscoMessage != fisco12 {
+		t.Fatalf("item 12 fiscoMessage must match FISCO's V4 window gate verbatim, got %q", item12.fiscoMessage)
+	}
+	if item12.opGethMessage != "requests should be empty for Isthmus blocks" {
+		t.Fatalf("item 12 op_geth anchor must be the real ExecutableDataToBlockNoHash wording, got %q", item12.opGethMessage)
+	}
+	if got := opGethAnchor(item12); got != item12.opGethMessage {
+		t.Fatalf("item 12 must anchor hard (no weak fallback), got %q", got)
+	}
+	base, err := buildCaseFromSpecs("transfer_basic", "isthmus")
+	if err != nil {
+		t.Fatalf("buildCaseFromSpecs: %v", err)
+	}
+	bv, err := buildBlockVector(&base)
+	if err != nil {
+		t.Fatalf("buildBlockVector: %v", err)
+	}
+	payload := buildBasePayload(bv)
+	if err := item12.mutate(payload); err != nil {
+		t.Fatalf("item 12 mutate: %v", err)
+	}
+	reqs, ok := payload["executionRequests"].([]string)
+	if !ok || len(reqs) != 1 || reqs[0] != "0xdeadbeef" {
+		t.Fatalf("item 12 payload member must be wire-form [\"0xdeadbeef\"], got %#v", payload["executionRequests"])
+	}
+}
+
+// TestStaticJovianBaseEmitsForkIndependentFacesOnly (WI-E13): --mode=static with the
+// jovian base emits ONLY the fork-independent faces (items 3/12) plus item 11 (which keys
+// to the jovian base on its own). The isthmus-anchored items 1..10 must NOT be re-emitted
+// under a jovian base — their FISCO/op-geth anchors are fork-dependent (9B vs 17B
+// extraData; pre-Jovian blobGasUsed zero vs the Jovian DA equality gate; rawTransactions
+// gate vs the Jovian DA footprint gate on an empty body).
+func TestStaticJovianBaseEmitsForkIndependentFacesOnly(t *testing.T) {
+	outDir := t.TempDir()
+	if err := runInvalidMode("static", "jovian_transfer_basic", outDir, "testcommit"); err != nil {
+		t.Fatalf("runInvalidMode(static, jovian_transfer_basic): %v", err)
+	}
+	entries, err := os.ReadDir(outDir)
+	if err != nil {
+		t.Fatalf("ReadDir: %v", err)
+	}
+	got := map[string]bool{}
+	for _, e := range entries {
+		got[e.Name()] = true
+	}
+	want := []string{
+		"invalid_jovian_transfer_basic_static_3.json",
+		"invalid_jovian_transfer_basic_static_11.json",
+		"invalid_jovian_transfer_basic_static_12.json",
+	}
+	for _, w := range want {
+		if !got[w] {
+			t.Fatalf("jovian static base must emit %s, got %v", w, got)
+		}
+	}
+	if len(got) != len(want) {
+		t.Fatalf("jovian static base must emit exactly %v, got %v", want, got)
 	}
 }
 

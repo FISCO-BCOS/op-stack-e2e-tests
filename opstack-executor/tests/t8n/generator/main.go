@@ -2944,6 +2944,18 @@ func runInvalidMode(mode, baseStem, outDir, opGethCommit string) error {
 				b = jovBase
 				stemBase = "jovian_transfer_basic"
 			}
+			// WI-E13: the jovian base emits only the fork-INDEPENDENT faces (items
+			// 3/12 — the engine_newPayloadV4 expectedBlobVersionedHashes /
+			// executionRequests lists; item 11 keys to the jovian base on its own).
+			// The isthmus-anchored items 1..10 keep their single isthmus variant:
+			// their FISCO/op-geth anchors are fork-DEPENDENT (item 10: 9B vs 17B
+			// extraData; item 7: pre-Jovian blobGasUsed zero vs the Jovian DA
+			// equality gate; item 1: rawTransactions gate vs the Jovian DA
+			// footprint gate on an empty body), so re-emitting them under a jovian
+			// base would need a second anchor per item without adding coverage.
+			if stemBase == "jovian_transfer_basic" && item.fork != "jovian" && item.n != 3 && item.n != 12 {
+				continue
+			}
 			doc, err := emitStaticSurfaceVector(b, item)
 			if err != nil {
 				return fmt.Errorf("static %s: %w", item.name, err)
@@ -3559,9 +3571,10 @@ func captureInsertChainRejection(genesis *core.Genesis, block *types.Block) (str
 
 // staticItem is one §4c static-validation malformation. mutate rewrites the
 // base payload; fiscoMessage is the EXACT substring the FISCO
-// validateOpNewPayloadRequest (EngineServiceImpl.cpp:310-508) returns, which the
-// E2E runner asserts via validation_error_contains. fork selects the base block
-// (isthmus|jovian) -- item 11 (Jovian DA footprint) needs a Jovian base.
+// validateOpNewPayloadRequest (OpEngineService.cpp validateOpNewPayloadRequest)
+// returns, which the E2E runner asserts via validation_error_contains. fork
+// selects the base block (isthmus|jovian) -- item 11 (Jovian DA footprint) needs
+// a Jovian base.
 type staticItem struct {
 	n            int
 	name         string
@@ -3573,11 +3586,15 @@ type staticItem struct {
 	// _op_test_vectors.generator_commit. Format verbs are truncated at the first
 	// verb (both anchors are consumed as substrings). Empty means op-geth has no
 	// counterpart surface for the item -- the field is FISCO-only
-	// (rawTransactions, expectedBlobVersionedHashes), or op-geth accepts the shape
-	// (executionRequests may be non-empty post-Prague). emitStaticSurfaceVector
-	// then falls back to fiscoMessage, the corpus's documented weak anchor
-	// (main_test.go:741). Per-item pins against op-geth e8800cffe53d:
+	// (rawTransactions). emitStaticSurfaceVector then falls back to fiscoMessage,
+	// the corpus's documented weak anchor (main_test.go:741). Per-item pins
+	// against op-geth e8800cffe53d:
 	//   item 2  eth/catalyst/api_optimism.go:17   checkOptimismPayload
+	//   item 3  beacon/engine/types.go:309        ExecutableDataToBlockNoHash
+	//                                             (WI-E13: an L2 payload never
+	//                                             carries blob txs, so any
+	//                                             non-empty versionedHashes list
+	//                                             is a count mismatch)
 	//   item 4  eth/catalyst/api.go:754           NewPayloadV4 param check
 	//   item 5  core/block_validator.go:190       post-Isthmus withdrawals root
 	//   item 7  core/block_validator.go:111       Cancun blob-gas branch (derived:
@@ -3587,18 +3604,25 @@ type staticItem struct {
 	//   item 11 core/block_validator.go:129       equality gate; the range gate at
 	//                                             :132 reads "DA footprint %d
 	//                                             exceeds block gas limit %d"
+	//   item 12 beacon/engine/types.go:344        ExecutableDataToBlockNoHash
+	//                                             (WI-E13: requests non-empty is
+	//                                             rejected for Isthmus blocks
+	//                                             before the requestsHash is
+	//                                             computed)
 	opGethMessage string
 }
 
-// staticSurfaceItems enumerates the 12 §4c items. ⚠️ Expressibility through the
+// staticSurfaceItems enumerates the 12 §4c items. Expressibility through the
 // Task 2 loader (GoldenSample.h makeInvalidParamsJson) + parseNewPayloadRequest
-// is the constraint that decides whether an item actually reaches its FISCO
-// message in the E2E runner:
+// decides whether an item reaches its FISCO message in the E2E runner:
 //   - items 3 (expectedBlobVersionedHashes non-empty) and 12 (executionRequests
-//     non-empty) CANNOT be expressed: the loader hardcodes params[1] = [] and
-//     parseNewPayloadRequest never parses executionRequests. They are emitted
-//     per the brief but must NOT be manifest-registered until the loader/RPC
-//     parse is extended (see task-3-report).
+//     non-empty) were historically FORCED out of the manifest because the loader
+//     hardcoded params[1] = [] / params[3] = []. WI-E13 extended the loader to
+//     pass both members of _op_payload through to the engine_newPayloadV4
+//     params, so they are now manifest-registered like the rest of the face
+//     (item 12's payload member carries the WIRE form -- a hex byte string per
+//     request, exactly what parseNewPayloadRequest's parseHexBytesField reads;
+//     the EL-requests {type,data} object form never existed on this surface).
 //   - item 1 (rawTransactions missing) is expressed as `transactions: null`
 //     (NOT omission -- the loader substitutes an empty array for a missing
 //     member, which would convert the case into a blockHash mismatch).
@@ -3618,7 +3642,7 @@ var staticSurfaceItems = []staticItem{
 	{3, "expectedBlobVersionedHashes_nonempty", "isthmus", func(p map[string]interface{}) error {
 		p["expectedBlobVersionedHashes"] = []string{"0x0000000000000000000000000000000000000000000000000000000000000001"}
 		return nil
-	}, "expectedBlobVersionedHashes must be an empty array on the OP path", ""},
+	}, "expectedBlobVersionedHashes must be an empty array on the OP path", "invalid number of versionedHashes"},
 	{4, "parentBeaconBlockRoot_missing", "isthmus", func(p map[string]interface{}) error {
 		delete(p, "parentBeaconBlockRoot")
 		return nil
@@ -3658,11 +3682,15 @@ var staticSurfaceItems = []staticItem{
 		return nil
 	}, "invalid DA footprint in blobGasUsed field", "invalid DA footprint in blobGasUsed field"},
 	{12, "executionRequests_nonempty", "isthmus", func(p map[string]interface{}) error {
-		p["executionRequests"] = []map[string]interface{}{
-			{"type": "0x0", "data": "0xdeadbeef"},
-		}
+		// WIRE form (WI-E13): engine_newPayloadV4 params[3] is a list of hex byte
+		// strings -- one opaque request per element -- which is exactly what
+		// FISCO's parseNewPayloadRequest (parseHexBytesField) and op-geth's
+		// convertRequests read. The former {type,data} object form was the
+		// EL-requests receipt shape, never legal on this surface, and made the
+		// element unparseable on both sides.
+		p["executionRequests"] = []string{"0xdeadbeef"}
 		return nil
-	}, "executionRequests must be absent or empty on the OP path", ""},
+	}, "executionRequests must be a present-but-empty list on the OP path", "requests should be empty for Isthmus blocks"},
 }
 
 // buildBasePayload assembles the FULL valid payload of a base block (all base

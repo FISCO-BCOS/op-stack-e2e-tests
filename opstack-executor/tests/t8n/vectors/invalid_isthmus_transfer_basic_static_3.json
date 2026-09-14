@@ -60,7 +60,7 @@
     },
     "_op_expected": {
       "reject": {
-        "op_geth": "expectedBlobVersionedHashes must be an empty array on the OP path",
+        "op_geth": "invalid number of versionedHashes",
         "fisco": {
           "consumer": "engine",
           "classification": "INVALID",
