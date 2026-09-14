@@ -186,3 +186,38 @@ op-batcher --l1-eth-rpc http://127.0.0.1:8545 --l2-eth-rpc http://127.0.0.1:9545
 - 产物：`/tmp/d3-run/artifacts/{genesis.json,rollup.json,l1-chain-config.json}`；intent：`/tmp/d3-deployer/intent.toml`；state：`/tmp/d3-deployer/state.json`
 - 日志：`/tmp/d3-run/logs/{anvil,geth,opnode,batcher,deployer-apply,forge-*}.log`
 - 分析脚本：`/tmp/d3-run/analyze.py`（逐激活块计数）、`/tmp/d3-run/analyze2.py`（布局切换与升级交易明细）
+
+---
+
+# 可插拔交易源执行器 `txsource`（P1-3）
+
+状态：**已完成（2026-09-14）**。交付目录 `tools/devnet/txsource/`（契约/用法/测试详见其
+`txsource/README.md`）。runner = per-segment 调度（方案 A 全量轮）+ L1 资金桥 + settle；
+单测用假 JSON-RPC 桩覆盖段边界/每段恰好一轮/激活块跳过/missed/settle 失败/插件失败/target
+退出（18/18 绿）；真实 devnet 端到端跑通单段全通路（资金桥 L1→L2、插件 3 笔转账、报告、
+safe 追平 unsafe）。
+
+## 定案与实测发现
+
+1. **段表权威 = rollup.json**：段 = bedrock（genesis.l2_time 起）+ 每个 `<fork>_time`；
+   激活块号 = ⌈(fork_time − l2_time)/block_time⌉（delta 奇数偏移 1875 → 938）。不读
+   devnet.toml 的 forks 表（那是输入，rollup.json 是生效值）。
+2. **中途加入语义**：runner 启动头之前的段标记 missed 不补轮（链史已定型）；当前段照常
+   触发一轮。本 devnet fork 绝对时间锚定 toml 固定时间戳，jovian 边界 = 墙钟约 11:19 UTC
+   2026-09-14；`up` 完成时若已过该时刻则只能观察到 jovian 段（全段覆盖需 up 后立即接入
+   runner，或桩演示多段语义）。
+3. **资金桥必须走 L1 Portal 存款**：intent `fundDevAccounts = false` ⇒ anvil 账户 L2 余额
+   全为 0（实测 key0/key9）。runner 每轮经 `OptimismPortal.depositTransaction` 存入确定性
+   金额，轮询 L2 余额到账后才触发插件。
+4. **Portal2 ABI 踩坑**：`depositTransaction` 的 gasLimit 参数是 **uint64**
+   （selector `0xe9e05c42`）；按 uint256 编码（`0xfa92670c`）dispatcher 不识别，报空
+   revert（`execution reverted, data "0x"`），gas 估算阶段就失败。
+5. **op-geth `--rollup.sequencerhttp` 踩坑（重大，P1-3 发现并修正）**：op-geth 的
+   `SendTx` 在该旗标存在时把用户 raw tx **转发**到指定端点（`eth/api_backend.go`）；
+   P1-1/P1-2 的启动线把它指向 op-node(9546)，而 op-node 没有 `eth_sendRawTransaction`
+   （-32601）→ 用户经 RPC 向 L2 发交易整条不可用（估算都过不去的是 depositTransaction L1
+   侧；L2 侧 cast send 直接 -32601）。修正：geth 启动线删去该旗标（单 sequencer 语义 =
+   交易进本地 txpool，由本节点 sequencer 出块），down/up 后 genesis hash 仍幂等。
+   **不修则 Task 4 的 bcos-testing（hardhat 发 raw tx）无法工作。**
+6. **settle 实测**：轮末快照 unsafe，op-node `optimism_syncStatus`（snake_case
+   safe_l2/unsafe_l2）轮询 safe 追平，batcher 生效下数秒内完成。

@@ -276,7 +276,11 @@ json.dump(s, open(p, 'w'))"
     --authrpc.port "$P_GETH_AUTH" --authrpc.jwtsecret "$RUN/jwt.txt" \
     --ws --ws.port "$P_GETH_WS" \
     --gcmode archive --syncmode full --nodiscover --port 0 \
-    --rollup.disabletxpoolgossip --rollup.sequencerhttp "$OPNODE_RPC"
+    --rollup.disabletxpoolgossip
+  # 注意：不给 --rollup.sequencerhttp。op-geth 的 SendTx 在该旗标存在时把用户 raw tx
+  # 转发到指定端点（eth/api_backend.go SendTx）；单节点 devnet 指向 op-node 时转发必败
+  # （op-node 无 eth_sendRawTransaction，-32601），用户 RPC 发交易整条不可用（P1-3 实测）。
+  # 单 sequencer 语义 = 用户交易进本地 txpool，由本节点 sequencer 出块。
   wait_rpc "$L2_HTTP" 30 || { tail_log "$LOGS/geth.log" 40; die "geth HTTP not ready on $P_GETH_HTTP"; }
   wait_listen "$P_GETH_AUTH" 10 || { tail_log "$LOGS/geth.log" 40; die "geth authrpc not listening on $P_GETH_AUTH"; }
   wait_listen "$P_GETH_WS" 10 || { tail_log "$LOGS/geth.log" 40; die "geth ws not listening on $P_GETH_WS"; }
