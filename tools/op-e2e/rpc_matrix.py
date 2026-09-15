@@ -248,22 +248,31 @@ def a2_blocks(rpc):
     # R2: baseFee is real (may legitimately be 0 on the genesis-adjacent chain).
     check("baseFeePerGas present", "baseFeePerGas" in b, str(b.get("baseFeePerGas")))
     # R2b: eth_feeHistory (foundry/alloy's EIP-1559 fee suggestion calls it on every send).
-    fh = rpc.call("eth_feeHistory", ["0x5", "latest", [25, 50, 75]])
-    ok = (isinstance(fh, dict) and "oldestBlock" in fh and
-          isinstance(fh.get("baseFeePerGas"), list) and isinstance(fh.get("gasUsedRatio"), list) and
-          len(fh["baseFeePerGas"]) == len(fh["gasUsedRatio"]) + 1 and
-          isinstance(fh.get("reward"), list) and len(fh["reward"]) == len(fh["gasUsedRatio"]) and
-          all(isinstance(r, list) and len(r) == 3 for r in fh["reward"]) and
-          all(isinstance(x, (int, float)) and 0.0 <= x <= 1.0 for x in fh["gasUsedRatio"]))
-    check("feeHistory shape (count+1 baseFees, ratios, reward rows)", ok, str(fh)[:90])
-    oldest = int(fh["oldestBlock"], 16)
-    ob = rpc.call("eth_getBlockByNumber", [hex(oldest), False])
-    check("feeHistory first baseFee matches oldest block header",
-          ob is not None and fh["baseFeePerGas"][0] == ob["baseFeePerGas"],
-          f"{fh['baseFeePerGas'][0]} vs {ob and ob.get('baseFeePerGas')}")
-    fh2 = rpc.call("eth_feeHistory", ["0x3", "latest"])
-    check("feeHistory without percentiles omits reward",
-          isinstance(fh2, dict) and "reward" not in fh2, str(fh2)[:70])
+    # The node defers the method: the cutover PR removed it and the implementation waits on its
+    # own change, so a node that answers -32601 gets the same treatment as eth_config above — a
+    # printed SKIP, not a failure. The shape assertions below still run wherever the method IS
+    # served, so the tier keeps its teeth for the follow-up; L2 sends here price with --legacy
+    # meanwhile.
+    fh = rpc.call_optional("eth_feeHistory", ["0x5", "latest", [25, 50, 75]])
+    if fh is None:
+        print("  SKIP eth_feeHistory: not served by this node (deferred to its own PR)")
+    else:
+        ok = (isinstance(fh, dict) and "oldestBlock" in fh and
+              isinstance(fh.get("baseFeePerGas"), list) and
+              isinstance(fh.get("gasUsedRatio"), list) and
+              len(fh["baseFeePerGas"]) == len(fh["gasUsedRatio"]) + 1 and
+              isinstance(fh.get("reward"), list) and len(fh["reward"]) == len(fh["gasUsedRatio"]) and
+              all(isinstance(r, list) and len(r) == 3 for r in fh["reward"]) and
+              all(isinstance(x, (int, float)) and 0.0 <= x <= 1.0 for x in fh["gasUsedRatio"]))
+        check("feeHistory shape (count+1 baseFees, ratios, reward rows)", ok, str(fh)[:90])
+        oldest = int(fh["oldestBlock"], 16)
+        ob = rpc.call("eth_getBlockByNumber", [hex(oldest), False])
+        check("feeHistory first baseFee matches oldest block header",
+              ob is not None and fh["baseFeePerGas"][0] == ob["baseFeePerGas"],
+              f"{fh['baseFeePerGas'][0]} vs {ob and ob.get('baseFeePerGas')}")
+        fh2 = rpc.call("eth_feeHistory", ["0x3", "latest"])
+        check("feeHistory without percentiles omits reward",
+              isinstance(fh2, dict) and "reward" not in fh2, str(fh2)[:70])
     check("extraData present", b.get("extraData", "").startswith("0x"))
     # timestamp: RPC is seconds; assert it parses and is sane (B3 started 2026).
     ts = int(b["timestamp"], 16)

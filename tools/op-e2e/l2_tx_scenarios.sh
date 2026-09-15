@@ -49,7 +49,7 @@ echo "== 1. contract deployment (creation tx, 1559) =="
 # re-parses "--create" as a nested subcommand whose option set contains NO tx flags
 # (--private-key/--rpc-url after it are rejected as unknown arguments), so the
 # incantation below is the only ordering that works on current cast.
-ADDR=$(cast send --private-key "$KEY" --rpc-url "$L2" --chain-id "$CHAIN_ID" \
+ADDR=$(cast send --private-key "$KEY" --legacy --rpc-url "$L2" --chain-id "$CHAIN_ID" \
   --json --create "$BYTECODE" \
   | python3 -c 'import json,sys; print(json.load(sys.stdin)["contractAddress"])')
 echo "  deployed at $ADDR"
@@ -58,9 +58,9 @@ CODE=$(cast code "$ADDR" --rpc-url "$L2")
   || { echo "  [FAIL] code empty after deploy"; exit 1; }
 
 echo "== 2. inc() x2 -> state change through the sequencer path =="
-cast send "$ADDR" "inc()" --private-key "$KEY" --rpc-url "$L2" --chain-id "$CHAIN_ID" > /dev/null
+cast send "$ADDR" "inc()" --private-key "$KEY" --legacy --rpc-url "$L2" --chain-id "$CHAIN_ID" > /dev/null
 N1=$(counter "$ADDR")
-cast send "$ADDR" "inc()" --private-key "$KEY" --rpc-url "$L2" --chain-id "$CHAIN_ID" > /dev/null
+cast send "$ADDR" "inc()" --private-key "$KEY" --legacy --rpc-url "$L2" --chain-id "$CHAIN_ID" > /dev/null
 N2=$(counter "$ADDR")
 [ "$N1" = "1" ] && [ "$N2" = "2" ] \
   && echo "  [ok] counter 0 -> $N1 -> $N2" \
@@ -71,7 +71,7 @@ echo "== 3. boom() always reverts -> tx INCLUDED with status 0 =="
 # reverts — an explicit --gas-limit skips the estimate so the tx actually lands.
 # cast send then exits nonzero on the reverted receipt, so capture with || true and
 # assert on the receipt itself — the WHOLE POINT is that the chain includes it.
-TX=$( { cast send --gas-limit 200000 --private-key "$KEY" --rpc-url "$L2" \
+TX=$( { cast send --gas-limit 200000 --private-key "$KEY" --legacy --rpc-url "$L2" \
     --chain-id "$CHAIN_ID" --json "$ADDR" "boom()" || true; } 2>/dev/null \
   | python3 -c 'import sys,re; m=re.search(r"\"transactionHash\":\"(0x[0-9a-fA-F]{64})\"", sys.stdin.read()); print(m.group(1) if m else "")')
 [ -n "$TX" ] || { echo "  [FAIL] could not extract boom() tx hash"; exit 1; }

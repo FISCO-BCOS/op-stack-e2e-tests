@@ -192,9 +192,11 @@ if [ "${CONTEST:-1}" = "1" ]; then
     "initiateWithdrawal(address,uint256,bytes)" "$DEV1" 100000 0x --value 1ether \
     --from "$DEV1" --rpc-url "$C2_L2_WEB3")
   GAS_LIMIT=$(l2_padded_gas "$GAS_EST")
+  # --legacy: this node serves no eth_feeHistory, and cast's default EIP-1559 fee suggestion
+  # asks for it (eth_gasPrice is what every lane implements).
   TX=$(cast send 0x4200000000000000000000000000000000000016 \
     "initiateWithdrawal(address,uint256,bytes)" "$DEV1" 100000 0x --value 1ether \
-    --private-key "$KEY" --rpc-url "$C2_L2_WEB3" --chain-id "$CHAIN_ID" \
+    --private-key "$KEY" --legacy --rpc-url "$C2_L2_WEB3" --chain-id "$CHAIN_ID" \
     --gas-limit "$GAS_LIMIT" --json \
     | python3 -c 'import json,sys; print(json.load(sys.stdin)["transactionHash"])')
   log "contest withdrawal tx: $TX (gas limit $GAS_LIMIT, estimate $GAS_EST)"
@@ -215,8 +217,9 @@ fi
 # ── phase 4 (optional): rpc_matrix tier-1 against the live instance ───────
 if [ "${MATRIX:-0}" = "1" ]; then
   log "running rpc_matrix tier-1 against the instance"
+  # --legacy for the same reason as the contest leg: the node serves no eth_feeHistory.
   cast send 0x6afa9580383E6627dA926B6f6ed9Ab2B9c8cC693 --value 1ether \
-    --private-key "$KEY" --rpc-url "$C2_L2_WEB3" --chain-id "$CHAIN_ID" > /dev/null
+    --private-key "$KEY" --legacy --rpc-url "$C2_L2_WEB3" --chain-id "$CHAIN_ID" > /dev/null
   B3_ETH_PORT=$EPH_WEB3 B3_ENGINE_PORT=$EPH_ENGINE \
   B3A_JWT="$WORKSPACE/fisco/jwt.hex" \
   B3_GENESIS="$WORKSPACE/fisco/config.genesis" \
