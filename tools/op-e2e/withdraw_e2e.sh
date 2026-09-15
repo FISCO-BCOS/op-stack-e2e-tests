@@ -83,9 +83,13 @@ GAS_EST=$(cast estimate 0x4200000000000000000000000000000000000016 \
 # shellcheck source=l2_gas.sh
 source "$(dirname "$0")/l2_gas.sh"
 GAS_LIMIT=$(l2_padded_gas "$GAS_EST")
+# The node does not implement eth_feeHistory (deferred to the follow-up PR that carries it;
+# the implementation lives on FISCO-BCOS/FISCO-BCOS's feat/fee-history-eip1559), and cast's
+# EIP-1559 fee suggestion calls it on every send. Price L2 transactions from eth_gasPrice,
+# which every lane implements: --legacy is that choice, spelled out.
 TX=$(cast send 0x4200000000000000000000000000000000000016 \
   "initiateWithdrawal(address,uint256,bytes)" "$DEV1" 100000 0x --value 1ether \
-  --private-key "$KEY" --rpc-url "$L2" --chain-id "$CHAIN_ID" --gas-limit "$GAS_LIMIT" --json \
+  --private-key "$KEY" --legacy --rpc-url "$L2" --chain-id "$CHAIN_ID" --gas-limit "$GAS_LIMIT" --json \
   | python3 -c 'import json,sys; print(json.load(sys.stdin)["transactionHash"])')
 echo "withdrawal tx: $TX (gas limit $GAS_LIMIT, estimate $GAS_EST)"
 assert_l2_receipt_ok "$TX" "$L2"
@@ -111,7 +115,7 @@ PY
 
 # No clock warps were used, so the sequencer must still accept txs after the
 # full claim — this is the regression guard for the 裁决 8 failure mode.
-cast send "$DEV1" --value 0.001ether --private-key "$KEY" \
+cast send "$DEV1" --value 0.001ether --private-key "$KEY" --legacy \
   --rpc-url "$L2" --chain-id "$CHAIN_ID" > /dev/null
 echo "POST-CLAIM TX OK — sequencer healthy after claim (no clock warps used)"
 echo "E2E ALL GREEN"

@@ -63,7 +63,7 @@ GAS_EST=$(cast estimate "$L2_XDM" "sendMessage(address,bytes,uint32)" \
 GAS_LIMIT=$(l2_padded_gas "$GAS_EST")
 TX=$(cast send "$L2_XDM" "sendMessage(address,bytes,uint32)" \
   "$RECIPIENT" 0x 100000 --value "$AMT" \
-  --private-key "$KEY" --rpc-url "$L2" --chain-id "$CHAIN_ID" \
+  --private-key "$KEY" --legacy --rpc-url "$L2" --chain-id "$CHAIN_ID" \
   --gas-limit "$GAS_LIMIT" --json \
   | python3 -c 'import json,sys; print(json.load(sys.stdin)["transactionHash"])')
 log "sendMessage tx: $TX (gas limit $GAS_LIMIT, estimate $GAS_EST)"
