@@ -27,6 +27,29 @@
 //     a ~128-block recent-state window) → pre (full genesis state) + postState
 //     dumps (boundary sampling by default)
 //
+// accountRange completeness (P3-1b fix): the dump call passes incompletes=true
+// (this op-geth pin maps it to DumpConfig.OnlyWithAddresses=false) so accounts
+// WITHOUT address preimages are included — under the hash state scheme that is
+// the entire genesis alloc minus execution-touched accounts, and dropping them
+// (the old incompletes=false behavior) silently removed the predeploy
+// implementation contracts from `pre` (12 of ~2340 accounts exported). Two
+// hash-scheme consequences are repaired state-side, not by the RPC:
+//
+//   - unaddressed accounts come back keyed "pre(0x<addrHash>)" (core/state/
+//     dump.go OnAccount); they are resolved via keccak256(addr)==addrHash
+//     against the --genesis alloc addresses (preimage-less ⇒ never
+//     execution-written ⇒ must be a genesis account). Unresolvable keys are a
+//     hard error, never a silent drop.
+//   - storage slots without storage-key preimages are dropped by the dump
+//     (dump.go `key == nil → continue`) for EVERY account, and preimage-less
+//     accounts additionally dump storage against the zero address. Invariant
+//     making the join exact: any slot whose value differs from genesis was
+//     execution-written, and execution records storage-key preimages
+//     (rawdb.WritePreimages), so it appears in the dump with its raw key.
+//     Therefore storage = genesis-alloc slots ∪ dump slots (dump wins) is the
+//     complete slot set; the OpT8nReplay postState bidirectional compare
+//     (want=0x0 vs got≠0 on a missed slot) is the acceptance gate.
+//
 // Emission rules mirror opstack-executor/tests/t8n/generator (main.go
 // buildExpectedReceipts + assembleOutput) exactly:
 //   - nil-able receipt fields → absent keys (omitempty semantics)
@@ -68,7 +91,6 @@ package main
 import (
 	"bytes"
 	"crypto/sha256"
-	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"flag"
@@ -81,6 +103,9 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/crypto"
 )
 
 // ----------------------------------------------------------------------------
@@ -276,6 +301,28 @@ func canonQty(s string) (string, error) {
 		return "", err
 	}
 	return hexQtyBig(v), nil
+}
+
+// canonSlotValue re-emits a storage slot VALUE as exactly 32 bytes of hex
+// ("0x" + 64 lowercase digits): the replayer parses slot values as bytes32
+// (evmc::from_hex rejects odd-length — minimal hex like "0x123" would throw).
+// Input is raw hex with an OPTIONAL 0x prefix: dump values arrive without it
+// (common.Bytes2Hex), genesis-alloc values usually with it. Slot KEYS go
+// through canonHash (already fixed-width).
+func canonSlotValue(s string) (string, error) {
+	h := strings.ToLower(strings.TrimPrefix(s, "0x"))
+	if h == "" {
+		h = "0"
+	}
+	v, ok := new(big.Int).SetString(h, 16)
+	if !ok {
+		return "", fmt.Errorf("not a hex quantity: %q", s)
+	}
+	h = v.Text(16)
+	if len(h) > 64 {
+		return "", fmt.Errorf("slot value exceeds 32 bytes: %q", s)
+	}
+	return "0x" + strings.Repeat("0", 64-len(h)) + h, nil
 }
 
 func canonHash(s string) (string, error) {
@@ -622,14 +669,16 @@ func main() {
 	workers := flag.Int("workers", 8, "parallel RPC block-fetch workers")
 	gethCommit := flag.String("op-geth-commit", "unknown", "op-geth pin recorded into _op_test_vectors.generator_commit")
 	dumpWorkers := flag.Int("dump-workers", 4, "parallel state-dump workers")
+	genesisPath := flag.String("genesis", "/tmp/opdevnet/artifacts/genesis.json",
+		"geth genesis file whose alloc resolves preimage-less dump keys and backfills storage slots")
 	flag.Parse()
-	if err := run(*rpcURL, *rollupPath, *outDir, *poststate, *workers, *dumpWorkers, *gethCommit); err != nil {
+	if err := run(*rpcURL, *rollupPath, *outDir, *poststate, *workers, *dumpWorkers, *gethCommit, *genesisPath); err != nil {
 		fmt.Fprintf(os.Stderr, "chainexport: FAIL: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func run(rpcURL, rollupPath, outDir, poststate string, workers, dumpWorkers int, gethCommit string) error {
+func run(rpcURL, rollupPath, outDir, poststate string, workers, dumpWorkers int, gethCommit, genesisPath string) error {
 	if outDir == "" {
 		return fmt.Errorf("--out-dir is required")
 	}
@@ -818,11 +867,59 @@ func run(rpcURL, rollupPath, outDir, poststate string, workers, dumpWorkers int,
 	}
 
 	// ---- pre: full genesis state (block 0 dump) -------------------------------
+	join, err := loadStateJoin(genesisPath)
+	if err != nil {
+		return err
+	}
 	fmt.Fprintf(os.Stderr, "chainexport: dumping pre (genesis state)...\n")
-	preDump, err := dumpState(client, 0)
+	preDump, err := dumpState(client, 0, join)
 	if err != nil {
 		return fmt.Errorf("genesis state dump (pre): %w (devnet geth must run --state.scheme hash --gcmode archive)", err)
 	}
+	// Genesis self-check: the block-0 dump (all accounts, preimage-less ones
+	// resolved via this very alloc) must reproduce the alloc's non-empty
+	// account set field-for-field. A mismatch means --genesis is not the
+	// genesis the running chain was inited with — refuse to emit a vector
+	// whose `pre` silently misrepresents reality.
+	if len(preDump) != len(join.alloc) {
+		return fmt.Errorf("genesis self-check: dump accounts %d != alloc accounts %d (--genesis mismatch?)", len(preDump), len(join.alloc))
+	}
+	var missing, extra []string
+	for addr := range join.alloc {
+		if _, ok := preDump[addr]; !ok {
+			missing = append(missing, addr)
+		}
+	}
+	for addr := range preDump {
+		if _, ok := join.alloc[addr]; !ok {
+			extra = append(extra, addr)
+		}
+	}
+	if len(missing) > 0 || len(extra) > 0 {
+		return fmt.Errorf("genesis self-check: alloc accounts missing from dump %v; dump keys not in alloc %v (--genesis mismatch?)", missing, extra)
+	}
+	for addr, want := range join.alloc {
+		got, ok := preDump[addr]
+		if !ok {
+			return fmt.Errorf("genesis self-check: alloc account %s missing from dump", addr)
+		}
+		if got.Balance != want.Balance || got.Nonce != want.Nonce || got.Code != want.Code {
+			return fmt.Errorf("genesis self-check: account %s fields differ from alloc (bal %s/%s nonce %s/%s code %d/%d bytes)",
+				addr, got.Balance, want.Balance, got.Nonce, want.Nonce, len(got.Code), len(want.Code))
+		}
+		for slot, wantVal := range want.Storage {
+			gotVal, ok := got.Storage[slot]
+			if !ok {
+				return fmt.Errorf("genesis self-check: account %s slot %s missing from dump join", addr, slot)
+			}
+			gn, _ := parseQty(gotVal)
+			wn, _ := parseQty(wantVal)
+			if gn.Cmp(wn) != 0 {
+				return fmt.Errorf("genesis self-check: account %s slot %s value %s != alloc %s", addr, slot, gotVal, wantVal)
+			}
+		}
+	}
+	fmt.Fprintf(os.Stderr, "chainexport: genesis self-check OK (%d accounts, storage join verified)\n", len(preDump))
 	doc.Blocks[0].Pre = preFromDump(preDump)
 
 	// ---- postState dumps -------------------------------------------------------
@@ -837,7 +934,7 @@ func run(rpcURL, rollupPath, outDir, poststate string, workers, dumpWorkers int,
 			defer dwg.Done()
 			dsem <- struct{}{}
 			defer func() { <-dsem }()
-			st, err := dumpState(client, uint64(blockNum+1)) // state AFTER 0-based block idx = state at block idx+1
+			st, err := dumpState(client, uint64(blockNum+1), join) // state AFTER 0-based block idx = state at block idx+1
 			dmu.Lock()
 			defer dmu.Unlock()
 			if err != nil && dumpErr == nil {
@@ -1534,6 +1631,12 @@ type dumpAccount struct {
 	Nonce   json.Number       `json:"nonce"`             // number
 	Code    string            `json:"code"`              // "0x..." (may be absent)
 	Storage map[string]string `json:"storage"`           // "0x<slot>" → hex WITHOUT 0x prefix
+	// AddressHash (dump.go sets it for EVERY account, addressed or not). Used
+	// as the pagination seek position: resuming from the dump's own `next`
+	// cursor loses the account AT the cursor (tr.Iterator.Next() advances past
+	// the seek node), so we re-seek to the last EMITTED account instead —
+	// skipping it on resume is correct because it was already emitted.
+	Key string `json:"key"`
 }
 
 type dumpResult struct {
@@ -1544,20 +1647,136 @@ type dumpResult struct {
 	Next *string `json:"next"`
 }
 
+// stateJoin repairs the two hash-scheme consequences of a preimage-less dump
+// (see the header comment "accountRange completeness"):
+//   - addrByTrieKey resolves "pre(0x<addrHash>)" dump keys back to addresses
+//     via keccak256(addr)==addrHash over the --genesis alloc (a preimage-less
+//     account was never execution-written, hence must be a genesis account);
+//   - allocStorage carries the alloc's raw storage slots so the merge in
+//     dumpState can backfill slots the dump drops (no storage-key preimage).
+type stateJoin struct {
+	addrByTrieKey map[common.Hash]string
+	alloc         map[string]postAccount // canonical lowercase addr → alloc account
+}
+
+// genesisFile mirrors the geth genesis JSON subset we consume.
+type genesisFile struct {
+	Alloc map[string]struct {
+		Balance string            `json:"balance"`
+		Nonce   string            `json:"nonce"`
+		Code    string            `json:"code"`
+		Storage map[string]string `json:"storage"`
+	} `json:"alloc"`
+}
+
+// loadStateJoin parses the geth genesis file and builds the trie-key reverse
+// map. Alloc keys may carry "0x" or not (geth tolerates both); storage values
+// are right-padded quantities in the wild, normalized to minimal hex here.
+func loadStateJoin(path string) (*stateJoin, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("genesis alloc: %w", err)
+	}
+	var g genesisFile
+	if err := json.Unmarshal(data, &g); err != nil {
+		return nil, fmt.Errorf("genesis alloc: %w", err)
+	}
+	join := &stateJoin{
+		addrByTrieKey: make(map[common.Hash]string, len(g.Alloc)),
+		alloc:         make(map[string]postAccount, len(g.Alloc)),
+	}
+	for key, acc := range g.Alloc {
+		ks := strings.ToLower(strings.TrimPrefix(key, "0x"))
+		if len(ks) != 40 {
+			return nil, fmt.Errorf("genesis alloc: bad address %q", key)
+		}
+		addrRaw, err := hex.DecodeString(ks)
+		if err != nil {
+			return nil, fmt.Errorf("genesis alloc: bad address %q: %w", key, err)
+		}
+		var addrBytes common.Address
+		copy(addrBytes[:], addrRaw)
+		// Vector pre/postState key shape (ladder vectors, generator GenesisAlloc
+		// marshaling): "0x" + lowercase hex. canonAddr produces the same shape.
+		join.addrByTrieKey[crypto.Keccak256Hash(addrBytes[:])] = "0x" + ks
+
+		pa := postAccount{}
+		bal, ok := new(big.Int).SetString(strings.TrimPrefix(acc.Balance, "0x"), 16)
+		if !ok {
+			return nil, fmt.Errorf("genesis alloc %s: balance %q not hex", key, acc.Balance)
+		}
+		pa.Balance = hexQtyBig(bal)
+		if acc.Nonce != "" {
+			nn, err := parseQty(acc.Nonce)
+			if err != nil {
+				return nil, fmt.Errorf("genesis alloc %s: nonce: %w", key, err)
+			}
+			if nn.Sign() > 0 {
+				pa.Nonce = hexQtyBig(nn)
+			}
+		}
+		if c := strings.ToLower(acc.Code); c != "" && c != "0x" {
+			pa.Code = c
+		}
+		if len(acc.Storage) > 0 {
+			st := make(map[string]string, len(acc.Storage))
+			for slot, val := range acc.Storage {
+				sh, err := canonHash(slot)
+				if err != nil {
+					return nil, fmt.Errorf("genesis alloc %s: slot %q: %w", key, slot, err)
+				}
+				v, err := canonSlotValue(val)
+				if err != nil {
+					return nil, fmt.Errorf("genesis alloc %s: slot %q value: %w", key, slot, err)
+				}
+				st[sh] = v
+			}
+			pa.Storage = st
+		}
+		join.alloc["0x" + ks] = pa
+	}
+	return join, nil
+}
+
 // dumpState returns the full account set at the state of block `num`
-// (0 = genesis state, the chain replay's `pre`).
-func dumpState(client *rpcClient, num uint64) (map[string]postAccount, error) {
+// (0 = genesis state, the chain replay's `pre`). Preimage-less accounts arrive
+// keyed "pre(0x<addrHash>)" and are resolved through the genesis-alloc join;
+// storage is genesis-alloc slots overlaid with the dump's (execution-recorded,
+// raw-keyed) slots — dump wins. Unresolvable keys are a hard error.
+func dumpState(client *rpcClient, num uint64, join *stateJoin) (map[string]postAccount, error) {
 	out := map[string]postAccount{}
 	start := "0x"
+	dropPrev := "" // the address expected to be re-emitted at the next page head
 	for page := 0; ; page++ {
 		var res dumpResult
-		if err := client.call(&res, "debug_accountRange", hexQtyU64(num), start, 256, false, false, false); err != nil {
+		// nocode=false, nostorage=false, incompletes=true (→
+		// DumpConfig.OnlyWithAddresses=false): include preimage-less accounts.
+		if err := client.call(&res, "debug_accountRange", hexQtyU64(num), start, 256, false, false, true); err != nil {
 			return nil, err
 		}
 		for key, acc := range res.Accounts {
-			addr, err := canonAddr(key) // dump keys are EIP-55 checksummed
-			if err != nil {
-				return nil, fmt.Errorf("dump key %q: %w", key, err)
+			var addr string
+			if strings.HasPrefix(key, "pre(") && strings.HasSuffix(key, ")") {
+				h, err := canonHash(key[len("pre(") : len(key)-1])
+				if err != nil {
+					return nil, fmt.Errorf("dump preimage-less key %q: %w", key, err)
+				}
+				a, ok := join.addrByTrieKey[common.HexToHash(h)]
+				if !ok {
+					return nil, fmt.Errorf("dump: unresolvable preimage-less key %s "+
+						"(not a --genesis alloc address; a non-genesis account lost its preimage?)", key)
+				}
+				addr = a
+			} else {
+				a, err := canonAddr(key) // dump keys are EIP-55 checksummed
+				if err != nil {
+					return nil, fmt.Errorf("dump key %q: %w", key, err)
+				}
+				addr = a
+			}
+			if addr == dropPrev {
+				dropPrev = "" // expected boundary re-emission; drop once
+				continue
 			}
 			if _, dup := out[addr]; dup {
 				return nil, fmt.Errorf("dump: duplicate account %s across pages", addr)
@@ -1585,12 +1804,28 @@ func dumpState(client *rpcClient, num uint64) (map[string]postAccount, error) {
 					if err != nil {
 						return nil, fmt.Errorf("dump %s: storage slot %q: %w", addr, slot, err)
 					}
-					// dump values are hex WITHOUT the 0x prefix (common.Bytes2Hex)
-					v := "0x" + strings.ToLower(val)
-					if v == "0x" {
-						v = "0x0"
+					// dump values are hex WITHOUT the 0x prefix (common.Bytes2Hex,
+					// already 64 digits); normalize through canonSlotValue anyway
+					// so both join sources share one fixed-width shape.
+					v, err := canonSlotValue(val)
+					if err != nil {
+						return nil, fmt.Errorf("dump %s: storage slot %s value: %w", addr, sh, err)
 					}
 					st[sh] = v
+				}
+				pa.Storage = st
+			}
+			// Storage completeness join: backfill the alloc's raw-keyed slots
+			// (dump drops slots without storage-key preimages, and preimage-less
+			// accounts dump storage against the zero address). The dump's own
+			// slots (execution writes carry recorded preimages) win.
+			if ga, inAlloc := join.alloc[addr]; inAlloc && len(ga.Storage) > 0 {
+				st := make(map[string]string, len(ga.Storage)+len(pa.Storage))
+				for slot, val := range ga.Storage {
+					st[slot] = val
+				}
+				for slot, val := range pa.Storage {
+					st[slot] = val
 				}
 				pa.Storage = st
 			}
@@ -1599,11 +1834,27 @@ func dumpState(client *rpcClient, num uint64) (map[string]postAccount, error) {
 		if res.Next == nil || *res.Next == "" || len(res.Accounts) == 0 {
 			break
 		}
-		raw, err := base64.StdEncoding.DecodeString(*res.Next)
-		if err != nil {
-			return nil, fmt.Errorf("dump: bad next cursor %q: %w", *res.Next, err)
+		// Pagination resume: seek to the last EMITTED account's trie key (the
+		// max AddressHash on this page — Accounts is an unordered JSON map).
+		// Empirics (this pin): a nodeIterator seek positions BEFORE the seek
+		// key, so the next page RE-EMITS that key; drop it (dropPrev) instead
+		// of erroring. Resuming from res.Next instead loses the account AT the
+		// cursor (tr.Iterator.Next() advances past the seek node).
+		lastKey := ""
+		for k := range res.Accounts {
+			if kk := res.Accounts[k].Key; kk > lastKey {
+				lastKey = kk
+			}
 		}
-		start = "0x" + hex.EncodeToString(raw)
+		if lastKey == "" {
+			return nil, fmt.Errorf("dump: page %d has no address hashes for pagination", page)
+		}
+		lh, err := canonHash(lastKey)
+		if err != nil {
+			return nil, fmt.Errorf("dump: page %d bad last address hash %q: %w", page, lastKey, err)
+		}
+		start = lh
+		dropPrev, _ = join.addrByTrieKey[common.HexToHash(lh)]
 		if page > 1_000_000 {
 			return nil, fmt.Errorf("dump: pagination did not terminate")
 		}
