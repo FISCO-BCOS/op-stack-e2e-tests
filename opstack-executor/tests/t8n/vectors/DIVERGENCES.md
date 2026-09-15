@@ -308,3 +308,32 @@ deposit_mint × 6 档 + l1fee_edge × 5 档）。与 op-geth `e8800cffe` 的对�
 > 级联表现，不是独立 FISCO 缺陷；不立案、不登记 ALLOWLIST 行。**
 > 依据：/tmp/trace_tx3.json（debug_traceTransaction structLog，124 op 单帧无子调用）
 > 对照 OP_TXGAS_TRACE=1 的 OpT8nReplay（OpTransition.cpp 临时打点，已随工作树还原）。
+
+---
+
+## WI-E2 扩展（RPC 表示层：deposit 回执形状，2026-09-15）
+
+W6-WI-E2 用 **op-geth 真实 devnet RPC 输出**（非手写期望）对 FISCO web3 序列化路径
+做逐字段对拍，关闭「FISCO 自写自过」缺口。golden = `opdevnet.sh` devnet
+（geth @ `e8800cffe`）的 `eth_getTransactionReceipt` 原样 JSON（4 笔存款：attributes
+pre/post-Canyon、用户 call 型、用户创建型），落 FISCO 树
+`bcos-rpc/test/unittests/rpc/golden/op-geth-deposit-receipt/`；对拍用例 =
+`bcos-rpc/test/unittests/rpc/Web3ResponseTest.cpp` `opgethGolden*Receipt`（复制品从
+golden JSON 构造，经生产路径 `combineReceiptResponse` 序列化后全字段比对：字段名拼写、
+值、双向字段全集）。捕获方法：`tools/devnet/README.md` §WI-E2。
+
+| 锚点 | FISCO 锚点 | op-geth 锚点 | 判定 | 证据 | 状态 |
+|---|---|---|---|---|---|
+| deposit 回执字段全集（RPC JSON） | `bcos-rpc/bcos-rpc/web3jsonrpc/model/ReceiptResponse.cpp:28-148` combineReceiptResponse | `internal/ethapi/api.go:1771-1813` MarshalReceipt（geth e8800cffe） | 等价 | 4 笔真实 golden 逐字段对拍全过：16 字段名（含 `depositNonce` 拼写）精确匹配、值相等、双向无孤儿字段；含 `depositNonce=0x0` 仍发射（nil-vs-zero 语义）与 pre-Canyon `depositReceiptVersion` 双端缺席 | 已确认 |
+| 差异点 D1：地址表示大小写 | `ReceiptResponse.cpp:47/:54/:66` from/to/contractAddress 走 EIP-55 checksummed | 同字段全小写（`common.Address` MarshalJSON） | 已知分叉 | 同 20 字节；`0xf39f…92266` FISCO 发 `0xf39Fd6…Fb92266`。影响对裸 JSON 文本做精确匹配/快照 diff 的下游工具；解析型工具无感。测试以「大小写不敏感比对 + 字面量 pin」固化，禁止静默改齐 | 已确认（有意保留） |
+| depositNonce 语义 | `bcos-framework/bcos-framework/protocol/TransactionReceipt.h:48` deposit_nonce（tars field 8 逐字段 presence） | `core/state_processor.go:218-225`：= 执行时发送者账户 EVM nonce（`statedb.GetNonce(msg.From)`），**逐发送者计数，非全局存款序号**；attributes 存款独占 `0xdead…0001` 序列 | 等价 | devnet 实测：attributes 块 100→0x63、3000→0xbb9、4375→0x1119（含 op-node predeploy 配置存款插队）；用户存款按各自发送者 0x0、0x1 递增 | 已确认 |
+| depositReceiptVersion fork 门控 | `ReceiptResponse.cpp:144-145`（meta presence 门控） | `state_processor.go:221-225` Canyon 起 `=1`（`types.CanyonDepositReceiptVersion`） | 等价 | pre-Canyon golden（block 100）双端字段缺席；post-Canyon golden 双端 `0x1` | 已确认 |
+| deposit 回执不发射 l1 费字段 | `ReceiptResponse.cpp:111-148` meta 缺省 → 不发射 | `api.go` 门控 `IsOptimism() && !tx.IsDepositTx()`，deposit 回执恒无 l1GasPrice/l1Fee/… | 等价 | 4 golden 均无 l1* 字段，FISCO 输出亦无；`effectiveGasPrice` 双端 `0x0` | 已确认 |
+| FISCO 单侧扩展：operatorFee | `ReceiptResponse.cpp:146-147`（`meta.operator_fee` presence 时发射，键名 `operatorFee`） | MarshalReceipt 无该键（Jovian 只发 `operatorFeeScalar`/`operatorFeeConstant`） | 结构性差异 | 本次 4 golden 均未触发（meta 不带 operator_fee）；键名冲突风险在于未来 op-geth 若引入同名键语义不同——先登记 | 已确认 |
+| deposit tx hash 等价（副产品 pin） | `bcos-rlp-protocol/bcos-rlp-protocol/Web3TxHandler.cpp:842-871` DepositTxHandler（8 字段序=op-geth） | `core/types/deposit_tx.go:25-46` struct 序 | 等价 | 4 golden 复制品的 `tx.hash()` == golden `transactionHash`（含 680B l1info calldata 与创建型 to=null 分支） | 事实达成 |
+
+> 备注（devnet 侧，非 FISCO RPC）：d3-precheck op-node（`76e4fad5`）在
+> `op-node/rollup/derive/deposit_log.go:84` `dep.From = from`，未做上游 stock 的
+> `ApplyL1ToL2Alias`——本 devnet 的用户存款回执 `from` 是 L1 原始发送者。读 golden
+> 时勿判为 FISCO↔op-geth 表示分歧；如未来换 stock op-node 重捕获，`from` 将变为
+> alias 形式，`user-deposit*.receipt.json` 需同步更新。

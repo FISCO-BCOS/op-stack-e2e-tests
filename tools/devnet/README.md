@@ -452,3 +452,67 @@ must-fix 并修复。逐项证据见提交 `harden(devnet)`；本节只记定案
   入块→settle）通过。
 - chainexport 真链导出 5897 块成功；同 stem 重导被拒、`--force` 覆盖且 sha256 一致
   （导出确定性顺带验证）。
+
+# WI-E2：op-geth 真实 deposit 回执 golden 捕获（RPC 表示层）
+
+目的：给 FISCO `bcos-rpc` 的 `depositNonce`/`contractAddress`/deposit 回执形状提供
+**op-geth 真实 RPC 输出** golden（消除「FISCO 自写自过」验证缺口）。golden 落
+FISCO 树 `bcos-rpc/test/unittests/rpc/golden/op-geth-deposit-receipt/`，由
+`Web3ResponseTest.cpp` 的 `opgethGolden*Receipt` 用例逐字段对拍。
+
+## 捕获方法（devnet 重启后可随时重做）
+
+```bash
+# 0) /tmp/d3-bin 二进制重启即失：按 versions.lock src= 重建（geth @ op-geth e8800cffe，
+#    op-node/op-batcher/op-deployer @ optimism-d3-precheck 76e4fad5）。
+#    实测 `go build -o /tmp/d3-bin/geth ./cmd/geth`（op-geth 树）、
+#    `go build -o /tmp/d3-bin/op-node ./op-node/cmd` 等（optimism 树）产物
+#    sha256 与 versions.lock 逐位一致。
+~/.cache/fisco-t8n-corpus/tools/devnet/opdevnet.sh up
+export PATH="$PATH:/Users/octopus/.foundry/bin"; R=http://127.0.0.1:9545
+
+# 1) attributes deposit：任意块首笔（type 0x7e）。多采样几个高度确认 nonce 语义。
+TX=$(cast rpc eth_getBlockByNumber 0xbb8 false --rpc-url $R | jq -r '.transactions[0]')
+cast rpc eth_getTransactionReceipt $TX --rpc-url $R | jq .
+
+# 2) 用户存款：anvil key 对 L1 OptimismPortal（地址取
+#    /tmp/opdevnet/run/deployer/state.json 的 OptimismPortalProxy）发 depositTransaction：
+cast send 0xd01da3544ee5600483d8a149a3bb21a4aaa6c4de \
+  "depositTransaction(address,uint256,uint64,bool,bytes)" \
+  0x70997970C51812dc3A010C7d01b50e0d17dc79C8 1000000000000000 100000 false 0x \
+  --value 1000000000000000 \
+  --private-key 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80 \
+  --rpc-url http://127.0.0.1:8545
+
+# 3) 找 L2 落点：看 opnode.log 的 "Sequencer sealed block ... txs=2"（用户存款块）。
+#    ⚠️ 派生滞后 ~2×（sequencer 消费 L1 origin 比实时慢一倍），别扫当前 head 窗口——
+#    实测存款块在 head 后方数百块。
+grep -n "txs=2" /tmp/opdevnet/logs/opnode.log | tail
+cast rpc eth_getTransactionReceipt <hash> --rpc-url $R > golden.json
+
+# 4) 创建型存款（拿 contractAddress golden）：isCreation=true 时 to 必须是 address(0)，
+#    否则 portal revert custom error 0xc5defbad（OptimismPortal_BadTarget）。
+cast send 0xd01da3544ee5600483d8a149a3bb21a4aaa6c4de \
+  "depositTransaction(address,uint256,uint64,bool,bytes)" \
+  0x0000000000000000000000000000000000000000 0 100000 true 0x \
+  --private-key 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80 \
+  --rpc-url http://127.0.0.1:8545
+```
+
+## 实测语义（2026-09-15，Jovian 全档 devnet）
+
+- **depositNonce = 存款执行时发送者账户的 EVM nonce**（`core/state_processor.go:218-225`
+  `nonce = statedb.GetNonce(msg.From)`），**不是全局存款计数器**：
+  - attributes deposit 全部出自 `0xdead...0001`，逐块 +1（block 100→0x63、3000→0xbb9、
+    4375→0x1119）；op-node 偶发的 predeploy 配置存款同账户，会插队 +1（fjord 块 1875
+    的 GasPriceOracle 配置存款 nonce 0x754 紧跟 l1info 0x753）。
+  - 用户存款各自按（未 alias 的）L1 发送者账户 nonce 计（实测首笔 0x0、次笔 0x1）。
+  - 升级存款出自 `0x4210...00..07` 专用账户（to=null 创建型，nonce 从 0 计）与
+    硬编码 `0x0000...0000`（nonce 逐笔累积：ecotone 0x0 → jovian 0x6）。
+- **depositReceiptVersion**：Cyanon 起恒 `0x1`（`CanyonDepositReceiptVersion`）；Canyon 前
+  字段**缺席**（非 null）。deposit 回执上从不出现 l1GasPrice/l1Fee 等（门控
+  `!tx.IsDepositTx()`），`effectiveGasPrice` 恒 "0x0"。
+- **本 devnet 不做 L1→L2 address aliasing**：d3-precheck 的 op-node 在
+  `op-node/rollup/derive/deposit_log.go:84` `dep.From = from`（上游 stock 是
+  `ApplyL1ToL2Alias(from)`）——用户存款回执 `from` = L1 原始发送者。这不是 RPC
+  表示层问题，但读 golden 时别误判为形状分歧。
