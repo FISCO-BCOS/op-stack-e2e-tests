@@ -104,6 +104,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -718,12 +719,26 @@ func main() {
 		"overwrite an existing output file (default: refuse — silent overwrite was a footgun)")
 	flag.Parse()
 	if err := run(*rpcURL, *rollupPath, *outDir, *poststate, *workers, *dumpWorkers, *gethCommit, *genesisPath, *rpcTimeout, *force); err != nil {
-		fmt.Fprintf(os.Stderr, "chainexport: FAIL: %v\n", err)
+		fmt.Fprintf(os.Stderr, "[chainexport][ERROR] export: %v\n", err)
 		os.Exit(1)
 	}
 }
 
+// progressEvery returns the block interval for EXPORT progress lines:
+// every 5% of the total, clamped to [1, 250].
+func progressEvery(total uint64) uint64 {
+	e := total / 20
+	if e < 1 {
+		e = 1
+	}
+	if e > 250 {
+		e = 250
+	}
+	return e
+}
+
 func run(rpcURL, rollupPath, outDir, poststate string, workers, dumpWorkers int, gethCommit, genesisPath string, rpcTimeout time.Duration, force bool) error {
+	start := time.Now()
 	if outDir == "" {
 		return fmt.Errorf("--out-dir is required")
 	}
@@ -865,14 +880,23 @@ func run(rpcURL, rollupPath, outDir, poststate string, workers, dumpWorkers int,
 
 	// ---- per-block assembly ---------------------------------------------------
 	doc := &chainDoc{Blocks: make([]blockOutput, n)}
+	progEvery := progressEvery(n)
+	var txCount uint64
+	forkCounts := make(map[string]uint64)
 	for i := uint64(0); i < n; i++ {
 		bf := fetches[i]
 		num := bf.num
-		blk, err := assembleBlock(bf, hardforkOf(num), forkNames, len(forkNames) > 0 && hardforkOf(num) == "jovian")
+		hf := hardforkOf(num)
+		blk, err := assembleBlock(bf, hf, forkNames, hf == "jovian")
 		if err != nil {
 			return fmt.Errorf("block %d: %w", num, err)
 		}
 		doc.Blocks[i] = *blk
+		txCount += uint64(len(bf.blk.Transactions))
+		forkCounts[hf]++
+		if (i+1)%progEvery == 0 || i+1 == n {
+			fmt.Fprintf(os.Stderr, "chainexport: EXPORT %d/%d blocks (receipts ok, state pages 0)\n", i+1, n)
+		}
 	}
 	// description strings need n; fill here (assembleBlock wrote a placeholder)
 	for i := uint64(0); i < n; i++ {
@@ -973,6 +997,7 @@ func run(rpcURL, rollupPath, outDir, poststate string, workers, dumpWorkers int,
 	var dwg sync.WaitGroup
 	var dmu sync.Mutex
 	var dumpErr error
+	var dumped uint64 // atomic — EXPORT 进度行的 state pages 计数
 	for _, idx := range sampledIdxs {
 		dwg.Add(1)
 		go func(blockNum int) {
@@ -987,6 +1012,10 @@ func run(rpcURL, rollupPath, outDir, poststate string, workers, dumpWorkers int,
 				return
 			}
 			doc.Blocks[blockNum].PostState = st
+			done := atomic.AddUint64(&dumped, 1)
+			if done%progEvery == 0 || done == uint64(len(sampledIdxs)) {
+				fmt.Fprintf(os.Stderr, "chainexport: EXPORT %d/%d blocks (receipts ok, state pages %d)\n", n, n, done)
+			}
 		}(idx)
 	}
 	dwg.Wait()
@@ -1002,7 +1031,7 @@ func run(rpcURL, rollupPath, outDir, poststate string, workers, dumpWorkers int,
 		Version         string `json:"version"`
 		Generator       string `json:"generator"`
 		GeneratorCommit string `json:"generator_commit"`
-	}{"3-block", "chainexport", gethCommit})
+	}{fmt.Sprintf("%d-block", n), "chainexport", gethCommit})
 	if err != nil {
 		return err
 	}
@@ -1037,6 +1066,14 @@ func run(rpcURL, rollupPath, outDir, poststate string, workers, dumpWorkers int,
 	fmt.Printf("DEVNET-STEM %s\n", stem)
 	fmt.Printf("WROTE %s\n", file)
 	fmt.Printf("SHA256 %x\n", sum)
+	// 结束摘要（P4 可观测性；stderr，stdout 的 STEM/WROTE/SHA256 机读行不受影响）
+	var segParts []string
+	for _, f := range forkNames {
+		segParts = append(segParts, fmt.Sprintf("%s=%d", f, forkCounts[f]))
+	}
+	fmt.Fprintf(os.Stderr, "chainexport: SUMMARY blocks=%d txs=%d postState blocks=%d/%d elapsed=%s\n",
+		n, txCount, len(sampledIdxs), n, time.Since(start).Round(time.Second))
+	fmt.Fprintf(os.Stderr, "chainexport: fork segment blocks: %s\n", strings.Join(segParts, " "))
 	return nil
 }
 

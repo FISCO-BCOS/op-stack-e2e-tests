@@ -62,7 +62,7 @@ def rpc(url, method, params, retries=3, timeout=20):
         except Exception as e:  # noqa: BLE001 — transport/RPC 错误统一重试后上抛
             last = e
             time.sleep(0.5 * (i + 1))
-    print(f"ERROR: RPC unavailable at {url} ({method} failed after {retries} attempts): {last}\n"
+    print(f"[check_activations][ERROR] rpc: RPC unavailable at {url} ({method} failed after {retries} attempts): {last}\n"
           f"       is the devnet stack up?  opdevnet.sh status", file=sys.stderr)
     sys.exit(3)
 
@@ -81,14 +81,14 @@ def main():
         with open(args.rollup) as f:
             rollup = json.load(f)
     except (OSError, json.JSONDecodeError) as e:
-        print(f"ERROR: cannot read rollup file {args.rollup}: {e}", file=sys.stderr)
+        print(f"[check_activations][ERROR] rollup: cannot read rollup file {args.rollup}: {e}", file=sys.stderr)
         return 2
     if not isinstance(rollup.get("genesis", {}).get("l2_time"), int):
-        print(f"ERROR: {args.rollup} missing/bad genesis.l2_time —— 不是 op-deployer inspect rollup 产物？",
+        print(f"[check_activations][ERROR] rollup: {args.rollup} missing/bad genesis.l2_time —— 不是 op-deployer inspect rollup 产物？",
               file=sys.stderr)
         return 2
     if not isinstance(rollup.get("block_time"), int) or rollup["block_time"] <= 0:
-        print(f"ERROR: {args.rollup} missing/bad block_time", file=sys.stderr)
+        print(f"[check_activations][ERROR] rollup: {args.rollup} missing/bad block_time", file=sys.stderr)
         return 2
 
     l2_time = rollup["genesis"]["l2_time"]

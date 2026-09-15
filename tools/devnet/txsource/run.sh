@@ -41,7 +41,19 @@ SEGS="" ROUNDS_JSONL=""
 
 usage() { sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
 log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
-die() { log "FAIL: $*"; exit 1; }
+# 错误统一格式（P4 可观测性）：[txsource][ERROR] <component>: <message> (log: <path>)
+#   component = 当前阶段（config/segments/fund/settle/rounds/summary，缺省 runner）；
+#   (log: …) 后缀仅在该阶段有关联日志文件时输出。只改错误行的呈现，退出码语义不变。
+COMP="runner"
+_LAST_LOG=""
+die() {
+  if [ -n "$_LAST_LOG" ]; then
+    printf '[txsource][ERROR] %s: %s (log: %s)\n' "$COMP" "$*" "$_LAST_LOG" >&2
+  else
+    printf '[txsource][ERROR] %s: %s\n' "$COMP" "$*" >&2
+  fi
+  exit 1
+}
 
 # ---------- 通用 RPC（纪律同 opdevnet.sh：数值参数一律 JSON 字符串） ----------
 dec() { printf '%d' "${1:-0x0}" 2>/dev/null; }   # "0x1f" -> 31
@@ -67,6 +79,7 @@ sync_safe_unsafe() { # -> "safe unsafe"（本构建 op-node 返回 snake_case，
 # 载入后 SEGS 为 TSV：name \t start_ts \t activation_block。bedrock 行 activation=0。
 # 段起始时间或激活块已过的语义见 main_loop 内注释。可被单测 source 后直接调用。
 load_segments() {
+  COMP="segments"
   [ -n "$ROLLUP_JSON" ] && [ -f "$ROLLUP_JSON" ] || die "rollup.json not found: $ROLLUP_JSON"
   local tmp="${SEGS}.tmp"
   if ! python3 - "$ROLLUP_JSON" >"$tmp" 2>"$tmp.err" <<'PYEOF'
@@ -108,6 +121,7 @@ wei_ge() { python3 -c "import sys; sys.exit(0 if int(sys.argv[1]) >= int(sys.arg
 # devnet intent fundDevAccounts=false → L2 无预富账户（实测 key0/key9 L2 余额 0），
 # 富账户资金只能经 OptimismPortal 存款进入 L2。portal 地址取 op-deployer state.json。
 fund_plugin() { # -> stdout: 插件资金账户 L2 地址
+  COMP="fund"
   command -v cast >/dev/null || die "cast required for funding bridge"
   local faddr portal amt_wei
   faddr="$(cast wallet address --private-key "$FUNDING_KEY")"
@@ -125,6 +139,7 @@ PYEOF
 )"
   [ -n "$portal" ] || die "OptimismPortalProxy not found in $DEPLOYER_STATE for chain $CHAIN_ID"
   log "fund: L1 depositTransaction -> $faddr amount=${FUND_AMOUNT}ether portal=$portal"
+  _LAST_LOG="$OUT_DIR/fund.log"
   # 注意签名：本部署 Portal2 的 gasLimit 参数是 uint64（selector e9e05c42）；写成 uint256 会
   # 得到 0xfa92670c，dispatcher 不识别 → 空 revert（实测踩坑）
   cast send "$portal" 'depositTransaction(address,uint256,uint64,bool,bytes)' \
@@ -149,6 +164,7 @@ PYEOF
 
 # ---------- settle（设计 §4.3：batcher 提交 → safe 追上 unsafe 才算沉降） ----------
 settle_round() { # $1=round_label $2=timeout_s -> 0/1；SETTLE_SAFE/SETTLE_UNSAFE 传出
+  COMP="settle"; _LAST_LOG=""
   local label="$1" target="" su safe unsafe deadline=$(( $(date +%s) + $2 ))
   SETTLE_SAFE=""; SETTLE_UNSAFE=""
   while :; do
@@ -172,6 +188,7 @@ settle_round() { # $1=round_label $2=timeout_s -> 0/1；SETTLE_SAFE/SETTLE_UNSAF
 # ---------- 单轮触发 ----------
 ROUND_RC=0; SETTLE_SAFE=""; SETTLE_UNSAFE=""
 fire_round() { # $1=segment $2=round
+  COMP="rounds"; _LAST_LOG=""
   local seg="$1" round="$2" rdir rc
   rdir="$OUT_DIR/round-$(printf '%02d' "$round")-$seg"; mkdir -p "$rdir"
   log "round $round segment=$seg begin (dir $rdir)"
@@ -217,6 +234,7 @@ fire_round() { # $1=segment $2=round
 # ---------- 主循环 ----------
 RPC_FAIL_MAX=20   # 连续 RPC 失败阈值（默认 poll 1s → 容忍 ~20s 的节点重启/瞬断，超出即 die）
 main_loop() {
+  COMP="main"
   load_segments
   local last; last="$(last_segment)"
   log "txsource start: plugin=$PLUGIN l2=$L2_RPC opnode=$OPNODE_RPC rollup=$ROLLUP_JSON"
@@ -278,6 +296,7 @@ main_loop() {
 }
 
 main() {
+  COMP="config"; _LAST_LOG=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --plugin)          PLUGIN="${2:?}"; shift 2 ;;
@@ -336,8 +355,10 @@ main() {
   main_loop
 
   # ---------- 汇总（stdout 仅此一份 JSON；任何轮失败或 settle 失败 → 退出码 1） ----------
+  COMP="summary"; _LAST_LOG=""
   python3 - "$OUT_DIR" "$ROUNDS_JSONL" <<'PYEOF'
 import json, sys
+from collections import OrderedDict
 out, path = sys.argv[1], sys.argv[2]
 rounds = [json.loads(l) for l in open(path) if l.strip()]
 def acc(key): return sum(r.get(key, 0) for r in rounds)
@@ -351,6 +372,22 @@ summary = {
     "rounds": rounds,
 }
 json.dump(summary, open(f"{out}/summary.json", "w"), indent=2)
+# campaign 汇总矩阵（stderr；stdout 只留给 summary JSON）：段 × 轮次 × tx_total/included/reverted
+by_seg = OrderedDict()
+for r in rounds:
+    d = by_seg.setdefault(r["segment"], {"rounds": 0, "tx_total": 0, "included": 0, "reverted": 0})
+    d["rounds"] += 1
+    for k in ("tx_total", "included", "reverted"):
+        d[k] += r.get(k, 0)
+w = max([len(s) for s in by_seg] + [6])
+print("==== txsource campaign summary (segment x rounds) ====", file=sys.stderr)
+print(f"{'segment':<{w}} {'rounds':>6} {'tx_total':>9} {'included':>9} {'reverted':>9}", file=sys.stderr)
+tot = {"rounds": 0, "tx_total": 0, "included": 0, "reverted": 0}
+for s, d in by_seg.items():
+    for k in tot:
+        tot[k] += d[k]
+    print(f"{s:<{w}} {d['rounds']:>6} {d['tx_total']:>9} {d['included']:>9} {d['reverted']:>9}", file=sys.stderr)
+print(f"{'TOTAL':<{w}} {tot['rounds']:>6} {tot['tx_total']:>9} {tot['included']:>9} {tot['reverted']:>9}", file=sys.stderr)
 print(json.dumps(summary))
 sys.exit(1 if summary["rounds_failed"] or summary["settle_failed"] else 0)
 PYEOF

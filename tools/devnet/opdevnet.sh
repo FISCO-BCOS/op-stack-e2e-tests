@@ -66,7 +66,21 @@ CAMPAIGN_TOML="${OPDEVNET_CAMPAIGN_TOML:-/tmp/opdevnet-campaign.toml}"
 CAMPAIGN_CATCHUP_DRIFT_S="30"     # L2 头块时间追平到墙钟该误差内 = catch-up 完成
 
 log()  { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
-die()  { printf '[%s] FAIL(step=%s): %s\n' "$(date +%H:%M:%S)" "$STEP" "$*" >&2; exit 1; }
+# 错误统一格式（P4 可观测性）：[opdevnet][ERROR] <step>: <message> (log: <path>)
+#   <log> 来自最近一次 tail_log 的文件；die 前没 tail 过日志则省略 (log: …) 后缀。
+#   只改错误行的呈现，退出码语义不变（仍 exit 1）。
+_LAST_LOG=""
+die()  {
+  if [ -n "$_LAST_LOG" ]; then
+    printf '[opdevnet][ERROR] %s: %s (log: %s)\n' "$STEP" "$*" "$_LAST_LOG" >&2
+  else
+    printf '[opdevnet][ERROR] %s: %s\n' "$STEP" "$*" >&2
+  fi
+  exit 1
+}
+stage() { # $1=k(1..6) $2=label —— up 六阶段标记（anvil→deployer→geth init→geth start→op-node→batcher）
+  log "[stage $1/6] $2"
+}
 usage() { sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
 
 # ---------- 配置解析（仅支持本仓库 devnet.toml 的平面格式） ----------
@@ -323,7 +337,7 @@ validate_config() { # devnet.toml 结构校验（审计 4.1/4.2：缺字段旧�
     prev="$off"
   done
 }
-tail_log() { printf -- '---- tail %s ----\n' "$1"; tail -n "${2:-25}" "$1" 2>/dev/null || true; }
+tail_log() { _LAST_LOG="$1"; printf -- '---- tail %s ----\n' "$1"; tail -n "${2:-25}" "$1" 2>/dev/null || true; }
 mine() { rpc "$L1_RPC" evm_mine '[]' >/dev/null; }
 # 确定性手动矿：实测（anvil 1.7.1）
 #   - evm_mine 不读 anvil_setBlockTimestampInterval（那只作用于间隔采矿 tick）
@@ -334,6 +348,60 @@ head_number() { dec "$(rpc_res "$L1_RPC" eth_blockNumber)"; }
 # 块号必须作为 JSON 字符串传（"0x1a"），裸 0x1a 不是合法 JSON，anvil 会回 Invalid Request(-32600)
 block_ts() { dec "$(rpc_res "$L1_RPC" eth_getBlockByNumber "$(printf '["0x%x", false]' "$1")" | jq -r '.timestamp')"; }
 head_ts() { block_ts "$(head_number)"; }
+
+# ---------- fork 边界穿越事件（P4 可观测性；计数逻辑复用 check_activations.py） ----------
+L1INFO_FROM="0xdeaddeaddeaddeaddeaddeaddeaddeaddead0001"
+L1INFO_TO="0x4200000000000000000000000000000000000015"
+boundary_table() { # -> stdout TSV: fork \t 激活块号 \t 边界 ts
+  # 激活块号公式与 check_activations.py 一致：(boundary - l2_time + 1) / block_time（整除）
+  local l2 bt f t
+  l2="$(jq -r '.genesis.l2_time' "$ART/rollup.json")"
+  bt="$(jq -r '.block_time' "$ART/rollup.json")"
+  for f in $RUN_FORKS; do
+    t="$(jq -r ".${f}_time // empty" "$ART/rollup.json" 2>/dev/null || true)"
+    [ -n "$t" ] || continue
+    printf '%s\t%d\t%d\n' "$f" "$(( (t - l2 + 1) / bt ))" "$t"
+  done
+}
+upgrade_tx_count() { # $1=block number -> stdout: 该块升级交易数（type 0x7E 且非 L1-attributes；
+                     # 判定式与 check_activations.py 的 l1info/upgrade 二分一致）
+  local hex; hex="$(printf '0x%x' "$1")"
+  rpc "$L2_HTTP" eth_getBlockByNumber "[\"$hex\", true]" 2>/dev/null | \
+    jq -r --arg from "$L1INFO_FROM" --arg to "$L1INFO_TO" '
+      [ (.result.transactions // [])[]?
+        | select(((.type // "0x0") | ascii_downcase) == "0x7e")
+        | select((((.from // "") | ascii_downcase) == $from)
+                 and (((.to // "") | ascii_downcase) == $to) | not) ]
+      | length' 2>/dev/null || echo 0
+}
+expected_upgrade_of() { # $1=fork -> UPGRADE_COUNTS 表里的预期升级交易数
+  awk -v k="$1" 'BEGIN{RS=" "; FS="="} $1==k {print $2}' <<<"$UPGRADE_COUNTS"
+}
+report_crossed() { # $1=head 块号 $2=boundary TSV —— 每跨过一个 fork 激活块主动打一条 CROSSED
+  local head="$1" f a t cnt exp
+  while IFS=$'\t' read -r f a t; do
+    [ -n "$f" ] || continue
+    case "$CROSSED" in *" $f "*) continue ;; esac
+    [ "$a" -le "$head" ] || continue
+    cnt="$(upgrade_tx_count "$a")"
+    exp="$(expected_upgrade_of "$f")"
+    if [ "$cnt" = "$exp" ]; then
+      log "CROSSED $f @block $a (upgrade txs: $cnt ✓)"
+    else
+      log "CROSSED $f @block $a (upgrade txs: $cnt != expected $exp)"
+    fi
+    CROSSED="$CROSSED$f "   # 记录前后包空格，供 *" $f "* 去重匹配（无尾空格会漏判 → 同一边界双打点，实测踩坑）
+  done <<<"$2"
+}
+fork_at_block() { # $1=block $2=boundary TSV -> 当前 fork 段名（最后一个激活块 <= 该块的 fork；否则 bedrock）
+  local n="$1" seg="bedrock" f a t
+  while IFS=$'\t' read -r f a t; do
+    [ -n "$f" ] || continue
+    [ "$a" -le "$n" ] && seg="$f"
+  done <<<"$2"
+  printf '%s' "$seg"
+}
+CROSSED=" "   # 首尾空格哨兵：去重匹配依赖 *" $f "*，无前导空格会漏判（实测踩坑）
 
 # ---------- campaign：由基准 toml 派生临时 campaign toml ----------
 # 只改四处：meta.name / l1.genesis_timestamp（锚 = 墙钟-500s）/ [forks]（压缩阶梯，可子集）/
@@ -435,6 +503,7 @@ cmd_up() {
   if [ -f "$ART/rollup.json" ]; then prev_hash="$(jq -r '.genesis.l2.hash' "$ART/rollup.json")"; fi
 
   # ---- 1) anvil（L1，genesis 时间固定在过去；--no-mining，块生产由脚本驱动） ----
+  stage 1 "anvil (L1)"
   STEP="anvil"
   start_bg anvil "$LOGS/anvil.log" "$ANVIL" --chain-id "$L1_CHAIN_ID" --no-mining \
     --timestamp "$L1_GENESIS_TS" --port "$P_ANVIL"
@@ -445,6 +514,7 @@ cmd_up() {
   [ "$ts0" = "$L1_GENESIS_TS" ] || die "anvil genesis ts=$ts0 != configured $L1_GENESIS_TS"
 
   # ---- 2) 确定性锚点：把 L1 头逐块精确矿到 pin_block 并停住 ----
+  stage 2 "deployer (pin L1 head -> init/apply/inspect -> normalize/verify)"
   # 每块 ts 精确 = genesis_ts + block_time*i（evm_setNextBlockTimestamp 指定），
   # apply 入口读到的 L1 起始块 ts 因此跨 run 完全一致 = 产物幂等的锚。
   STEP="pin-l1-head"
@@ -563,9 +633,11 @@ json.dump(s, open(p, 'w'))"
 
   # ---- 7) L2: geth init + start ----
   STEP="geth"
+  stage 3 "geth init"
   printf '%s\n' "$JWT" >"$RUN/jwt.txt"; chmod 600 "$RUN/jwt.txt"
   "$GETH" --datadir "$L2DIR" --state.scheme hash init "$ART/genesis.json" >"$LOGS/geth-init.log" 2>&1 \
     || { tail_log "$LOGS/geth-init.log"; die "geth init failed"; }
+  stage 4 "geth start"
   start_bg geth "$LOGS/geth.log" "$GETH" --datadir "$L2DIR" \
     --http --http.port "$P_GETH_HTTP" --http.api eth,debug,net,web3 \
     --authrpc.port "$P_GETH_AUTH" --authrpc.jwtsecret "$RUN/jwt.txt" \
@@ -610,6 +682,7 @@ json.dump(s, open(p, 'w'))"
   fi
 
   # ---- 9) op-node（sequencer）----
+  stage 5 "op-node (sequencer)"
   STEP="op-node"
   start_bg opnode "$LOGS/opnode.log" "$OPNODE" \
     --l2 "http://127.0.0.1:$P_GETH_AUTH" --l2.jwt-secret "$RUN/jwt.txt" \
@@ -623,6 +696,7 @@ json.dump(s, open(p, 'w'))"
   wait_rpc "$OPNODE_RPC" 30 optimism_syncStatus || { tail_log "$LOGS/opnode.log" 40; die "op-node rpc not ready"; }
 
   # ---- 9) op-batcher ----
+  stage 6 "op-batcher"
   STEP="op-batcher"
   start_bg batcher "$LOGS/batcher.log" "$OPBATCHER" \
     --l1-eth-rpc "$L1_RPC" --l2-eth-rpc "$L2_HTTP" --rollup-rpc "$OPNODE_RPC" \
@@ -645,12 +719,20 @@ json.dump(s, open(p, 'w'))"
     # campaign：sequencer 以机器速度从 genesis 追墙钟，追平后转入实时出块。
     # 头块 ts 进入墙钟 ±DRIFT 即认为 catch-up 完成（不设块数目标 —— 边界留给墙钟逐段穿越）。
     log "campaign: waiting L2 head time within ${CAMPAIGN_CATCHUP_DRIFT_S}s of wall clock ..."
-    local hts wall
+    local hts wall last_prog=0 now
+    local camp_boundaries; camp_boundaries="$(boundary_table)"
     while :; do
       for f in anvil geth opnode batcher; do
         pid_alive "$RUN/$f.pid" || { tail_log "$LOGS/$f.log" 40; die "$f died during catch-up"; }
       done
       blk=$(( $(rpc_res "$L2_HTTP" eth_blockNumber 2>/dev/null || echo 0) ))
+      report_crossed "$blk" "$camp_boundaries"
+      # 每 10 秒一条追赶进度行（与按块数 catch-up 同格式）
+      now="$(date +%s)"
+      if [ $(( now - last_prog )) -ge 10 ]; then
+        log "CATCH-UP block=$blk fork=$(fork_at_block "$blk" "$camp_boundaries")"
+        last_prog="$now"
+      fi
       hts=$(( $(rpc_res "$L2_HTTP" eth_getBlockByNumber "$(printf '["0x%x", false]' "$blk")" 2>/dev/null | jq -r '.timestamp // 0') ))
       wall="$(date +%s)"
       if [ "$blk" -gt 0 ] && [ $(( wall - hts )) -le "$CAMPAIGN_CATCHUP_DRIFT_S" ]; then
@@ -684,6 +766,8 @@ json.dump(s, open(p, 'w'))"
     return 0
   fi
   log "waiting L2 catch-up to block $TARGET_BLOCKS (machine speed ~115 blk/s after boundaries crossed) ..."
+  local boundaries; boundaries="$(boundary_table)"
+  local last_prog=0 now
   while :; do
     for f in anvil geth opnode batcher; do
       pid_alive "$RUN/$f.pid" || { tail_log "$LOGS/$f.log" 40; die "$f died during catch-up"; }
@@ -691,6 +775,14 @@ json.dump(s, open(p, 'w'))"
     blk=$(( $(rpc_res "$L2_HTTP" eth_blockNumber 2>/dev/null || echo 0) ))
     if [ $(( blk - last_reported )) -ge 500 ] || [ "$blk" -ge "$TARGET_BLOCKS" ]; then
       log "L2 head: $blk / $TARGET_BLOCKS"; last_reported="$blk"
+    fi
+    # 边界穿越主动打点（升级交易计数复用 check_activations.py 逻辑）
+    report_crossed "$blk" "$boundaries"
+    # 每 10 秒一条追赶进度行
+    now="$(date +%s)"
+    if [ $(( now - last_prog )) -ge 10 ]; then
+      log "CATCH-UP block=$blk fork=$(fork_at_block "$blk" "$boundaries")"
+      last_prog="$now"
     fi
     [ "$blk" -ge "$TARGET_BLOCKS" ] && { UP_STACK_OK=1; break; }
     [ "$(date +%s)" -gt "$deadline" ] && { tail_log "$LOGS/opnode.log" 30; die "catch-up timeout after ${CATCHUP_TIMEOUT}s (head=$blk)"; }
@@ -965,8 +1057,9 @@ cmd_status() {
   if [ -n "$l2n" ]; then
     l2n="$(dec "$l2n")"
     l2ts="$(dec "$(rpc_res "$L2_HTTP" eth_getBlockByNumber "$(printf '["0x%x", false]' "$l2n")" 2>/dev/null | jq -r '.timestamp' || true)")"
-    local seg next_name next_t
+    local seg next_name next_t bt
     seg="Bedrock"; next_name="-"; next_t=""
+    bt="$(jq -r '.block_time // 2' "$ART/rollup.json" 2>/dev/null || echo 2)"
     local f t prev_t=0
     for f in $RUN_FORKS; do
       t="$(jq -r ".${f}_time // empty" "$ART/rollup.json" 2>/dev/null || true)"
@@ -975,7 +1068,7 @@ cmd_status() {
     done
     echo "  L2 unsafe : block $l2n ts=$l2ts fork=$seg"
     if [ -n "$next_t" ]; then
-      echo "  next fork : $next_name at ts=$next_t (block ~$((( next_t - L2_TIME ) / 2)), in $(( next_t - l2ts ))s of chain time)"
+      echo "  next fork : $next_name at ts=$next_t (block ~$(( (next_t - L2_TIME) / bt )), in $(( next_t - l2ts ))s of chain time ≈ $(( (next_t - l2ts) / bt )) blocks)"
     fi
   fi
   local sync safe unsafe

@@ -20,10 +20,11 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 OUT="${1:-$DIR/chainexport.bin}"
 SCRATCH="$OPGETH/cmd/chainexport"
 
-[ "$(git -C "$OPGETH" rev-parse HEAD)" = "$PIN" ] || { echo "op-geth HEAD != $PIN" >&2; exit 1; }
+# 错误统一格式（P4 可观测性）：[chainexport][ERROR] <component>: <message>；本脚本无落盘日志，省略 (log: …) 后缀
+[ "$(git -C "$OPGETH" rev-parse HEAD)" = "$PIN" ] || { echo "[chainexport][ERROR] build: op-geth HEAD != $PIN (expected $PIN; fix OPGETH checkout or the PIN in build.sh)" >&2; exit 1; }
 # 与 regen.sh 同一纪律：只拦「有人手工把东西丢进 op-geth 工作树」；本脚本自己的
 # SCRATCH 在 cleanup trap 中删除。
-[ -z "$(git -C "$OPGETH" status --porcelain)" ] || { echo "op-geth worktree dirty" >&2; exit 1; }
+[ -z "$(git -C "$OPGETH" status --porcelain)" ] || { echo "[chainexport][ERROR] build: op-geth worktree dirty (tracked tree must be clean; SCRATCH $SCRATCH is handled by the cleanup trap)" >&2; exit 1; }
 
 cleanup() {
   rm -rf "$SCRATCH"

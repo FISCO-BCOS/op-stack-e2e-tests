@@ -106,4 +106,16 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    # 错误统一格式（P4 可观测性）：[check_distribution][ERROR] <component>: <message>
+    # rpc 基础设施故障 → 3、rollup 文件问题 → 2（与 check_activations.py 的退出码约定对齐）；
+    # 语义判定仍用 0/1（0 = 用户交易跨 >=2 段）。
+    try:
+        main()
+    except SystemExit:
+        raise
+    except RuntimeError as e:  # rpc() 的重试耗尽
+        print(f"[check_distribution][ERROR] rpc: {e}", file=sys.stderr)
+        sys.exit(3)
+    except (OSError, json.JSONDecodeError, KeyError) as e:
+        print(f"[check_distribution][ERROR] rollup: {e}", file=sys.stderr)
+        sys.exit(2)
