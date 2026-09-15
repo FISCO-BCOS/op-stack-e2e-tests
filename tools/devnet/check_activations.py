@@ -14,11 +14,14 @@
       Canyon / Delta / Granite / Holocene = 0（Delta 在 attributes.go 无注入分支）
   - 顺带断言: 每个激活块的父块 timestamp 严格 < 边界（激活块确为第一个越过边界的块）。
 
-退出码: 0=全部命中; 1=计数与预期不符或边界校验失败; 2=链尚未抵达全部边界/rollup 缺字段。
+退出码: 0=全部命中; 1=计数与预期不符或边界校验失败; 2=链尚未抵达全部边界/rollup 缺字段;
+       3=RPC 不可用（基础设施故障，与语义校验失败区分 —— robustness 审计 8.1）
 """
 import argparse
 import json
 import sys
+import time
+import urllib.error
 import urllib.request
 
 # attributes.go 注入分支的源码定案（不要凭链上结果改这张表；链不匹配说明链有问题）
@@ -38,14 +41,30 @@ L1INFO_FROM = "0xdeaddeaddeaddeaddeaddeaddeaddeaddead0001"
 L1INFO_TO = "0x4200000000000000000000000000000000000015"
 
 
-def rpc(url, method, params):
+def rpc(url, method, params, retries=3, timeout=20):
+    """JSON-RPC with bounded retries on transport errors; final failure -> SystemExit(3).
+
+    旧版无重试且让 URLError 裸 traceback、以退出码 1 混入「计数不符」语义（审计 8.1）。
+    """
     req = urllib.request.Request(
         url,
-        json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).encode(),
+        json.dumps({"jsonrpc":"2.0","id":1,"method":method,"params":params}).encode(),
         {"Content-Type": "application/json"},
     )
-    with urllib.request.urlopen(req, timeout=30) as r:
-        return json.load(r)["result"]
+    last = None
+    for i in range(retries):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                out = json.load(r)
+            if "error" in out:
+                raise RuntimeError(f"rpc error {out['error'].get('code')}: {out['error'].get('message')}")
+            return out["result"]
+        except Exception as e:  # noqa: BLE001 — transport/RPC 错误统一重试后上抛
+            last = e
+            time.sleep(0.5 * (i + 1))
+    print(f"ERROR: RPC unavailable at {url} ({method} failed after {retries} attempts): {last}\n"
+          f"       is the devnet stack up?  opdevnet.sh status", file=sys.stderr)
+    sys.exit(3)
 
 
 def block_by_number(url, n):
@@ -58,16 +77,27 @@ def main():
     ap.add_argument("--rpc", required=True, help="L2 geth HTTP RPC（9545）")
     args = ap.parse_args()
 
-    with open(args.rollup) as f:
-        rollup = json.load(f)
+    try:
+        with open(args.rollup) as f:
+            rollup = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"ERROR: cannot read rollup file {args.rollup}: {e}", file=sys.stderr)
+        return 2
+    if not isinstance(rollup.get("genesis", {}).get("l2_time"), int):
+        print(f"ERROR: {args.rollup} missing/bad genesis.l2_time —— 不是 op-deployer inspect rollup 产物？",
+              file=sys.stderr)
+        return 2
+    if not isinstance(rollup.get("block_time"), int) or rollup["block_time"] <= 0:
+        print(f"ERROR: {args.rollup} missing/bad block_time", file=sys.stderr)
+        return 2
 
     l2_time = rollup["genesis"]["l2_time"]
-    block_time = rollup.get("block_time", 2)
+    block_time = rollup["block_time"]
 
     latest_hex = rpc(args.rpc, "eth_blockNumber", [])
     latest = int(latest_hex, 16)
 
-    print(f"rollup: l2_time={l2_time} block_time={block_time}s l2_chain_id={rollup['l2_chain_id']} "
+    print(f"rollup: l2_time={l2_time} block_time={block_time}s l2_chain_id={rollup.get('l2_chain_id', '?')} "
           f"l2 head={latest}")
     print(f"{'fork':10} {'boundary':>11} {'actBlock':>9} {'blockTs':>11} {'7E_total':>8} {'l1info':>7} "
           f"{'upg':>4} {'expect':>6}  result")

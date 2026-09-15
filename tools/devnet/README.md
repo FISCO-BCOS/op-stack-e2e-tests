@@ -397,3 +397,58 @@ path 标记，漏改则启动报 `incompatible state scheme`）。经典 hash+ar
 分歧即本管线价值：1/2 族指向 FISCO pre-Ecotone L1-cost/L1Block 写入路径，
 3 族指向激活块升级 tx 的执行细节，均为正式 DIVERGENCES 判定的输入（本任务
 不豁免、不裁决）。
+
+---
+
+# 健壮性审计与加固（P4，2026-09-15）
+
+对全套工具做只读失败注入审计（全部在 /tmp 隔离复现，不污染语料仓），确认 10 项
+must-fix 并修复。逐项证据见提交 `harden(devnet)`；本节只记定案。
+
+## 审计确认的关键失败模式（修复前）
+
+| 维度 | 复现证据（摘要） |
+|---|---|
+| 恢复路径 | 二进制缺失（重启后 /tmp 必失）时 `down`/`status`/`clean` 全部 die exit 1 —— 重启后无法清理陈旧 pidfile |
+| PID 复用 | 把无辜 `sleep` 的 pid 写进 `geth.pid`，`down` 直接 SIGTERM+SIGKILL（无进程身份校验） |
+| 半状态 | 坏 fork 阶梯（inspect 失败）与坏 geth 二进制两个场景，up 失败后 anvil 孤儿进程继续监听 |
+| 静默死亡 | inspect 步骤无守卫：坏阶梯实测脚本 exit 1 且零输出，报错只在 `logs/inspect-genesis.err` |
+| 垃圾锚点 | toml 删 `genesis_timestamp` 后锚点静默算成 `l2_time=52`（空值当 0） |
+| 阶梯乱序穿透 | ecotone=4000/fjord=2500 被 op-deployer apply 接受，genesis 生成期才炸 |
+| sha256 无断言 | versions.lock 自述「不参与启动断言」；截断的 geth 一路放行到 init 阶段才间接暴露 |
+| 挂死 | chainexport http.Client 无 Timeout：accept-no-reply 服务器实测挂死 >40s 永不返回 |
+| RPC 静默空转 | run.sh L2 RPC 不可达时 head=0 ts=0 空转，烧完 run-timeout 才报超时 |
+| 裸 traceback | check_activations RPC 不可用 → URLError traceback + exit 1（与「计数不符」语义冲突） |
+
+## 加固定案
+
+- `opdevnet.sh up` 预检 fail-fast：sha256 使用时断言（lock 条目含 `sha256=` 即校验）、
+  必需工具（curl/jq/python3/lsof）、devnet.toml 结构校验（必需键/数值/端口范围与重复/
+  fork 阶梯严格递增/jwt 形状/create2_salt 形状/da_type）、磁盘余量（默认 5GiB，
+  `DEVNET_MIN_FREE_DISK_GB` 覆盖；geth 自杀阈值 ~1.6GiB）、up 互斥锁（mkdir 原子 +
+  陈旧 pid 抢占，封 preflight TOCTOU 窗口）。
+- 失败传播：catch-up 完成前任何失败 → 自动清理本次启动的组件（反序、经身份校验）+
+  非零退出 + 指向日志；catch-up 完成后的失败（激活计数不符）**保留运行现场**供 fork
+  审计取证，提示 `down` 清理。
+- `down`/`status`/`clean` 不再要求二进制存在；pidfile 格式升为 `<pid> <comm>`，kill 前
+  `ps -o comm` 校验身份，PID 复用时告警并跳过。apply 记 `apply.pid`（旧版 Ctrl-C 后成
+  孤儿且 preflight 不可见）；apply 代矿循环监督 anvil 存活（旧版 anvil 死亡后 apply 挂死）。
+- `txsource/run.sh`：L2 RPC 连续 20 次轮询失败 → 明确 die（容忍 ~20s 节点重启）；
+  `--run-timeout` 默认 1800→7200（bcos-testing 8 段全量实测需 ~3600s）。
+- `check_activations.py`：RPC 不可用 → 3 次重试后明确报错 **exit 3**（新增，与语义失败
+  区分）；rollup.json 结构坏 → **exit 2** 带说明。
+- `chainexport`：每请求超时（`-rpc-timeout`，默认 300s）+ 传输层错误 3 次退避重试
+  （RPC error 结果不重试）+ 输出文件存在默认拒绝覆盖（`--force` 才覆盖；stem 含头块高，
+  链在长则 stem 变化，不会误伤）。
+- 修复引入 `proc_comm_of_pid` 时实测踩坑：ps 对已死 pid 返回 rc=1，经 pipefail 传进
+  substitution 会让 `set -e` 下 down 静默 exit 1 —— 恢复路径上所有 substitution 一律
+  `|| true` 兜底（第 3 次回归抓出并修复）。
+
+## 回归（加固后全过）
+
+- 默认 up ×3（两次经 down）→ 激活计数 6/3/8/5 全中、`status` HEALTHY、genesis hash
+  跨 down/up 幂等（`IDEMPOTENT: identical`）。
+- txsource 单测 21/21（含新增 T7：RPC 不可达 → die）；demo 插件 e2e（资金桥→3 交易
+  入块→settle）通过。
+- chainexport 真链导出 5897 块成功；同 stem 重导被拒、`--force` 覆盖且 sha256 一致
+  （导出确定性顺带验证）。

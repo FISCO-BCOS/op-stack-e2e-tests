@@ -7,7 +7,8 @@
 #   T3 中途加入：启动头之前的段标记 missed 不补轮，仅当前段及未来段触发
 #   T4 settle 失败：safe 追不上 unsafe → settle_failed=1、退出码 1
 #   T5 插件失败：插件退出码非 0 → rounds_failed=1、退出码 1
-#   T6 target-blocks 退出：已达目标块数则收尾退出（未触发段不再等）
+#   T6 target-blocks 退出：已达目标块数则收尾退出（未触发段不再等)
+#   T7 L2 RPC 不可达：连续失败达阈值 → 明确 die（robustness 审计 7.4）
 #
 # 桩 = test/rpc_stub.py（假 JSON-RPC：按事件脚本应答，eth_blockNumber / optimism_syncStatus
 # 每次轮询推进事件指针，最后一个事件常驻重复 —— 轮询序列与脚本条目一一对应）。
@@ -200,6 +201,21 @@ check "T6 runner exit" 0 "$RUNNER_RC"
 check "T6 rounds until target" "bedrock/1
 canyon/2" "$(cat "$TXSOURCE_PLUGIN_LOG")"
 stop_stub
+
+# == T7 L2 RPC 不可达：连续失败达到阈值 → 明确 die（不静默空转到 run-timeout） ==
+# （robustness 审计 7.4：旧版 head=0 ts=0 静默空转，烧完 run-timeout 才报超时）
+echo "== T7 L2 RPC 不可达（无服务端） =="
+set +e
+"$RUN" --plugin "$DIR/fake_plugin.sh" --devnet-toml "" \
+  --rollup-json "$DIR/fixtures/rollup_stub.json" \
+  --l2-rpc "http://127.0.0.1:1" --opnode-rpc "http://127.0.0.1:1" \
+  --no-fund --poll-interval 0.05 --run-timeout 60 \
+  --out-dir "$WORK/t7" >"$WORK/t7.out" 2>"$WORK/t7.log"
+T7_RC=$?
+set -e
+check "T7 runner exit (RPC 不可达 → 1)" 1 "$T7_RC"
+grep -q "L2 RPC unreachable" "$WORK/t7.log" && ok "T7 die message points at RPC" || bad "T7 die message missing 'L2 RPC unreachable'"
+grep -q "run timeout" "$WORK/t7.log" && bad "T7 should die on RPC, not burn run-timeout" || ok "T7 no run-timeout burn"
 
 echo
 echo "RESULT: PASS=$PASS FAIL=$FAIL (artifacts in $WORK)"

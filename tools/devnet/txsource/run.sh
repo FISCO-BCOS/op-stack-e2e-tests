@@ -31,7 +31,9 @@ NO_FUND=0
 TARGET_BLOCKS=0           # 0 = 不按块数退出，仅按全部段覆盖退出
 POLL_INTERVAL="1"
 SETTLE_TIMEOUT="180"
-RUN_TIMEOUT="1800"
+# 默认需覆盖 bcos-testing 8 段全量（实测 ~3600s：每轮插件预算 270s + 资金桥 + settle）。
+# 旧默认 1800s 会让全量跑在中途 die（审计 7.3）。
+RUN_TIMEOUT="7200"
 OUT_DIR=""
 SEGMENTS_EXPECT=0         # >0 时校验段数（含 bedrock）
 DEPLOYER_STATE=""
@@ -213,6 +215,7 @@ fire_round() { # $1=segment $2=round
 }
 
 # ---------- 主循环 ----------
+RPC_FAIL_MAX=20   # 连续 RPC 失败阈值（默认 poll 1s → 容忍 ~20s 的节点重启/瞬断，超出即 die）
 main_loop() {
   load_segments
   local last; last="$(last_segment)"
@@ -220,10 +223,21 @@ main_loop() {
   log "segments ($(segment_count)): $(awk -F'\t' '{printf "%s@%d(act %d) ", $1, $2, $3}' "$SEGS"); last=$last"
   : >"$ROUNDS_JSONL"
 
-  local round=0 fired="" missed="" head ts cur i=0
+  local round=0 fired="" missed="" head ts cur i=0 rpc_fail=0 head_raw
   local deadline=$(( $(date +%s) + RUN_TIMEOUT ))
   while :; do
-    head="$(l2_head)"
+    # RPC 不可达显式失败（审计 7.4：旧版 head=0 ts=0 静默空转，烧完 run-timeout 才报超时）
+    head_raw="$(rpc_res "$L2_RPC" eth_blockNumber || true)"   # || true：curl 连接失败的 rc 会经 assignment 触发 set -e，改为计入 rpc_fail
+    if [ -z "$head_raw" ]; then
+      rpc_fail=$((rpc_fail+1))
+      if [ "$rpc_fail" -ge "$RPC_FAIL_MAX" ]; then
+        die "L2 RPC unreachable at $L2_RPC ($rpc_fail consecutive failed polls) —— 栈是否还活着？opdevnet.sh status"
+      fi
+      log "WARN: L2 RPC poll failed ($rpc_fail/$RPC_FAIL_MAX)"
+      sleep "$POLL_INTERVAL"; i=$((i+1)); continue
+    fi
+    rpc_fail=0
+    head="$(dec "$head_raw")"
     ts="$(l2_block_ts "$head")"
     cur="$(segment_for_ts "$ts")"
 

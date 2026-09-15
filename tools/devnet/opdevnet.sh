@@ -27,6 +27,19 @@
 #      逐块 +jump_interval_s，最后 evm_setIntervalMining 2 恢复与 --block-time 2 等价的稳态
 #      （tick 块 ts 恒 = parent+2，Task 1 实测过全程 2s 整齐阶梯）。
 #   2) L1 genesis 时间戳取配置文件的固定绝对值（Task 1 取 now-9000 的相对值）。
+#
+# 健壮性加固（P4 审计定案，逐项有失败注入证据，见提交信息）：
+#   - up 预检 fail-fast：versions.lock sha256 使用时断言、必需工具、devnet.toml 结构
+#     （缺字段/坏值/端口重复/fork 阶梯乱序——旧版会静默算出垃圾锚点或穿透到 inspect 才炸）、
+#     磁盘余量阈值（geth 磁余 <1.6GiB 自杀，默认 5GiB，DEVNET_MIN_FREE_DISK_GB 覆盖）、
+#     端口空闲、up 互斥锁（mkdir + 陈旧 pid 抢占，封 preflight TOCTOU 窗口）。
+#   - 失败传播：catch-up 完成前任何失败 → 自动清理本次启动的组件 + 非零退出 + 指向日志
+#     （旧版留孤儿 anvil 监听）；catch-up 完成后的失败（激活计数不符）保留现场供取证。
+#   - down/status/clean 不再要求二进制存在（/tmp 二进制重启即失，恢复路径不得被卡）；
+#     pidfile 记 "pid comm"，kill 前校验进程身份，PID 复用时跳过并告警。
+#   - inspect 步骤显式守卫（旧版 set -e 静默 exit 1，报错只落在 .err 侧文件）；
+#     apply 记 pidfile（旧版 Ctrl-C 后成孤儿且 preflight 不可见）；apply 代矿循环监督
+#     anvil 存活（旧版 anvil 死亡后 apply 无限挂死）。
 set -euo pipefail
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -96,18 +109,26 @@ load_config() {
   CB="$(toml_get paths contracts_bedrock)"
   LOCK_FROM_TOML="$(toml_get paths versions_lock)"
   lock="${LOCK_FROM_TOML:-$DIR/versions.lock}"
+  LOCK_FILE="$lock"
+  # 任一二进制路径需要从 versions.lock 解析时，lock 文件必须存在（否则 awk 裸崩，
+  # 报错不可读 —— robustness 审计 2.3）
+  if [ ! -f "$lock" ]; then
+    for k in anvil geth op_node op_batcher op_deployer; do
+      [ -n "$(toml_get paths "$k")" ] || die "versions.lock not found: $lock (needed to resolve [paths].$k; fix paths.versions_lock or $DIR/versions.lock)"
+    done
+  fi
   ANVIL="$(toml_get paths anvil)";     [ -n "$ANVIL" ]     || ANVIL="$(lock_path anvil "$lock")"
   GETH="$(toml_get paths geth)";       [ -n "$GETH" ]      || GETH="$(lock_path geth "$lock")"
   OPNODE="$(toml_get paths op_node)";  [ -n "$OPNODE" ]    || OPNODE="$(lock_path op-node "$lock")"
   OPBATCHER="$(toml_get paths op_batcher)"; [ -n "$OPBATCHER" ] || OPBATCHER="$(lock_path op-batcher "$lock")"
   OPDEPLOYER="$(toml_get paths op_deployer)"; [ -n "$OPDEPLOYER" ] || OPDEPLOYER="$(lock_path op-deployer "$lock")"
-  for b in "$ANVIL" "$GETH" "$OPNODE" "$OPBATCHER" "$OPDEPLOYER"; do
-    [ -x "$b" ] || die "binary not executable: $b (check versions.lock / devnet.toml [paths])"
-  done
+  # 二进制可执行性只在 up 的 check_binaries 里断言（robustness 审计 MF1）：
+  # down/status/clean 是重启后（/tmp 二进制必失）的恢复路径，不得因二进制缺失而罢工。
   [ -d "$CB" ] || die "contracts-bedrock not found: $CB"
   L2_HTTP="http://127.0.0.1:$P_GETH_HTTP"; L1_RPC="http://127.0.0.1:$P_ANVIL"
   OPNODE_RPC="http://127.0.0.1:$P_OPNODE"; BATCHER_RPC="http://127.0.0.1:$P_BATCHER"
-  EXPECTED_L2_TIME=$((L1_GENESIS_TS + L1_BLOCK_TIME * PIN_BLOCK))
+  # EXPECTED_L2_TIME 在 cmd_up 的 validate_config 之后才计算（审计 4.1：坏 toml 若在此处
+  # 做算术，bash 会以裸 arithmetic error 退出，结构校验永远轮不到跑）
 }
 
 # ---------- 通用小工具 ----------
@@ -133,21 +154,174 @@ start_bg() { # $1=name $2=logfile $3..=cmd —— 子进程统一以 $RUN 为工
   (
     cd "$RUN" || exit 1
     nohup "$@" >>"$logf" 2>&1 &
-    echo $! >"$RUN/$name.pid"
+    echo "$! $(basename "$1")" >"$RUN/$name.pid"   # "pid comm"：kill_pidfile 的进程身份校验依据
   )
-  log "started $name (pid $(cat "$RUN/$name.pid"), log $logf)"
+  log "started $name (pid $(awk '{print $1}' "$RUN/$name.pid"), log $logf)"
 }
-pid_alive() { [ -f "$1" ] && kill -0 "$(cat "$1")" 2>/dev/null; }
-kill_pidfile() { # $1=pidfile $2=name
+# pidfile 格式（robustness 审计 MF4）："<pid> <comm-basename>"，如 "67551 geth"。
+# kill 前用 ps -o comm 校验进程身份，防 PID 重启复用后杀无辜进程（实测：把无辜 sleep
+# 的 pid 写进 geth.pid，旧 down 直接 SIGTERM+SIGKILL）。
+pid_alive() { [ -f "$1" ] && kill -0 "$(awk '{print $1}' "$1")" 2>/dev/null; }
+proc_comm_of_pid() { # 空 = 进程不存在（ps rc=1 经 pipefail 会传给 substitution，必须 || true 兜住，
+                     # 否则 set -e 下 down 在「进程已死」的恢复路径上静默退出 1 —— 回归实测踩坑）
+  ps -p "$1" -o comm= 2>/dev/null | awk -F/ '{print $NF}' || true
+}
+kill_pidfile() { # $1=pidfile $2=期望 comm basename（opnode→op-node 等；miner→bash）
   [ -f "$1" ] || return 0
-  local pid; pid="$(cat "$1")"
-  if kill -0 "$pid" 2>/dev/null; then
-    kill "$pid" 2>/dev/null || true
-    local i=0
-    while kill -0 "$pid" 2>/dev/null && [ "$i" -lt 10 ]; do sleep 0.5; i=$((i+1)); done
-    kill -9 "$pid" 2>/dev/null || true
-  fi
+  local pid want have
+  pid="$(awk '{print $1}' "$1")"; want="$(awk '{print $2}' "$1")"
+  [ -n "$want" ] || want="$2"
+  have="$(proc_comm_of_pid "$pid")"
   rm -f "$1"
+  if [ -z "$have" ]; then return 0; fi   # 进程已不存在
+  if [ "$have" != "$want" ]; then
+    log "WARN: pid $pid (from $1) now runs '$have', expected '$want' —— PID 已被复用，跳过 kill（如确需清理请人工 lsof）"
+    return 0
+  fi
+  kill "$pid" 2>/dev/null || true
+  local i=0
+  while kill -0 "$pid" 2>/dev/null && [ "$i" -lt 10 ]; do sleep 0.5; i=$((i+1)); done
+  kill -9 "$pid" 2>/dev/null || true
+}
+# up 互斥锁（robustness 审计 1.1）：preflight 检查与首个 pidfile 落盘之间有 TOCTOU 窗口，
+# 同秒并发双 up 会双双通过并互相覆盖 anvil.pid。mkdir 原子锁 + 陈旧检测（持锁 pid 死亡可抢）。
+UP_LOCK=""
+acquire_up_lock() {
+  [ -n "$RUN" ] || die "up lock: RUNTIME not resolved"
+  if mkdir "$RUN/.up-lock" 2>/dev/null; then echo "$$" >"$RUN/.up-lock/pid"; UP_LOCK="$RUN/.up-lock"; return 0; fi
+  local lpid; lpid="$(awk '{print $1}' "$RUN/.up-lock/pid" 2>/dev/null || true)"   # pid 文件缺失时 awk rc=2，防 set -e 静默死
+  if [ -n "$lpid" ] && ! kill -0 "$lpid" 2>/dev/null; then
+    log "stale up-lock (holder pid $lpid gone) —— stealing"
+    rm -rf "$RUN/.up-lock"
+    if mkdir "$RUN/.up-lock" 2>/dev/null; then echo "$$" >"$RUN/.up-lock/pid"; UP_LOCK="$RUN/.up-lock"; return 0; fi
+  fi
+  die "another 'up' appears in progress (lock $RUN/.up-lock, holder pid ${lpid:-?}); 若确认无并发 up，可 rm -rf $RUN/.up-lock"
+}
+release_up_lock() { [ -n "$UP_LOCK" ] && rm -rf "$UP_LOCK"; UP_LOCK=""; }
+# 失败自动清理（robustness 审计 MF3）：up 中途失败不再留孤儿进程/半状态（实测两场景：
+# 坏 fork 阶梯 inspect 失败、坏 geth 二进制 —— 旧版都把 anvil 留在后台监听）。
+# 只清理本次 up 启动的组件；artifacts/ 与 logs/ 保留（与 down 同语义）。
+STARTED=""
+mark_started() { STARTED="$1 $STARTED"; }   # 反序追加 → STARTED 天然就是 kill 顺序
+UP_STACK_OK=0   # 1 = 栈完整起来且 catch-up 完成（此后失败保留现场，见 up_exit_trap）
+up_failure_cleanup() {
+  log "up failed —— auto-cleaning components started by this invocation:[ ${STARTED} ]"
+  local f
+  for f in $STARTED; do
+    case "$f" in
+      batcher) kill_pidfile "$RUN/batcher.pid" op-batcher ;;
+      opnode)  kill_pidfile "$RUN/opnode.pid"  op-node ;;
+      geth)    kill_pidfile "$RUN/geth.pid"    geth ;;
+      miner)   kill_pidfile "$RUN/miner.pid"   bash ;;
+      apply)   kill_pidfile "$RUN/apply.pid"   op-deployer ;;
+      anvil)   kill_pidfile "$RUN/anvil.pid"   anvil ;;
+    esac
+  done
+  rm -rf "$L2DIR" "$RUN"
+  log "cleaned: started components + L2 datadir + run state; logs kept in $LOGS"
+}
+up_exit_trap() {
+  local rc=$?
+  trap - EXIT
+  release_up_lock
+  if [ "$rc" -ne 0 ] && [ -n "$STARTED" ]; then
+    if [ "${UP_STACK_OK:-0}" -eq 1 ]; then
+      # 栈已完整起来、catch-up 已完成（如激活块计数不符）：链在跑但语义异常 —— 保留现场
+      # 供 fork 审计取证（README：链不匹配说明链有问题），只提示清理方式。
+      log "up failed AFTER the stack fully came up —— stack left RUNNING for forensics; ./opdevnet.sh down to clean"
+    else
+      up_failure_cleanup
+    fi
+  fi
+  exit "$rc"
+}
+# up 前置预检（robustness 审计 MF2/MF5/MF6）：fail-fast 带清晰错误
+is_uint() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
+sha256_of() { # $1=file -> hash
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" 2>/dev/null | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1" 2>/dev/null | awk '{print $1}'
+  else die "no sha256 tool available (need sha256sum or shasum)"; fi
+}
+lock_sha() { awk -v k="$1" '$1==k { for (i=2;i<=NF;i++) if ($i ~ /^sha256=/) { sub(/^sha256=/,"",$i); print $i; exit } }' "$LOCK_FILE"; }
+check_binaries() {
+  local b hint
+  for b in "$ANVIL" "$GETH" "$OPNODE" "$OPBATCHER" "$OPDEPLOYER"; do
+    [ -x "$b" ] || {
+      hint=""
+      case "$b" in /tmp/*) hint=" —— /tmp 下二进制重启即失，按 versions.lock 的 src= 字段重建" ;; esac
+      die "binary not executable: $b (check versions.lock / devnet.toml [paths])$hint"
+    }
+  done
+  # 内容 pin 校验：versions.lock 的 sha256= 从「记录」升级为「使用时断言」（审计 2.1：
+  # 截断/替换过的二进制旧版一路放行，直到组件崩溃才间接暴露）
+  local key bin want got
+  for pair in "geth:$GETH" "op-node:$OPNODE" "op-batcher:$OPBATCHER" "op-deployer:$OPDEPLOYER"; do
+    key="${pair%%:*}"; bin="${pair#*:}"
+    want="$(lock_sha "$key")"; [ -n "$want" ] || continue   # anvil/cast 等无 sha pin 的条目跳过
+    got="$(sha256_of "$bin")"
+    [ "$got" = "$want" ] || die "binary sha256 mismatch for $key: $bin
+  lock expects $want
+  actual     ${got:-<unreadable>}
+  rebuild the binary per versions.lock src=, or fix versions.lock"
+  done
+  local t
+  for t in curl jq python3 lsof; do
+    command -v "$t" >/dev/null 2>&1 || die "required tool missing: $t"
+  done
+}
+check_disk() { # 磁余阈值（审计 5.1：README 实测 geth 磁余 <1.6GiB 自杀；默认 5GiB 含运行时体量余量）
+  local need_gb="${DEVNET_MIN_FREE_DISK_GB:-5}" avail_kb
+  is_uint "$need_gb" || die "DEVNET_MIN_FREE_DISK_GB must be an integer, got '$need_gb'"
+  mkdir -p "$RUNTIME"
+  avail_kb="$(df -k "$RUNTIME" 2>/dev/null | awk 'NR==2{print $4}')"
+  is_uint "$avail_kb" || die "cannot read free disk space for $RUNTIME"
+  [ "$avail_kb" -ge $(( need_gb * 1024 * 1024 )) ] || \
+    die "free disk on $RUNTIME filesystem: $(( avail_kb / 1024 ))MiB < required ${need_gb}GiB
+  geth gracefully shuts down below ~1.6GiB free (README 运维踩坑); free space or override with DEVNET_MIN_FREE_DISK_GB"
+}
+validate_config() { # devnet.toml 结构校验（审计 4.1/4.2：缺字段旧版静默算出垃圾锚点
+                    # l2_time=52；fork 阶梯乱序穿透到 inspect 才炸且报错不可见）
+  local f off prev=0 p v
+  for v in "meta.runtime_dir:$RUNTIME" "meta.create2_salt:$(toml_get meta create2_salt)" \
+           "l1.chain_id:$L1_CHAIN_ID" "l1.genesis_timestamp:$L1_GENESIS_TS" "l1.block_time:$L1_BLOCK_TIME" \
+           "l1.pin_block:$PIN_BLOCK" "l1.private_key:$DEPLOYER_KEY" "l1.batcher_private_key:$BATCHER_KEY" \
+           "l2.chain_id:$L2_CHAIN_ID" "l2.jwt:$JWT" \
+           "accel.jump_interval_s:$JUMP_S" "accel.activation_margin_s:$MARGIN_S" \
+           "accel.target_l2_blocks:$TARGET_BLOCKS" "accel.catchup_timeout_s:$CATCHUP_TIMEOUT" \
+           "batcher.max_channel_duration:$MAX_CHAN_DUR" "batcher.da_type:$DA_TYPE" \
+           "paths.contracts_bedrock:$CB"; do
+    [ -n "${v#*:}" ] || die "config: ${v%%:*} missing or empty"
+  done
+  case "$(toml_get meta create2_salt)" in
+    0x[0-9a-fA-F]*) : ;;
+    *) die "config: [meta].create2_salt must be 0x-prefixed hex" ;;
+  esac
+  case "$JWT" in
+    *[!0-9a-fA-F]*|"") die "config: [l2].jwt must be 64 hex chars (got ${#JWT})" ;;
+  esac
+  [ "${#JWT}" -eq 64 ] || die "config: [l2].jwt must be 64 hex chars (got len=${#JWT})"
+  case "$DA_TYPE" in calldata|blobs) : ;; *) die "config: [batcher].da_type must be calldata|blobs (got '$DA_TYPE')" ;; esac
+  for v in "$L1_CHAIN_ID" "$L1_GENESIS_TS" "$L1_BLOCK_TIME" "$PIN_BLOCK" "$L2_CHAIN_ID" \
+           "$JUMP_S" "$MARGIN_S" "$TARGET_BLOCKS" "$CATCHUP_TIMEOUT" "$MAX_CHAN_DUR"; do
+    is_uint "$v" || die "config: numeric field has bad value '$v'"
+  done
+  [ "$L1_BLOCK_TIME" -ge 1 ] || die "config: l1.block_time must be >= 1"
+  [ "$PIN_BLOCK" -ge 1 ] || die "config: l1.pin_block must be >= 1"
+  # 端口：范围 + 互不冲突（toml 内部自撞旧版不查，运行期才以 geth 绑定失败暴露）
+  local ports=("$P_ANVIL" "$P_GETH_HTTP" "$P_GETH_AUTH" "$P_GETH_WS" "$P_OPNODE" "$P_BATCHER") dups
+  for p in "${ports[@]}"; do
+    is_uint "$p" || die "config: port field has bad value '$p'"
+    [ "$p" -ge 1 ] && [ "$p" -le 65535 ] || die "config: port $p out of range 1-65535"
+  done
+  dups="$(printf '%s\n' "${ports[@]}" | sort | uniq -d)"
+  [ -z "$dups" ] || die "config: duplicate port(s) in devnet.toml:[ ${dups//$'\n'/ }] — components would fight over the socket"
+  # fork 阶梯：本次生效集合内严格递增（op-deployer 只在 genesis 生成期才查，乱序会穿透）
+  for f in $RUN_FORKS; do
+    off="$(toml_get forks "$f")"
+    is_uint "$off" || die "config: [forks].$f missing or not a non-negative integer ('$off')"
+    [ "$off" -gt "$prev" ] || die "config: fork ladder not strictly increasing at $f (offset $off, prior $prev)"
+    prev="$off"
+  done
 }
 tail_log() { printf -- '---- tail %s ----\n' "$1"; tail -n "${2:-25}" "$1" 2>/dev/null || true; }
 mine() { rpc "$L1_RPC" evm_mine '[]' >/dev/null; }
@@ -217,6 +391,11 @@ cmd_up() {
       *) die "unknown up flag: $1" ;;
     esac
   done
+  # campaign 数值参数 fail-fast（审计 4.5：非数字旧版落到 python traceback）
+  if [ "$CAMPAIGN" -eq 1 ]; then
+    is_uint "$CAMPAIGN_SEG_S" || die "--segment-seconds must be a positive integer (got '$CAMPAIGN_SEG_S')"
+    [ "$CAMPAIGN_SEG_S" -ge 1 ] || die "--segment-seconds must be >= 1"
+  fi
   if [ "$CAMPAIGN" -eq 1 ]; then
     generate_campaign_toml "$TOML" "$CAMPAIGN_TOML" | sed 's/^/[campaign] /'
     TOML="$CAMPAIGN_TOML"
@@ -225,12 +404,19 @@ cmd_up() {
   load_config
   log "devnet up: runtime=$RUNTIME  l2_chain_id=$L2_CHAIN_ID  l1_chain_id=$L1_CHAIN_ID"
   [ "$CAMPAIGN" -eq 0 ] || log "CAMPAIGN mode: seg=${CAMPAIGN_SEG_S}s anchor=now-${CAMPAIGN_ANCHOR_OFFSET_S}s forks=[${CAMPAIGN_FORKS:-$FORKS}] toml=${TOML}（链时间贴墙钟，边界按墙钟逐段到来）"
-  log "anchor: anvil genesis ts=$L1_GENESIS_TS (fixed), pin L1 head at block $PIN_BLOCK -> expected rollup l2_time=$EXPECTED_L2_TIME"
 
-  # ---- preflight ----
+  # ---- preflight（fail-fast：二进制/内容 pin/工具/配置结构/磁盘/端口/互斥） ----
   STEP="preflight"
-  for f in batcher opnode geth anvil miner; do
-    if pid_alive "$RUN/$f.pid"; then die "already running (pid $(cat "$RUN/$f.pid") in $RUN/$f.pid); run ./opdevnet.sh down first"; fi
+  trap up_exit_trap EXIT
+  mkdir -p "$RUN" 2>/dev/null || true
+  acquire_up_lock
+  check_binaries
+  validate_config
+  check_disk
+  EXPECTED_L2_TIME=$((L1_GENESIS_TS + L1_BLOCK_TIME * PIN_BLOCK))
+  log "anchor: anvil genesis ts=$L1_GENESIS_TS (fixed), pin L1 head at block $PIN_BLOCK -> expected rollup l2_time=$EXPECTED_L2_TIME"
+  for f in batcher opnode geth anvil miner apply; do
+    if pid_alive "$RUN/$f.pid"; then die "already running (pid $(awk '{print $1}' "$RUN/$f.pid") in $RUN/$f.pid); run ./opdevnet.sh down first"; fi
   done
   local p
   for p in "$P_ANVIL" "$P_GETH_HTTP" "$P_GETH_AUTH" "$P_GETH_WS" "$P_OPNODE" "$P_BATCHER"; do
@@ -252,6 +438,7 @@ cmd_up() {
   STEP="anvil"
   start_bg anvil "$LOGS/anvil.log" "$ANVIL" --chain-id "$L1_CHAIN_ID" --no-mining \
     --timestamp "$L1_GENESIS_TS" --port "$P_ANVIL"
+  mark_started anvil
   wait_listen "$P_ANVIL" 15 || { tail_log "$LOGS/anvil.log"; die "anvil did not listen on $P_ANVIL"; }
   wait_rpc "$L1_RPC" 15 || { tail_log "$LOGS/anvil.log"; die "anvil RPC not ready"; }
   local ts0; ts0="$(block_ts 0)"
@@ -296,21 +483,33 @@ json.dump(s, open(p, 'w'))"
   nohup "$OPDEPLOYER" apply --workdir "$WD" --l1-rpc-url "$L1_RPC" --private-key "$DEPLOYER_KEY" \
     >"$LOGS/deployer-apply.log" 2>&1 &
   local apply_pid=$!
+  echo "$apply_pid op-deployer" >"$RUN/apply.pid"   # 旧版无 pidfile：Ctrl-C 中断 up 后 apply 成孤儿且 preflight 不可见（审计 1.4/3）
+  mark_started apply
   sleep 2   # deployer 在入口读 L1 头作为「L1 起始块」——此刻头仍停在 pin_block
-  ( while kill -0 "$apply_pid" 2>/dev/null; do mine_next $(( $(head_ts) + L1_BLOCK_TIME )); sleep 1; done ) &   # apply 代矿循环（ts 仍精确 parent+2）
+  # apply 代矿循环（ts 仍精确 parent+2）。监督 anvil 存活（审计 3.4）：anvil 死亡时代矿若
+  # 静默空转，apply 会无限挂死等块 —— 最坏失败模式；此处杀 apply 让失败立刻传播。
+  ( while kill -0 "$apply_pid" 2>/dev/null; do
+      if ! pid_alive "$RUN/anvil.pid"; then kill "$apply_pid" 2>/dev/null; exit 1; fi
+      mine_next $(( $(head_ts) + L1_BLOCK_TIME )); sleep 1
+    done ) &
   local miner_pid=$!
-  echo "$miner_pid" >"$RUN/miner.pid"
+  echo "$miner_pid bash" >"$RUN/miner.pid"
+  mark_started miner
   local rc=0
   wait "$apply_pid" || rc=$?
   kill "$miner_pid" 2>/dev/null || true; wait "$miner_pid" 2>/dev/null || true
-  rm -f "$RUN/miner.pid"
+  rm -f "$RUN/miner.pid" "$RUN/apply.pid"
   [ "$rc" -eq 0 ] || { tail_log "$LOGS/deployer-apply.log" 40; die "op-deployer apply failed (rc=$rc)"; }
   log "apply done: $(grep -c '' "$LOGS/deployer-apply.log") log lines; L1 head now block $(head_number)"
 
   # ---- 4) inspect 取产物 ----
+  # 守卫必须显式（审计 3.2：坏 fork 阶梯实测 inspect genesis 失败时脚本 set -e 静默 exit 1，
+  # 报错只落在 .err 侧文件里，用户零输出）
   STEP="inspect"
-  "$OPDEPLOYER" inspect genesis --workdir "$WD" "$L2_CHAIN_ID" 2>"$LOGS/inspect-genesis.err" >"$ART/genesis.json"
-  "$OPDEPLOYER" inspect rollup  --workdir "$WD" "$L2_CHAIN_ID" 2>"$LOGS/inspect-rollup.err"  >"$ART/rollup.json"
+  "$OPDEPLOYER" inspect genesis --workdir "$WD" "$L2_CHAIN_ID" 2>"$LOGS/inspect-genesis.err" >"$ART/genesis.json" \
+    || { tail_log "$LOGS/inspect-genesis.err" 25; die "op-deployer inspect genesis failed (fork ladder ordering / intent 校验? see $LOGS/inspect-genesis.err)"; }
+  "$OPDEPLOYER" inspect rollup  --workdir "$WD" "$L2_CHAIN_ID" 2>"$LOGS/inspect-rollup.err"  >"$ART/rollup.json" \
+    || { tail_log "$LOGS/inspect-rollup.err" 25; die "op-deployer inspect rollup failed (see $LOGS/inspect-rollup.err)"; }
   jq -e '.genesis.l2_time' "$ART/rollup.json" >/dev/null 2>&1 || { tail_log "$LOGS/inspect-rollup.err"; die "inspect rollup output invalid"; }
 
   # ---- 5) 产物归一化到 toml 锚点（README「post-edit 路径」定案：时间数值一致即等价）----
@@ -373,6 +572,7 @@ json.dump(s, open(p, 'w'))"
     --ws --ws.port "$P_GETH_WS" \
     --state.scheme hash --gcmode archive --syncmode full --nodiscover --port 0 \
     --rollup.disabletxpoolgossip
+  mark_started geth
   # 注意 1：不给 --rollup.sequencerhttp。op-geth 的 SendTx 在该旗标存在时把用户 raw tx
   # 转发到指定端点（eth/api_backend.go SendTx）；单节点 devnet 指向 op-node 时转发必败
   # （op-node 无 eth_sendRawTransaction，-32601），用户 RPC 发交易整条不可用（P1-3 实测）。
@@ -417,6 +617,7 @@ json.dump(s, open(p, 'w'))"
     --rollup.l1-chain-config "$ART/l1-chain-config.json" \
     --sequencer.enabled --sequencer.l1-confs 0 \
     --rollup.config "$ART/rollup.json" --rpc.port "$P_OPNODE"
+  mark_started opnode
   wait_listen "$P_OPNODE" 30 || { tail_log "$LOGS/opnode.log" 40; die "op-node rpc not listening on $P_OPNODE"; }
   # op-node RPC 没有 eth_chainId，用 optimism_syncStatus 探活（run6 教训：探针方法要对组件语义）
   wait_rpc "$OPNODE_RPC" 30 optimism_syncStatus || { tail_log "$LOGS/opnode.log" 40; die "op-node rpc not ready"; }
@@ -428,6 +629,7 @@ json.dump(s, open(p, 'w'))"
     --private-key "$BATCHER_KEY" \
     --max-channel-duration "$MAX_CHAN_DUR" --data-availability-type "$DA_TYPE" \
     --throttle.unsafe-da-bytes-lower-threshold 0 --rpc.port "$P_BATCHER"
+  mark_started batcher
   wait_listen "$P_BATCHER" 20 || { tail_log "$LOGS/batcher.log" 40; die "batcher rpc not listening on $P_BATCHER"; }
   # batcher 默认 --rpc.port 8545 与 anvil 撞（Task 1 实测），配置固定 8548
 
@@ -436,6 +638,9 @@ json.dump(s, open(p, 'w'))"
   # ---- 10) 等待 L2 追到目标；campaign 以「头块时间追平墙钟」为准，默认按块数+激活块检查 ----
   STEP="l2-catchup"
   local deadline=$(( $(date +%s) + CATCHUP_TIMEOUT )) last_reported=0 blk
+  # 标记「栈已完整、catch-up 完成」：此前的失败自动清理已启动组件；此后的失败
+  # （激活块计数不符）保留运行现场供取证（见 up_exit_trap）。
+  UP_STACK_OK=0
   if [ "$CAMPAIGN" -eq 1 ]; then
     # campaign：sequencer 以机器速度从 genesis 追墙钟，追平后转入实时出块。
     # 头块 ts 进入墙钟 ±DRIFT 即认为 catch-up 完成（不设块数目标 —— 边界留给墙钟逐段穿越）。
@@ -450,6 +655,7 @@ json.dump(s, open(p, 'w'))"
       wall="$(date +%s)"
       if [ "$blk" -gt 0 ] && [ $(( wall - hts )) -le "$CAMPAIGN_CATCHUP_DRIFT_S" ]; then
         log "campaign catch-up done: head=$blk head_ts=$hts wall=$wall (behind $((wall-hts))s)"
+        UP_STACK_OK=1
         break
       fi
       [ "$(date +%s)" -gt "$deadline" ] && { tail_log "$LOGS/opnode.log" 30; die "campaign catch-up timeout after ${CATCHUP_TIMEOUT}s (head=$blk head_ts=${hts:-?})"; }
@@ -486,7 +692,7 @@ json.dump(s, open(p, 'w'))"
     if [ $(( blk - last_reported )) -ge 500 ] || [ "$blk" -ge "$TARGET_BLOCKS" ]; then
       log "L2 head: $blk / $TARGET_BLOCKS"; last_reported="$blk"
     fi
-    [ "$blk" -ge "$TARGET_BLOCKS" ] && break
+    [ "$blk" -ge "$TARGET_BLOCKS" ] && { UP_STACK_OK=1; break; }
     [ "$(date +%s)" -gt "$deadline" ] && { tail_log "$LOGS/opnode.log" 30; die "catch-up timeout after ${CATCHUP_TIMEOUT}s (head=$blk)"; }
     sleep 2
   done
@@ -731,7 +937,7 @@ cmd_status() {
     pidfile="$RUN/$comp.pid"
     pid="-"; alive="no"; note=""
     if [ -f "$pidfile" ]; then
-      pid="$(cat "$pidfile")"
+      pid="$(awk '{print $1}' "$pidfile")"
       kill -0 "$pid" 2>/dev/null && alive="yes" || { alive="DEAD"; overall=1; }
     else
       overall=1
@@ -791,11 +997,13 @@ cmd_down() {
   load_config
   STEP="down"
   if [ ! -d "$RUN" ]; then log "nothing to down (no run state)"; return 0; fi
-  # 反序 kill：batcher -> op-node -> geth -> anvil（+ 可能残留的 apply 代矿循环）
-  kill_pidfile "$RUN/batcher.pid" batcher
-  kill_pidfile "$RUN/opnode.pid"  opnode
+  # 反序 kill：batcher -> op-node -> geth -> 代矿循环 -> apply -> anvil
+  # （第二参数 = 期望进程名，kill 前校验 PID 身份，防 PID 复用误杀 —— 审计 1.4）
+  kill_pidfile "$RUN/batcher.pid" op-batcher
+  kill_pidfile "$RUN/opnode.pid"  op-node
   kill_pidfile "$RUN/geth.pid"    geth
-  kill_pidfile "$RUN/miner.pid"   miner
+  kill_pidfile "$RUN/miner.pid"   bash
+  kill_pidfile "$RUN/apply.pid"   op-deployer
   kill_pidfile "$RUN/anvil.pid"   anvil
   # 端口清空核验（socket 释放比进程死亡略慢，给宽限重试）
   local p stuck="" i

@@ -93,6 +93,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -103,6 +104,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
@@ -226,6 +228,42 @@ func (c *rpcClient) call(result interface{}, method string, params ...interface{
 	if err != nil {
 		return err
 	}
+	// Robustness hardening (P4 audit 6.1/6.2): the client previously had no
+	// timeout (a hung node blocked the export forever — reproduced with an
+	// accept-no-reply listener) and no retry (one blip mid-export discarded
+	// the whole run). Transport-level failures are retried with backoff;
+	// deterministic RPC error results are NOT retried.
+	const attempts = 3
+	var lastErr error
+	for i := 0; i < attempts; i++ {
+		if i > 0 {
+			time.Sleep(time.Duration(i) * time.Second)
+		}
+		err := c.callOnce(result, body, method)
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if isRpcErrorResult(err) { // node answered with a json-rpc error: deterministic
+			return err
+		}
+	}
+	return lastErr
+}
+
+func isRpcErrorResult(err error) bool {
+	var re *rpcError
+	return errors.As(err, &re)
+}
+
+type rpcError struct {
+	Code int
+	Msg  string
+}
+
+func (e *rpcError) Error() string { return fmt.Sprintf("rpc error %d: %s", e.Code, e.Msg) }
+
+func (c *rpcClient) callOnce(result interface{}, body []byte, method string) error {
 	resp, err := c.http.Post(c.url, "application/json", bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("%s: %w", method, err)
@@ -233,7 +271,10 @@ func (c *rpcClient) call(result interface{}, method string, params ...interface{
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return err
+		return fmt.Errorf("%s: read reply: %w", method, err)
+	}
+	if resp.StatusCode >= 500 || resp.StatusCode == 429 {
+		return fmt.Errorf("%s: http %d: %s", method, resp.StatusCode, truncate(string(raw), 200))
 	}
 	var out struct {
 		Result json.RawMessage `json:"result"`
@@ -247,7 +288,7 @@ func (c *rpcClient) call(result interface{}, method string, params ...interface{
 		return fmt.Errorf("%s: bad rpc reply %s", method, truncate(string(raw), 200))
 	}
 	if out.Error != nil {
-		return fmt.Errorf("%s: rpc error %d: %s", method, out.Error.Code, out.Error.Message)
+		return &rpcError{Code: out.Error.Code, Msg: out.Error.Message}
 	}
 	if result == nil {
 		return nil
@@ -671,14 +712,18 @@ func main() {
 	dumpWorkers := flag.Int("dump-workers", 4, "parallel state-dump workers")
 	genesisPath := flag.String("genesis", "/tmp/opdevnet/artifacts/genesis.json",
 		"geth genesis file whose alloc resolves preimage-less dump keys and backfills storage slots")
+	rpcTimeout := flag.Duration("rpc-timeout", 300*time.Second,
+		"per-request RPC timeout (a hung node previously blocked the export forever)")
+	force := flag.Bool("force", false,
+		"overwrite an existing output file (default: refuse — silent overwrite was a footgun)")
 	flag.Parse()
-	if err := run(*rpcURL, *rollupPath, *outDir, *poststate, *workers, *dumpWorkers, *gethCommit, *genesisPath); err != nil {
+	if err := run(*rpcURL, *rollupPath, *outDir, *poststate, *workers, *dumpWorkers, *gethCommit, *genesisPath, *rpcTimeout, *force); err != nil {
 		fmt.Fprintf(os.Stderr, "chainexport: FAIL: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func run(rpcURL, rollupPath, outDir, poststate string, workers, dumpWorkers int, gethCommit, genesisPath string) error {
+func run(rpcURL, rollupPath, outDir, poststate string, workers, dumpWorkers int, gethCommit, genesisPath string, rpcTimeout time.Duration, force bool) error {
 	if outDir == "" {
 		return fmt.Errorf("--out-dir is required")
 	}
@@ -699,7 +744,7 @@ func run(rpcURL, rollupPath, outDir, poststate string, workers, dumpWorkers int,
 	for _, f := range forks {
 		forkNames = append(forkNames, f.name)
 	}
-	client := &rpcClient{url: rpcURL, http: &http.Client{}, label: rpcURL}
+	client := &rpcClient{url: rpcURL, http: &http.Client{Timeout: rpcTimeout}, label: rpcURL}
 
 	var headHex string
 	if err := client.call(&headHex, "eth_blockNumber"); err != nil {
@@ -975,6 +1020,16 @@ func run(rpcURL, rollupPath, outDir, poststate string, workers, dumpWorkers int,
 	}
 	outBytes = append(outBytes, '\n')
 	file := outDir + "/" + stem + ".json"
+	// Refuse to silently clobber a previous export (robustness hardening): the
+	// stem embeds the head height + activation spec, so an existing file is
+	// either a previous export of the same chain or a colliding run.
+	if !force {
+		if _, err := os.Stat(file); err == nil {
+			return fmt.Errorf("output %s already exists (pass --force to overwrite)", file)
+		} else if !os.IsNotExist(err) {
+			return err
+		}
+	}
 	if err := os.WriteFile(file, outBytes, 0o644); err != nil {
 		return err
 	}
