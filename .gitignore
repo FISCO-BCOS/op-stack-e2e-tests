@@ -13,6 +13,13 @@ opstack-executor/tests/t8n/vectors/*.json
 # generation by-product with no reader (unlike golden/engine/SHA256SUMS, which is a
 # tracked contract), so it stays out of the tree.
 opstack-executor/tests/t8n/vectors/SHA256SUMS
+# P3-2 exceptions: the real-derivation devnet snapshot is a registered INPUT (a
+# one-shot chainexport export of the real devnet chain, replayed as-is), not a
+# regen.sh product -- it is tracked like the other non-generated contracts, together
+# with the vectors/SHA256SUMS contract that pins its bytes (the ladder mode upserts
+# only its own stem's line in that file and preserves the devnet lines).
+!opstack-executor/tests/t8n/vectors/devnet_*.json
+!opstack-executor/tests/t8n/vectors/SHA256SUMS
 opstack-executor/tests/t8n/golden/engine/*.golden.json
 opstack-executor/tests/t8n/golden/engine/chained/*.json
 opstack-executor/tests/t8n/golden/engine/getpayload/*.json

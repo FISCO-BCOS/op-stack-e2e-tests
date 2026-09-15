@@ -227,3 +227,12 @@ invalid_isthmus_transfer_basic_static_12.json
 invalid_isthmus_transfer_basic_static_3.json
 invalid_jovian_transfer_basic_static_12.json
 invalid_jovian_transfer_basic_static_3.json
+
+# Real-derivation devnet snapshot (P3-2): 884-block d3-devnet chain exported live by
+# tools/devnet/chainexport (opdevnet campaign ladder; stem rule devnet_<blocks>_<digest8>,
+# digest8 = sha256 over the actual-header activation spec -- single source of truth in
+# chainexport/main.go, same convention as the ladder stem). Not a regen.sh product:
+# regen.sh registers it read-only from the vectors/ glob and never regenerates it.
+# Its bytes are pinned in vectors/SHA256SUMS; the 10 create-output divergences
+# registered in DIVERGENCES.md (P3-1b) bind to this stem.
+devnet_884_007399eb.json

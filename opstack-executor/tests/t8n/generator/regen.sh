@@ -419,6 +419,17 @@ is_ladder() {
     *) return 1 ;;
   esac
 }
+# P3-2：devnet 真实派生快照（chainexport 产物）不是本脚本的生成产物——它来自一次性
+# 真实 devnet 导出（tools/devnet/chainexport），stem 规则 devnet_<blocks>_<digest8>
+# （digest8 = 实际链头激活点 spec 的 sha256 前 8 hex，单一真相在 chainexport/main.go，
+# 与 ladder 的 Go 侧 stem 同理，本脚本绝不复算）。与 ladder 同理单独成组 append，
+# 字节由 vectors/SHA256SUMS 契约钉住。
+is_devnet() {
+  case "$1" in
+    devnet_*.json) return 0 ;;
+    *) return 1 ;;
+  esac
+}
 # WI-E13：static item 3/12（expectedBlobVersionedHashes / executionRequests 非空）解除
 # 「loader 不可表达」豁免，jovian 变体（static_3/12）一并入册。单独成组 append（同
 # observer 惯例），历史注释不改写。
@@ -437,6 +448,7 @@ for f in "$T8N_DIR"/vectors/*.json; do
   if is_blob_static "$base"; then continue; fi
   if is_observer "$base"; then continue; fi
   if is_ladder "$base"; then continue; fi
+  if is_devnet "$base"; then continue; fi
   registerable+=("$base")
 done
 # 确定性顺序：排序后追加（与 diff 集合比较同序）。
@@ -453,10 +465,23 @@ append_if_absent "$manifest" "Dual-path observer vectors (gaslimit/basefee, both
 # D1g：ladder 差分向量（mode 产物；无 golden，见上方生成步骤）。stem 由生成器
 # 产出并经 LADDER-STEM 捕获（含 spec digest，见上方注释）。
 append_if_absent "$manifest" "Ladder differential vector (D1g): ${N_LADDER_BLOCKS}-block 8-fork regolith->jovian ladder (mode product, no golden)" "${ladder_stem}.json"
+# P3-2：devnet 快照组（chainexport 产物，入库的只读注册向量；stem 不由本脚本产出，
+# 快照已入库 → vectors/ glob 即全集，与 ladder 的 LADDER-STEM 捕获同理不复算 digest）。
+devnet_vectors=()
+for f in "$T8N_DIR"/vectors/devnet_*.json; do
+  [ -e "$f" ] || continue
+  devnet_vectors+=("$(basename "$f")")
+done
+if [ "${#devnet_vectors[@]}" -gt 0 ]; then
+  sorted_devnet=()
+  while IFS= read -r line; do sorted_devnet+=("$line"); done < <(printf '%s\n' "${devnet_vectors[@]}" | sort)
+  append_if_absent "$manifest" "Real-derivation devnet snapshots (P3-2): chainexport exports of the d3-devnet chain (stem devnet_<blocks>_<digest8>); registered read-only, not a regen.sh product" "${sorted_devnet[@]}"
+fi
 
-# ── diff 源重定义（Task 7 Step 1，审查 R10）：cases ∪ 三模式产物 ∪ ladder == manifest ──
+# ── diff 源重定义（Task 7 Step 1，审查 R10）：cases ∪ 三模式产物 ∪ ladder ∪ devnet == manifest ──
 # cases basename 展开（.in.json → .json）∪ 派生名（corrupt/static 注册项/invalid-tx/chain）
-# ∪ ladder（D1g）与 manifest 非注释行比集合相等（防孤儿向量/漏格）。
+# ∪ ladder（D1g，stem 捕获）∪ devnet（P3-2，入库快照按 glob 枚举）与 manifest 非注释行
+# 比集合相等（防孤儿向量/漏格）。
 {
   ls "$T8N_DIR"/cases/*.in.json | xargs -n1 basename | sed 's/\.in\.json$/.json/'
   printf 'invalid_isthmus_transfer_basic_%s.json\n' stateRoot gasUsed receiptsRoot parentHash extraData blockHash
@@ -475,6 +500,9 @@ append_if_absent "$manifest" "Ladder differential vector (D1g): ${N_LADDER_BLOCK
   printf 'invalid_isthmus_chain_%d_break.json\n' "$N_CHAIN"
   printf 'invalid_jovian_chain_%d_break.json\n' "$N_CHAIN"
   printf '%s.json\n' "$ladder_stem"                     # D1g ladder mode product (stem captured from the generator)
+  for f in "$T8N_DIR"/vectors/devnet_*.json; do         # P3-2 devnet snapshots (committed; glob = full set)
+    [ -e "$f" ] && basename "$f"
+  done
 } | sort > /tmp/opt8n-left.$$
 grep -v '^#' "$manifest" | sed '/^$/d' | sort > /tmp/opt8n-right.$$
 if ! diff /tmp/opt8n-left.$$ /tmp/opt8n-right.$$; then
