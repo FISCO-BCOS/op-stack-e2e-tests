@@ -11,6 +11,13 @@
 #                         （/tmp/opdevnet-campaign.toml），默认 up 完全不受影响（幂等语义不变）。
 #                         campaign 模式下：不做 L1 跳时钟、不做激活块计数检查（边界本来就没到）、
 #                         L2 catch-up 以「头块时间追平墙钟」为完成信号。
+#                         --forks 只接受规范序 [regolith, canyon, ecotone, fjord, granite,
+#                         holocene, isthmus, jovian] 从 regolith 开始的连续前缀（大小写不敏感，
+#                         逗号/空格分隔）：真实链不能跳过 fork，前缀子集 = 合法真实链形态。
+#                         前缀内的 fork 按压缩阶梯激活；前缀外的 fork 写「远未来」偏移
+#                         （intent 物理上不能省略任何 fork —— op-deployer 对缺字段按 0 处理，
+#                         会被严格递增校验拒绝），链在观察窗口内即一条合法前缀链。
+#                         非前缀（跳变/乱序/未知名）→ 结构化报错，不留半状态。
 #                         runtime_dir/端口/chain-id 与默认 up 相同 → status/down、txsource run.sh
 #                         用缺省 devnet.toml 即可操作 campaign 栈。
 #   ./opdevnet.sh status  组件进程/端口 + L2 块高 + 所在 fork 段 + safe/unsafe 差
@@ -47,7 +54,12 @@ TOML="${DEVNET_TOML:-$DIR/devnet.toml}"
 LOCK_FROM_TOML=""
 STEP="init"
 FORKS="canyon delta ecotone fjord granite holocene isthmus jovian"
-RUN_FORKS="$FORKS"                # 本次 up 生效的 fork 集合（campaign --forks 子集时 ≠ FORKS）
+RUN_FORKS="$FORKS"                # 本次 up 生效的 fork 集合（恒为全表：campaign 前缀外 fork 也必须
+                                  # 显式给偏移 —— 远未来值，见 generate_campaign_toml）
+CANON_FORKS="regolith canyon ecotone fjord granite holocene isthmus jovian"
+                                  # 规范 fork 序（= --forks 前缀校验的基准；regolith 恒在 genesis @0
+                                  # 不在 [forks] 表内；delta 是本 worktree 的非标准 fork，不可点名，
+                                  # 隐式跟随前缀：前缀含 ecotone 则入选，否则远未来）
 FORKS_NOINJECT="canyon delta granite holocene"   # attributes.go 无注入分支 / 计数为 0
 UPGRADE_COUNTS="canyon=0 delta=0 ecotone=6 fjord=3 granite=0 holocene=0 isthmus=8 jovian=5"
 
@@ -59,7 +71,10 @@ UPGRADE_COUNTS="canyon=0 delta=0 ecotone=6 fjord=3 granite=0 holocene=0 isthmus=
 #     （窗口 ~120s），其余 7 段全部可触发 —— 8 轮 8 段
 #   - 生成临时 toml（CAMPAIGN_TOML），默认 up 的 devnet.toml 一字不改（幂等语义不受影响）
 CAMPAIGN=0
-CAMPAIGN_FORKS=""                 # 空 = 全部 8 fork；否则为空格分隔子集（保持标准顺序）
+CAMPAIGN_FORKS=""                 # 空 = 全 8 fork（= 最长前缀）；否则规范序连续前缀（逗号/空格分隔，
+                                  # 大小写不敏感；parse_campaign_forks 校验后写入 CAMPAIGN_SEL/CAMPAIGN_FAR）
+CAMPAIGN_SEL=""                   # 规范序入选前缀（含 regolith；空 = 未解析）
+CAMPAIGN_FAR=""                   # 前缀之外的表内 fork（远未来偏移，运行窗口内不激活）
 CAMPAIGN_SEG_S="300"
 CAMPAIGN_ANCHOR_OFFSET_S="500"    # genesis_ts = now - 500
 CAMPAIGN_TOML="${OPDEVNET_CAMPAIGN_TOML:-/tmp/opdevnet-campaign.toml}"
@@ -404,21 +419,83 @@ fork_at_block() { # $1=block $2=boundary TSV -> 当前 fork 段名（最后一�
 CROSSED=" "   # 首尾空格哨兵：去重匹配依赖 *" $f "*，无前导空格会漏判（实测踩坑）
 
 # ---------- campaign：由基准 toml 派生临时 campaign toml ----------
-# 只改四处：meta.name / l1.genesis_timestamp（锚 = 墙钟-500s）/ [forks]（压缩阶梯，可子集）/
+# 只改四处：meta.name / l1.genesis_timestamp（锚 = 墙钟-500s）/ [forks]（压缩阶梯 + 远未来尾）/
 # [accel].target_l2_blocks（信息用）。runtime_dir、端口、chain-id、角色、盐全部继承基准 ——
 # status/down 与 txsource run.sh 用缺省 devnet.toml 即可操作 campaign 栈。
+#
+# --forks 前缀子集语义（P4 修复定案；旧版未入选 fork 从 [forks] 落空 → intent 缺字段落 0 →
+# op-deployer 校验拒绝 `fork delta set to 0, but prior fork canyon has higher offset`）：
+#   - 合法输入 = 规范序 CANON_FORKS 从 regolith 开始的连续前缀（大小写不敏感，逗号/空格分隔）。
+#     理由：真实链不能跳过 fork，前缀子集 = 合法真实链形态；非前缀（跳变）有已登记的
+#     L1-fee cross-check 限制，不支持 → 结构化报错（不留半状态，此校验在任何组件启动前）。
+#   - 生成规则（[forks] 恒含全表 8 fork，物理上不能省略 —— deployer 缺字段落 0 被拒）：
+#     前缀内 fork = 压缩阶梯（第 i 个表内入选者 = i × seg_s）；前缀外 fork = 远未来偏移
+#     （base = max(0xffff, (入选数+1)×seg_s) 起逐个 +1，保持严格递增且 ≫ 观察窗口）——
+#     不能写 0（递增校验拒绝）、不能省略（回落 deployer 默认「出生即 jovian」）。
+#     ⇒ 链在观察窗口内是一条合法的前缀链，远未来 fork 的边界永不到来。
+#   - Delta 特殊处理（本 worktree 非标准 fork，位于 Canyon↔Ecotone 之间，deployer 要求
+#     严格介于两者之间）：前缀含 ecotone 时 delta 入选、占自己的阶梯档位（= canyon 档 +
+#     seg_s，恒严格介于 canyon 与 ecotone 之间，任意 seg_s ≥ 1 都成立）；前缀只到 canyon
+#     时 delta 与 ecotone 一同写远未来值。delta 不是 --forks 的合法名字（隐式跟随前缀）。
+canon_pos() { # $1=fork -> 1-based position in CANON_FORKS（0 = 不在表内）
+  local i=1 f
+  for f in $CANON_FORKS; do [ "$f" = "$1" ] && { printf '%s' "$i"; return 0; }; i=$((i+1)); done
+  printf '0'
+}
+canon_nth() { awk -v i="$1" '{print $i}' <<<"$CANON_FORKS"; }
+parse_campaign_forks() { # 解析/校验 CAMPAIGN_FORKS -> CAMPAIGN_SEL（规范序前缀）+ CAMPAIGN_FAR
+  local list f pos at=0 j skipped seen=" "
+  list="$(printf '%s' "${CAMPAIGN_FORKS:-$CANON_FORKS}" | tr ',\t' '  ' | tr 'A-Z' 'a-z' | awk '{$1=$1}1')"
+  [ -n "$list" ] || list="$CANON_FORKS"          # --forks "" 等价缺省
+  CAMPAIGN_SEL=""; CAMPAIGN_FAR=""
+  # 1) 名字合法 + 不重复（fail-fast，先于任何组件启动 —— 无半状态）
+  for f in $list; do
+    case " $CANON_FORKS " in *" $f "*) ;;
+      *) if [ "$f" = "delta" ]; then
+           die "--forks: 'delta' is not selectable —— 本 worktree 的非标准 fork 隐式跟随前缀：前缀含 ecotone 则 delta 落 canyon 与 ecotone 之间，否则远未来 (canonical order: $CANON_FORKS)"
+         fi
+         die "--forks: unknown fork '$f' (canonical order: $CANON_FORKS)" ;;
+    esac
+    case "$seen" in *" $f "*) die "--forks: duplicate fork '$f'" ;; esac
+    seen="$seen$f "
+  done
+  # 2) 连续前缀：从 regolith 开始逐项命中规范序；断链/乱序即结构化报错（列合法示例）
+  for f in $list; do
+    pos="$(canon_pos "$f")"
+    if [ "$pos" -eq "$((at+1))" ]; then
+      CAMPAIGN_SEL="$CAMPAIGN_SEL$f "; at="$pos"
+    elif [ "$pos" -le "$at" ]; then
+      die "--forks: out-of-order entry '$f'（规范序中它已在位置 $pos 出现过，必须紧跟 '$(canon_nth "$at")' 之后; canonical order: $CANON_FORKS)"
+    else
+      skipped=""
+      for (( j=at+1; j<pos; j++ )); do skipped+="$(canon_nth "$j") "; done
+      skipped="${skipped% }"
+      die "--forks must be a contiguous prefix of the canonical fork order starting at regolith
+  got:            [$list]
+  gap:            '$f' selected but skipped fork(s) before it: ${skipped:-<none>}
+  legal prefixes: \"regolith\" / \"regolith,canyon\" / \"regolith,canyon,ecotone,fjord,granite,holocene\" / \"regolith,canyon,ecotone,fjord,granite,holocene,isthmus,jovian\"（= 缺省全表）"
+    fi
+  done
+  # 3) 前缀之外的表内 fork（远未来）：delta 入选当且仅当前缀到达 ecotone
+  local sel=" $CAMPAIGN_SEL"
+  for f in $FORKS; do
+    case "$sel" in *" $f "*) continue ;; esac                 # 入选 → 阶梯档位
+    if [ "$f" = "delta" ] && case "$sel" in *" ecotone "*) true ;; *) false ;; esac; then
+      continue                                                # delta 隐式入选（前缀含 ecotone）→ 阶梯档位
+    fi
+    CAMPAIGN_FAR="$CAMPAIGN_FAR$f "
+  done
+  CAMPAIGN_FAR="${CAMPAIGN_FAR% }"
+}
 generate_campaign_toml() { # $1=base toml $2=out toml
   local base="$1" out="$2"
   [ -f "$base" ] || die "base config not found: $base"
-  # 校验子集：只允许 FORKS 表内的 fork，保持标准顺序
-  local want="${CAMPAIGN_FORKS:-$FORKS}" f
-  for f in $want; do
-    case " $FORKS " in *" $f "*) ;; *) die "unknown fork in --forks: $f (known: $FORKS)";; esac
-  done
+  parse_campaign_forks
   local anchor_ts=$(( $(date +%s) - CAMPAIGN_ANCHOR_OFFSET_S ))
-  python3 - "$base" "$out" "$want" "$CAMPAIGN_SEG_S" "$anchor_ts" <<'PYEOF'
+  python3 - "$base" "$out" "$CAMPAIGN_SEL" "$CAMPAIGN_FAR" "$CAMPAIGN_SEG_S" "$anchor_ts" <<'PYEOF' || die "campaign toml generation failed (见上方 python 报错)"
 import re, sys
-base_p, out_p, want, seg_s, anchor_ts = sys.argv[1], sys.argv[2], sys.argv[3].split(), int(sys.argv[4]), int(sys.argv[5])
+base_p, out_p, sel, far, seg_s, anchor_ts = (
+    sys.argv[1], sys.argv[2], sys.argv[3].split(), sys.argv[4].split(), int(sys.argv[5]), int(sys.argv[6]))
 text = open(base_p).read()
 # 0) 文件头打 campaign 标记（注释独占一行 —— 本 toml 的 awk 解析器约定）
 text = "# GENERATED by opdevnet.sh up --campaign（勿手改；基准 devnet.toml 不受影响）\n" + text
@@ -427,18 +504,33 @@ text = re.sub(r'(?m)^name\s*=\s*".*"$', 'name       = "d3-devnet-campaign"', tex
 # 2) l1.genesis_timestamp -> 墙钟锚（campaign 特意不固定绝对值：每次 up 锚定当前墙钟）
 text = re.sub(r'(?m)^genesis_timestamp(\s*)=\s*\d+(\s*#.*)?$',
               lambda m: f'genesis_timestamp{m.group(1)} = {anchor_ts}', text, count=1)
-# 3) [forks] 段整体替换为压缩阶梯：第 i 个 fork 偏移 = i*seg_s
-#    （canyon=300, delta=600, ... 严格递增；delta 恒严格介于 canyon 与 ecotone 之间）
+# 3) [forks] 段整体替换：恒含全表 8 fork（deployer 对 intent 缺字段按 0 处理 → 被严格递增
+#    校验拒绝，物理上不能省略）。前缀内 = 压缩阶梯（第 i 个表内入选者 = i*seg_s；delta 入选
+#    时占自己的档位，恒严格介于 canyon 与 ecotone 之间）；前缀外 = 远未来偏移（base 起 +1
+#    保持严格递增，≫ 观察窗口 → 边界永不到来）。
 order = ["canyon", "delta", "ecotone", "fjord", "granite", "holocene", "isthmus", "jovian"]
-picks = [f for f in order if f in want]
-sec = ["[forks]"] + [f"{f:<8} = {i * seg_s}" for i, f in enumerate(picks, start=1)]
+active = [f for f in order if f not in far]
+far_base = max(0xFFFF, (len(active) + 1) * seg_s)
+offsets = {f: (i + 1) * seg_s for i, f in enumerate(active)}
+for j, f in enumerate(far):
+    offsets[f] = far_base + j
+assert list(offsets) == order and len(set(offsets.values())) == len(order), "fork schedule not a strict ladder"
+sec = ["[forks]",
+       "# 生效调度：前缀内 fork = 第 i 个表内入选者 x seg_s（delta 入选时占自己的档位，严格介于",
+       "# canyon 与 ecotone 之间）；前缀外 fork = 远未来偏移（观察窗口内不激活）。全表 8 fork 必须",
+       "# 显式给值：op-deployer 对 intent 缺字段按 0 处理，会被严格递增校验拒绝。",
+       "# regolith 不在表内 = 恒在 genesis（@0）"]
+sec += [f"{f:<8} = {offsets[f]}" for f in order]
 text = re.sub(r'(?ms)^\[forks\]\n.*?(?=\n\[)', "\n".join(sec) + "\n", text)
-# 4) [accel].target_l2_blocks -> 末 fork 激活块 + 余量（campaign catch-up 不用它，仅 status 展示）
-last_act = (len(picks) * seg_s) // 2 + ((len(picks) * seg_s) % 2)
+# 4) [accel].target_l2_blocks -> 末个入选 fork 激活块 + 余量（campaign catch-up 不用它，仅展示）
+last_boundary = len(active) * seg_s
+last_act = last_boundary // 2 + (last_boundary % 2)
 text = re.sub(r'(?m)^target_l2_blocks(\s*)=\s*\d+(\s*#.*)?$',
               lambda m: f'target_l2_blocks{m.group(1)} = {last_act + 75}', text, count=1)
 open(out_p, "w").write(text)
-print(f"campaign toml: forks={' '.join(picks)} seg={seg_s}s anchor_genesis_ts={anchor_ts} last_boundary={len(picks)*seg_s}s")
+print(f"forks: prefix=[{' '.join(sel)}] active=[{' '.join(active)}] far_future=[{' '.join(far) or '-'}] "
+      f"(far offset base={far_base}s ≫ window {last_boundary}s) seg={seg_s}s "
+      f"anchor_genesis_ts={anchor_ts} last_boundary={last_boundary}s")
 PYEOF
   # 与基准一致性自检：runtime_dir/端口/chain-id 必须相同（runner/down/status 靠它们）
   local k base_v camp_v
@@ -465,13 +557,15 @@ cmd_up() {
     [ "$CAMPAIGN_SEG_S" -ge 1 ] || die "--segment-seconds must be >= 1"
   fi
   if [ "$CAMPAIGN" -eq 1 ]; then
+    parse_campaign_forks   # 父 shell 先解析（管道里的 generate 在子 shell 跑，变量传不出来）
     generate_campaign_toml "$TOML" "$CAMPAIGN_TOML" | sed 's/^/[campaign] /'
     TOML="$CAMPAIGN_TOML"
-    RUN_FORKS="${CAMPAIGN_FORKS:-$FORKS}"   # intent/normalize/verify/status 只认本次生效的 fork 集
+    # RUN_FORKS 恒为全表 8 fork：intent 必须显式覆盖全部（deployer 对缺字段按 0 处理 → 被严格
+    # 递增校验拒绝）。前缀外 fork = 远未来偏移（CAMPAIGN_FAR），运行窗口内不激活。
+    log "CAMPAIGN mode: seg=${CAMPAIGN_SEG_S}s anchor=now-${CAMPAIGN_ANCHOR_OFFSET_S}s prefix=[${CAMPAIGN_SEL% }] far_future=[${CAMPAIGN_FAR:-none}] toml=${TOML}（链时间贴墙钟，边界按墙钟逐段到来）"
   fi
   load_config
   log "devnet up: runtime=$RUNTIME  l2_chain_id=$L2_CHAIN_ID  l1_chain_id=$L1_CHAIN_ID"
-  [ "$CAMPAIGN" -eq 0 ] || log "CAMPAIGN mode: seg=${CAMPAIGN_SEG_S}s anchor=now-${CAMPAIGN_ANCHOR_OFFSET_S}s forks=[${CAMPAIGN_FORKS:-$FORKS}] toml=${TOML}（链时间贴墙钟，边界按墙钟逐段到来）"
 
   # ---- preflight（fail-fast：二进制/内容 pin/工具/配置结构/磁盘/端口/互斥） ----
   STEP="preflight"
@@ -760,9 +854,16 @@ json.dump(s, open(p, 'w'))"
     local f t
     for f in $RUN_FORKS; do
       t="$(jq -r ".${f}_time // empty" "$ART/rollup.json" 2>/dev/null || true)"
-      [ -n "$t" ] && log "    $f @ ts $t (block ~$((( t - $(jq -r '.genesis.l2_time' "$ART/rollup.json") ) / 2)))"
+      [ -n "$t" ] || continue
+      case " $CAMPAIGN_FAR " in *" $f "*)
+        log "    $f @ ts $t (block ~$((( t - $(jq -r '.genesis.l2_time' "$ART/rollup.json") ) / 2))) —— 远未来：观察窗口内不激活（前缀外 fork）"
+        ;;
+      *)
+        log "    $f @ ts $t (block ~$((( t - $(jq -r '.genesis.l2_time' "$ART/rollup.json") ) / 2)))"
+        ;;
+      esac
     done
-    log "  next: ./opdevnet.sh status | txsource: cd ../txsource && ./run.sh --plugin ..."
+    log "  next: ./opdevnet.sh status | 激活计数：check_activations.py --forks <前缀内表内 fork 逗号表> | txsource: cd ../txsource && ./run.sh --plugin ..."
     return 0
   fi
   log "waiting L2 catch-up to block $TARGET_BLOCKS (machine speed ~115 blk/s after boundaries crossed) ..."

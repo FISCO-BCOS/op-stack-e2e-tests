@@ -247,10 +247,13 @@ genesis hash 随墙钟漂移属预期，WARN 行如实报告）。派生时只�
    ≈ 墙钟 - 448s。up 本身耗时 ~110s，L2 追平墙钟后头块链时偏移 ≈ +480~580s →
    bedrock 段在 up 的追平阶段被结构性消耗（runner 标 missed），第一可观察段（canyon，
    窗口 ~120s）+ 后续 7 段全部可触发 —— 8 轮 8 段。
-2. `[forks]` 压缩阶梯：第 i 个 fork 偏移 = i × `--segment-seconds`（缺省 300s）→
-   8 边界跨 40min 链时间，全 9 段观察 ≤ 1h；`--forks "canyon delta ecotone"` 可取子集
-   试点（intent/normalize/verify/status 走 `RUN_FORKS` 子集，delta=600 恒严格介于
-   canyon=300 与 ecotone=900 之间，部署校验天然满足）。
+2. `[forks]` 压缩阶梯：第 i 个表内入选 fork 偏移 = i × `--segment-seconds`（缺省 300s）→
+   8 边界跨 40min 链时间，全 9 段观察 ≤ 1h。`--forks` 只接受规范序
+   [regolith, canyon, ecotone, fjord, granite, holocene, isthmus, jovian] 从 regolith 开始的
+   **连续前缀**（大小写不敏感，逗号/空格分隔；P4 follow-up 定案，见文末专节）：前缀内 fork
+   按阶梯激活，前缀外 fork 写远未来偏移（op-deployer 的 intent 物理上不能省略任何 fork，
+   见文末根因）—— 链在观察窗口内即一条合法前缀链；非前缀（跳变/乱序/未知名）→ 结构化
+   报错，无半状态。
 3. `[accel].target_l2_blocks` 重算为末 fork 激活块 + 75（campaign catch-up 不用它，仅展示）。
 4. `meta.name` 打标。
 
@@ -516,3 +519,61 @@ cast send 0xd01da3544ee5600483d8a149a3bb21a4aaa6c4de \
   `op-node/rollup/derive/deposit_log.go:84` `dep.From = from`（上游 stock 是
   `ApplyL1ToL2Alias(from)`）——用户存款回执 `from` = L1 原始发送者。这不是 RPC
   表示层问题，但读 golden 时别误判为形状分歧。
+
+---
+
+# campaign `--forks` 子集限定为连续前缀（P4 follow-up，2026-09-15）
+
+## 缺陷与根因（源码 + 复现双定案）
+
+`up --campaign --forks <子集>` 旧版把 `[forks]` 段整体替换为**只含入选 fork** 的压缩阶梯
+→ 未入选 fork 从 toml 落空 → intent 不写对应 `l2Genesis*TimeOffset` → op-deployer 拒绝：
+`CombineDeployConfig` 以 `DefaultHardforkSchedule()` 打底 —— 它把 ≤jovian 的全部 fork
+偏移设为 **0（值，非 nil）**，intent 缺字段 = 留 0 → `UpgradeScheduleDeployConfig.Check`
+报 `fork X set to 0, but prior fork Y has higher offset`（复现：`--forks "canyon ecotone"`
+→ `fork fjord set to 0, but prior fork ecotone has higher offset 600`；README 开头记录的
+`fork delta set to 0, but prior fork canyon has higher offset` 同根）。默认 up 全表覆盖
+恰好补齐全部字段所以从未暴露。**⇒ 子集无法物理省略任何 fork，只能决定各 fork 落在哪个偏移。**
+
+## 定案语义（方案 1：连续前缀 + 远未来尾）
+
+- `--forks` 只接受规范序 [regolith, canyon, ecotone, fjord, granite, holocene, isthmus,
+  jovian] 从 regolith 开始的**连续前缀**（大小写不敏感，逗号/空格分隔；空 = 缺省全表 =
+  最长前缀）。理由：真实链不能跳过 fork，前缀子集 = 合法真实链形态；非前缀（跳变）有已
+  登记的 L1-fee cross-check 限制，不支持。
+- **生成规则**（`[forks]` 恒含全表 8 fork，物理上不能省略）：前缀内 fork = 压缩阶梯
+  （第 i 个表内入选者 = i × seg_s）；**前缀外 fork = 远未来偏移**（base =
+  max(0xffff, (入选数+1)×seg_s) 起逐个 +1，保持严格递增且 ≫ 观察窗口）—— 不能写 0
+  （递增校验拒绝）、不能省略（回落 deployer 默认「出生即 jovian」）。链在观察窗口内
+  = 一条合法的前缀链，远未来 fork 的边界永不到来。
+- **delta 特殊处理**：非标准 fork（Canyon↔Ecotone 之间，deployer 要求严格介于两者之间），
+  不可用 `--forks` 点名（结构化报错并说明隐式规则）：前缀含 ecotone 时隐式入选，占自己的
+  阶梯档位（= canyon 档 + seg_s，任意 seg_s ≥ 1 恒严格介于 canyon 与 ecotone 之间）；
+  前缀只到 canyon 时 delta 随 ecotone 一同写远未来值（65535 < 65536，递增约束仍满足）。
+- **非前缀 = 结构化拒绝**（统一 `[opdevnet][ERROR]` 格式，列出规范序、首个断点、跳过的
+  fork 与合法前缀示例）。校验在任何组件启动前（STEP=init）→ 无半状态。跳变
+  （`regolith,isthmus`）、缺 regolith（`canyon,ecotone`）、乱序、未知名、重复、点名 delta
+  均拒（12 例矩阵实测）。
+- `RUN_FORKS` 恒为全表：intent/normalize/verify/boundary/status 照常覆盖远未来 fork
+  （CROSSED 永不触发；campaign 末尾 fork 段表标注「远未来：观察窗口内不激活」）。
+- `check_activations.py` 加 `--forks`（规范序子集）：前缀链上用它排除远未来 fork 才能全绿
+  exit 0；不带旗标时远未来 fork 报 NOT REACHED（exit 2 INCOMPLETE，附 `--forks` 提示）。
+- **全表路径回归不变**：`up --campaign` 缺省 = 最长前缀，`[forks]` 阶梯与旧版逐字节一致；
+  默认 up 不经过任何新代码路径（实测 L2 genesis hash 与修复前的全表 run 完全相同
+  `0x43e8fa88…`，幂等未破坏）。
+
+## 实测（2026-09-15，三场景）
+
+1. **合法 6 fork 前缀** `--campaign --forks "Regolith,Canyon,Ecotone,Fjord,Granite,Holocene"
+   --segment-seconds 60`：up 全绿；`canyon=60…holocene=360, isthmus=65535, jovian=65536`
+   （ARTIFACT VERIFY 8/8 OK，op-deployer 接受远未来偏移）；追平期间 CROSSED 计数
+   canyon/delta/ecotone/fjord/granite/holocene = 0/0/6/3/0/0；
+   `check_activations.py --forks canyon,delta,ecotone,fjord,granite,holocene` 全 OK
+   （exit 0）；isthmus/jovian 激活块 ~32768 ≫ head 281 —— 运行窗口内不激活（全表跑
+   check_activations 报 2×NOT REACHED，exit 2 INCOMPLETE + 提示）。
+2. **非前缀拒绝** `--forks "regolith,isthmus"`：`[opdevnet][ERROR] init: --forks must be a
+   contiguous prefix …gap: 'isthmus' selected but skipped fork(s) before it: canyon ecotone
+   fjord granite holocene…`，exit 1，无任何组件启动（无半状态）。
+3. **全表回归**：`up --campaign --segment-seconds 60`（缺省全 8 fork）CROSSED
+   0/0/6/3/0/0/8/5 全对、check_activations 全表 ALL MATCH（exit 0）；默认 `up`
+   （1250…8750 真实阶梯）激活计数 6/3/8/5 ALL MATCH，UP OK。

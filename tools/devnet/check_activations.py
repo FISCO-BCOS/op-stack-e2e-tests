@@ -3,6 +3,9 @@
 
 用法:
     check_activations.py --rollup artifacts/rollup.json --rpc http://127.0.0.1:9545
+    [--forks canyon,ecotone]   # 可选：只检查规范序的连续子集（campaign 前缀链上，前缀外
+                               # fork 是远未来偏移、永不激活 —— 排除后才能全绿 exit 0；
+                               # 缺省查全表，未抵达的边界报 NOT REACHED 并 exit 2）
 
 逻辑（Task 1 实测定案，README.md「定案结论 3」）:
   - 激活块 = 链上第一个 timestamp >= fork 边界时间的块；边界 = rollup.json 的 *_time
@@ -19,6 +22,7 @@
 """
 import argparse
 import json
+import re
 import sys
 import time
 import urllib.error
@@ -75,7 +79,22 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--rollup", required=True, help="op-deployer inspect rollup 产物")
     ap.add_argument("--rpc", required=True, help="L2 geth HTTP RPC（9545）")
+    ap.add_argument("--forks", default="", help="只检查这些 fork（逗号/空格分隔，规范序子集；"
+                                                "缺省 = 全表。campaign 前缀链用它排除远未来 fork）")
     args = ap.parse_args()
+
+    want = [f for f in re.split(r"[,\s]+", args.forks.strip().lower()) if f] or FORK_ORDER
+    seen = set()
+    for f in want:
+        if f not in FORK_ORDER:
+            print(f"[check_activations][ERROR] args: unknown fork '{f}' (canonical order: {' '.join(FORK_ORDER)})",
+                  file=sys.stderr)
+            return 2
+        if f in seen:
+            print(f"[check_activations][ERROR] args: duplicate fork '{f}'", file=sys.stderr)
+            return 2
+        seen.add(f)
+    want = [f for f in FORK_ORDER if f in seen]   # 保持规范序输出
 
     try:
         with open(args.rollup) as f:
@@ -99,12 +118,16 @@ def main():
 
     print(f"rollup: l2_time={l2_time} block_time={block_time}s l2_chain_id={rollup.get('l2_chain_id', '?')} "
           f"l2 head={latest}")
+    if want != FORK_ORDER:
+        excluded = [f for f in FORK_ORDER if f not in seen]
+        print(f"subset: checking [{' '.join(want)}]（--forks 指定；排除 [{' '.join(excluded) or '-'}] —— "
+              f"campaign 前缀链的远未来 fork，窗口内不激活属预期）")
     print(f"{'fork':10} {'boundary':>11} {'actBlock':>9} {'blockTs':>11} {'7E_total':>8} {'l1info':>7} "
           f"{'upg':>4} {'expect':>6}  result")
 
     failures = 0
     unreachable = 0
-    for name in FORK_ORDER:
+    for name in want:
         boundary = rollup.get(f"{name}_time")
         if boundary is None:
             print(f"{name:10} {'(nil=disabled)':>11}  -- skip --")
@@ -153,12 +176,15 @@ def main():
               f"{exp:>6}  {verdict}")
 
     if unreachable:
-        print(f"\nRESULT: INCOMPLETE — {unreachable} fork boundary not yet on chain (exit 2)")
+        hint = ("；若为 campaign 前缀链（前缀外 fork 远未来永不激活），用 --forks <前缀内 fork> 排除后再验"
+                if want == FORK_ORDER else "")
+        print(f"\nRESULT: INCOMPLETE — {unreachable} fork boundary not yet on chain (exit 2){hint}")
         return 2
     if failures:
         print(f"\nRESULT: FAIL — {failures} mismatch(es) vs attributes.go expectations (exit 1)")
         return 1
-    print("\nRESULT: ALL MATCH — upgrade-tx counts per activation block = 6/3/8/5, others 0 (exit 0)")
+    scope = "全表" if want == FORK_ORDER else f"子集 [{' '.join(want)}]"
+    print(f"\nRESULT: ALL MATCH（{scope}）— upgrade-tx counts per activation block = attributes.go expectations (exit 0)")
     return 0
 
 
