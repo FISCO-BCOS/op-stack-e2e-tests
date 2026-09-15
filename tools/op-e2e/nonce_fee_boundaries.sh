@@ -124,9 +124,18 @@ wait_absent() {
 }
 
 send_async() {  # $@ = cast flags (fee style + nonce ...) -> bare tx hash
+  # A caller that names a fee style (--gas-price / --priority-gas-price / --legacy) keeps it —
+  # those are this suite's fee-boundary cases. Without one, cast would fall back to its EIP-1559
+  # suggestion and call eth_feeHistory, which this node does not serve; --legacy prices the probe
+  # from eth_gasPrice instead.
   local h
+  local fee_flag=()
+  case " $* " in
+    *" --gas-price "*|*" --priority-gas-price "*|*" --legacy "*) ;;
+    *) fee_flag=(--legacy) ;;
+  esac
   h=$(cast send --async --private-key "$KEY" --rpc-url "$L2" --chain-id "$CHAIN_ID" \
-    --gas-limit 21000 "$@")
+    --gas-limit 21000 "${fee_flag[@]}" "$@")
   echo "  sent $* -> $h" >&2
   echo "$h"
 }
