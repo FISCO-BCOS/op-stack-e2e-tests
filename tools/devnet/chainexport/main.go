@@ -75,6 +75,32 @@
 // sampledBlocks key). Consumers treat absent sampledBlocks = every block
 // sampled (legacy shape).
 //
+// Size guard (P5): the exported file is a git-TRACKED corpus input, and GitHub
+// rejects any pushed blob >= 100MiB (the 315MB full-mode snapshot registered in
+// dc9b945 blocked the branch push outright). A full-postState export whose
+// serialization exceeds maxOutputBytes (95 MiB) is therefore auto-downgraded to
+// boundary sampling at write time (the state dumps are already in memory — no
+// re-fetch) with a "full 超限，已自动降级" notice; a boundary export over the
+// ceiling cannot shrink further and only warns loudly (the register/push-side
+// big-blob check is the backstop). Default output is thus always < 100MiB.
+//
+// Block range (--from-block/--to-block): export only blocks in [from, to]
+// (1-based, inclusive on both ends; block 0 is the chain's genesis pre and is
+// never an exported block). Defaults: from 0 → 1, to 0 → chain head at export
+// start. Both error cases are hard errors, no silent clamping: from > to is a
+// caller bug; to > head means the chain hasn't produced the requested blocks
+// yet (wait or lower the value). Fork activation blocks are still derived
+// chain-authoritatively from actual headers 1..to — pre-range blocks are
+// header-scanned only (receipts/traces/raws/state dumps stay limited to the
+// range) — so per-block hardfork labels and the stem digest are identical to
+// a full export of the same prefix; a fork whose boundary is not reached by
+// block `to` is excluded from the activation spec (it never labels a range
+// block). The stem carries the range: devnet_<from>-<to>_<digest8> for a
+// ranged export vs devnet_<head>_<digest8> for a full one. postState boundary
+// sampling applies to the range's first/last/every-100th/activation±1 blocks
+// (range-relative indices); the first exported block's `pre` is the state
+// dump at from-1 (the genesis alloc when from=1, with the self-check below).
+//
 // Stem rule (mirrors ladderStem): devnet_<blocks>_<digest8> where digest8 =
 // sha256("<0:regolith>,<actBlock>:<fork>,...")[:8] — activation block numbers
 // are 1-based, taken from the ACTUAL chain headers.
@@ -399,19 +425,19 @@ type rpcAccessTuple struct {
 }
 
 type rpcTx struct {
-	Type                 string          `json:"type"`
-	From                 string          `json:"from"`
-	To                   *string         `json:"to"`
-	Nonce                string          `json:"nonce"`
-	Gas                  string          `json:"gas"`
-	Value                string          `json:"value"`
-	Input                string          `json:"input"`
-	ChainID              *string         `json:"chainId"`
-	GasPrice             *string         `json:"gasPrice"`
-	MaxFeePerGas         *string         `json:"maxFeePerGas"`
-	MaxPriorityFeePerGas *string         `json:"maxPriorityFeePerGas"`
+	Type                 string           `json:"type"`
+	From                 string           `json:"from"`
+	To                   *string          `json:"to"`
+	Nonce                string           `json:"nonce"`
+	Gas                  string           `json:"gas"`
+	Value                string           `json:"value"`
+	Input                string           `json:"input"`
+	ChainID              *string          `json:"chainId"`
+	GasPrice             *string          `json:"gasPrice"`
+	MaxFeePerGas         *string          `json:"maxFeePerGas"`
+	MaxPriorityFeePerGas *string          `json:"maxPriorityFeePerGas"`
 	AccessList           []rpcAccessTuple `json:"accessList"`
-	Hash                 string          `json:"hash"`
+	Hash                 string           `json:"hash"`
 	// deposit-only fields (op-geth txJSON @ pin)
 	SourceHash *string `json:"sourceHash"`
 	Mint       *string `json:"mint"`
@@ -421,35 +447,67 @@ type rpcTx struct {
 }
 
 type rpcAuthorization struct {
-	Address  string  `json:"address"`
-	ChainID  *string `json:"chainId"`
-	Nonce    string  `json:"nonce"`
-	YParity  *string `json:"yParity"`
-	V        *string `json:"v"`
-	R        string  `json:"r"`
-	S        string  `json:"s"`
+	Address   string  `json:"address"`
+	ChainID   *string `json:"chainId"`
+	Nonce     string  `json:"nonce"`
+	YParity   *string `json:"yParity"`
+	V         *string `json:"v"`
+	R         string  `json:"r"`
+	S         string  `json:"s"`
 	Authority *string `json:"authority"`
 }
 
 type rpcBlock struct {
-	Number                string     `json:"number"`
-	Hash                  string     `json:"hash"`
-	ParentHash            string     `json:"parentHash"`
-	Nonce                 *string    `json:"nonce"`
-	Timestamp             string     `json:"timestamp"`
-	Miner                 string     `json:"miner"`
-	MixHash               string     `json:"mixHash"`
-	StateRoot             string     `json:"stateRoot"`
-	ReceiptsRoot          string     `json:"receiptsRoot"`
-	LogsBloom             string     `json:"logsBloom"`
-	GasLimit              string     `json:"gasLimit"`
-	GasUsed               string     `json:"gasUsed"`
-	BaseFeePerGas         *string    `json:"baseFeePerGas"`
-	ParentBeaconBlockRoot *string    `json:"parentBeaconBlockRoot"`
-	WithdrawalsRoot       *string    `json:"withdrawalsRoot"`
-	RequestsHash          *string    `json:"requestsHash"`
-	BlobGasUsed           *string    `json:"blobGasUsed"`
-	Transactions          []*rpcTx   `json:"transactions"`
+	Number                string   `json:"number"`
+	Hash                  string   `json:"hash"`
+	ParentHash            string   `json:"parentHash"`
+	Nonce                 *string  `json:"nonce"`
+	Timestamp             string   `json:"timestamp"`
+	Miner                 string   `json:"miner"`
+	MixHash               string   `json:"mixHash"`
+	StateRoot             string   `json:"stateRoot"`
+	ReceiptsRoot          string   `json:"receiptsRoot"`
+	LogsBloom             string   `json:"logsBloom"`
+	GasLimit              string   `json:"gasLimit"`
+	GasUsed               string   `json:"gasUsed"`
+	BaseFeePerGas         *string  `json:"baseFeePerGas"`
+	ParentBeaconBlockRoot *string  `json:"parentBeaconBlockRoot"`
+	WithdrawalsRoot       *string  `json:"withdrawalsRoot"`
+	RequestsHash          *string  `json:"requestsHash"`
+	BlobGasUsed           *string  `json:"blobGasUsed"`
+	Transactions          []*rpcTx `json:"transactions"`
+}
+
+// UnmarshalJSON accepts BOTH response shapes of eth_getBlockByNumber: full
+// (transactions = tx objects) and header-only (second arg false — the ranged
+// export's pre-range header scan — where transactions = tx HASH strings).
+// Decoding a header response into []*rpcTx is a hard unmarshal error, so the
+// hash-array shape is detected and dropped: pre-range blocks never assemble,
+// they only supply linkage hashes and activation timestamps.
+func (b *rpcBlock) UnmarshalJSON(data []byte) error {
+	type alias rpcBlock
+	aux := struct {
+		Transactions json.RawMessage `json:"transactions"`
+		*alias
+	}{alias: (*alias)(b)}
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+	trimmed := bytes.TrimSpace(aux.Transactions)
+	if len(trimmed) == 0 {
+		return nil // no transactions field at all
+	}
+	var arr []json.RawMessage
+	if err := json.Unmarshal(aux.Transactions, &arr); err != nil {
+		return nil // not an array (null etc.) — treat as header-only shape
+	}
+	if len(arr) == 0 || arr[0][0] != '{' {
+		// header-only response: elements are tx-hash strings, not objects —
+		// pre-range blocks never assemble, so drop the list entirely
+		b.Transactions = nil
+		return nil
+	}
+	return json.Unmarshal(aux.Transactions, &b.Transactions)
 }
 
 type rpcLog struct {
@@ -459,25 +517,25 @@ type rpcLog struct {
 }
 
 type rpcReceipt struct {
-	Type                  string   `json:"type"`
-	Status                *string  `json:"status"`
-	Root                  *string  `json:"root"`
-	GasUsed               string   `json:"gasUsed"`
-	CumulativeGasUsed     string   `json:"cumulativeGasUsed"`
+	Type                  string    `json:"type"`
+	Status                *string   `json:"status"`
+	Root                  *string   `json:"root"`
+	GasUsed               string    `json:"gasUsed"`
+	CumulativeGasUsed     string    `json:"cumulativeGasUsed"`
 	Logs                  []*rpcLog `json:"logs"`
-	DepositNonce          *string  `json:"depositNonce"`
-	DepositReceiptVersion *string  `json:"depositReceiptVersion"`
-	L1GasPrice            *string  `json:"l1GasPrice"`
-	L1BlobBaseFee         *string  `json:"l1BlobBaseFee"`
-	L1GasUsed             *string  `json:"l1GasUsed"`
-	L1Fee                 *string  `json:"l1Fee"`
-	L1FeeScalar           *string  `json:"l1FeeScalar"` // decimal string (big.Float)
-	L1BaseFeeScalar       *string  `json:"l1BaseFeeScalar"`
-	L1BlobBaseFeeScalar   *string  `json:"l1BlobBaseFeeScalar"`
-	OperatorFeeScalar     *string  `json:"operatorFeeScalar"`
-	OperatorFeeConstant   *string  `json:"operatorFeeConstant"`
-	DAFootprintGasScalar  *string  `json:"daFootprintGasScalar"`
-	BlobGasUsed           *string  `json:"blobGasUsed"`
+	DepositNonce          *string   `json:"depositNonce"`
+	DepositReceiptVersion *string   `json:"depositReceiptVersion"`
+	L1GasPrice            *string   `json:"l1GasPrice"`
+	L1BlobBaseFee         *string   `json:"l1BlobBaseFee"`
+	L1GasUsed             *string   `json:"l1GasUsed"`
+	L1Fee                 *string   `json:"l1Fee"`
+	L1FeeScalar           *string   `json:"l1FeeScalar"` // decimal string (big.Float)
+	L1BaseFeeScalar       *string   `json:"l1BaseFeeScalar"`
+	L1BlobBaseFeeScalar   *string   `json:"l1BlobBaseFeeScalar"`
+	OperatorFeeScalar     *string   `json:"operatorFeeScalar"`
+	OperatorFeeConstant   *string   `json:"operatorFeeConstant"`
+	DAFootprintGasScalar  *string   `json:"daFootprintGasScalar"`
+	BlobGasUsed           *string   `json:"blobGasUsed"`
 }
 
 // ----------------------------------------------------------------------------
@@ -572,18 +630,18 @@ type eip1559TxOut struct {
 }
 
 type setcodeTxOut struct {
-	OpType              string      `json:"_op_type"`
-	OpRaw               string      `json:"_op_raw"`
-	ChainID             string      `json:"chainId"`
-	Nonce               string      `json:"nonce"`
-	To                  *string     `json:"to"`
-	Gas                 string      `json:"gas"`
-	MaxFeePerGas        string      `json:"maxFeePerGas"`
-	MaxPriorityFeePerGas string     `json:"maxPriorityFeePerGas"`
-	Value               string      `json:"value"`
-	Data                string      `json:"data"`
-	OpAuthorizationList []authOut   `json:"_op_authorization_list"`
-	Sender              string      `json:"sender"`
+	OpType               string    `json:"_op_type"`
+	OpRaw                string    `json:"_op_raw"`
+	ChainID              string    `json:"chainId"`
+	Nonce                string    `json:"nonce"`
+	To                   *string   `json:"to"`
+	Gas                  string    `json:"gas"`
+	MaxFeePerGas         string    `json:"maxFeePerGas"`
+	MaxPriorityFeePerGas string    `json:"maxPriorityFeePerGas"`
+	Value                string    `json:"value"`
+	Data                 string    `json:"data"`
+	OpAuthorizationList  []authOut `json:"_op_authorization_list"`
+	Sender               string    `json:"sender"`
 }
 
 type outputLog struct {
@@ -593,13 +651,13 @@ type outputLog struct {
 }
 
 type expectedReceipt struct {
-	Type              string `json:"type"`
-	Status            string `json:"status"`
-	GasUsed           string `json:"gasUsed"`
-	CumulativeGasUsed string `json:"cumulativeGasUsed"`
-	LogsCount         int    `json:"logsCount"`
+	Type              string      `json:"type"`
+	Status            string      `json:"status"`
+	GasUsed           string      `json:"gasUsed"`
+	CumulativeGasUsed string      `json:"cumulativeGasUsed"`
+	LogsCount         int         `json:"logsCount"`
 	Logs              []outputLog `json:"logs,omitempty"`
-	Output            string `json:"output"`
+	Output            string      `json:"output"`
 
 	OpDepositNonce          *string `json:"_op_deposit_nonce,omitempty"`
 	OpDepositReceiptVersion *string `json:"_op_deposit_receipt_version,omitempty"`
@@ -652,10 +710,10 @@ type preAccount struct {
 }
 
 type blockOutput struct {
-	Info       caseInfo               `json:"_info"`
-	Env        outputEnv              `json:"env"`
-	Pre        map[string]preAccount  `json:"pre,omitempty"`
-	Block      struct {
+	Info  caseInfo              `json:"_info"`
+	Env   outputEnv             `json:"env"`
+	Pre   map[string]preAccount `json:"pre,omitempty"`
+	Block struct {
 		Transactions []json.RawMessage `json:"transactions"`
 	} `json:"block"`
 	PostState  map[string]postAccount `json:"postState,omitempty"`
@@ -675,8 +733,8 @@ type blockFetch struct {
 	num      uint64
 	blk      *rpcBlock
 	receipts []*rpcReceipt
-	raws     map[int]string   // tx index → raw envelope (non-deposit only)
-	outputs  []string         // per-tx return data (callTracer)
+	raws     map[int]string // tx index → raw envelope (non-deposit only)
+	outputs  []string       // per-tx return data (callTracer)
 	err      error
 }
 
@@ -717,8 +775,12 @@ func main() {
 		"per-request RPC timeout (a hung node previously blocked the export forever)")
 	force := flag.Bool("force", false,
 		"overwrite an existing output file (default: refuse — silent overwrite was a footgun)")
+	fromBlock := flag.Uint64("from-block", 0,
+		"first block to export, inclusive (0 = first block after genesis; block 0 is the genesis pre and is never exported)")
+	toBlock := flag.Uint64("to-block", 0,
+		"last block to export, inclusive (0 = chain head at export start; a value beyond head is a hard error, not clamped)")
 	flag.Parse()
-	if err := run(*rpcURL, *rollupPath, *outDir, *poststate, *workers, *dumpWorkers, *gethCommit, *genesisPath, *rpcTimeout, *force); err != nil {
+	if err := run(*rpcURL, *rollupPath, *outDir, *poststate, *workers, *dumpWorkers, *gethCommit, *genesisPath, *rpcTimeout, *force, *fromBlock, *toBlock); err != nil {
 		fmt.Fprintf(os.Stderr, "[chainexport][ERROR] export: %v\n", err)
 		os.Exit(1)
 	}
@@ -737,8 +799,21 @@ func progressEvery(total uint64) uint64 {
 	return e
 }
 
-func run(rpcURL, rollupPath, outDir, poststate string, workers, dumpWorkers int, gethCommit, genesisPath string, rpcTimeout time.Duration, force bool) error {
+// maxOutputBytes is the hard serialization ceiling for one exported vector
+// file: 95 MiB. The devnet snapshot is a git-tracked corpus input and GitHub
+// rejects any pushed blob >= 100MiB (the 315MiB full-mode snapshot in dc9b945
+// blocked the branch push), so an export above this ceiling is not registrable.
+// The full-postState path auto-downgrades to boundary sampling at write time
+// (run()'s size guard); a boundary export over the ceiling can only warn.
+const maxOutputBytes = 95 << 20
+
+func run(rpcURL, rollupPath, outDir, poststate string, workers, dumpWorkers int, gethCommit, genesisPath string, rpcTimeout time.Duration, force bool, fromBlock, toBlock uint64) error {
 	start := time.Now()
+	// --from-block/--to-block arg sanity (no RPC needed): from > to is a
+	// caller bug, report it before touching the chain
+	if fromBlock != 0 && toBlock != 0 && fromBlock > toBlock {
+		return fmt.Errorf("--from-block %d > --to-block %d (range is inclusive on both ends)", fromBlock, toBlock)
+	}
 	if outDir == "" {
 		return fmt.Errorf("--out-dir is required")
 	}
@@ -769,26 +844,59 @@ func run(rpcURL, rollupPath, outDir, poststate string, workers, dumpWorkers int,
 	if err != nil {
 		return err
 	}
-	n := head.Uint64() // export blocks 1..n (block 0 is the chain's genesis pre)
+	n := head.Uint64() // full chain = blocks 1..n (block 0 is the chain's genesis pre)
 	if n < 1 {
 		return fmt.Errorf("chain has no blocks beyond genesis")
+	}
+	// ---- block range resolution (--from-block/--to-block) ----------------------
+	// Defaults: from 0 → 1 (block 0 is the genesis pre, never an exported
+	// block), to 0 → head at export start. The from > to arg error is already
+	// rejected above (fail-fast, no RPC); to > head is rejected here — no
+	// clamping by design: silently truncating would export a different range
+	// than the caller asked for.
+	from, to := fromBlock, toBlock
+	if from == 0 {
+		from = 1
+	}
+	if to == 0 {
+		to = n
+	}
+	if to > n {
+		return fmt.Errorf("--to-block %d > chain head %d (no clamping by design: wait for the chain to grow or lower --to-block)", to, n)
+	}
+	ranged := from != 1 || to != n
+	count := to - from + 1
+	if ranged {
+		fmt.Fprintf(os.Stderr, "chainexport: range export blocks %d-%d of head %d (postState sampling and dumps act on the range only)\n", from, to, n)
 	}
 	fmt.Fprintf(os.Stderr, "chainexport: l2_time=%d block_time=%ds forks=%v head=%d\n",
 		rollup.Genesis.L2Time, rollup.BlockTime, forkNames, n)
 
 	// ---- pass 1: fetch all blocks + receipts + raws + traces ----------------
-	fetches := make([]*blockFetch, n)
+	// Blocks before `from` are header-scanned only: fork activation detection
+	// needs chain-authoritative timestamps for the whole prefix 1..to, but the
+	// receipts/traces/raws of pre-range blocks are never exported.
+	fetches := make([]*blockFetch, to)
+	if from > 1 {
+		fmt.Fprintf(os.Stderr, "chainexport: scanning headers 1..%d for fork activation detection (range export)\n", from-1)
+	}
 	sem := make(chan struct{}, workers)
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	var firstErr error
-	for i := uint64(1); i <= n; i++ {
+	for i := uint64(1); i <= to; i++ {
 		wg.Add(1)
 		go func(num uint64) {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			bf, err := fetchBlock(client, num)
+			var bf *blockFetch
+			var err error
+			if num < from {
+				bf, err = fetchHeader(client, num)
+			} else {
+				bf, err = fetchBlock(client, num)
+			}
 			mu.Lock()
 			defer mu.Unlock()
 			fetches[num-1] = bf
@@ -802,8 +910,10 @@ func run(rpcURL, rollupPath, outDir, poststate string, workers, dumpWorkers int,
 		return firstErr
 	}
 
-	// chain linkage sanity (fetched data is what it claims to be)
-	for i := uint64(2); i <= n; i++ {
+	// chain linkage sanity (fetched data is what it claims to be) — headers
+	// (light or full) carry hash/parentHash, so this covers the whole 1..to
+	// prefix including the header-scanned pre-range blocks
+	for i := uint64(2); i <= to; i++ {
 		if fetches[i-1].blk.ParentHash != fetches[i-2].blk.Hash {
 			return fmt.Errorf("block %d parentHash %s != block %d hash %s",
 				i, fetches[i-1].blk.ParentHash, i-1, fetches[i-2].blk.Hash)
@@ -812,14 +922,26 @@ func run(rpcURL, rollupPath, outDir, poststate string, workers, dumpWorkers int,
 
 	// ---- activation blocks (actual chain, 1-based) --------------------------
 	type activation struct {
-		name string
-		ts   uint64
+		name  string
+		ts    uint64
 		block uint64 // 1-based
 	}
 	var activations []activation
 	for _, f := range forks {
 		// first block with ts >= boundary (headers are sorted by ts)
 		blk := sortSearchBlock(fetches, f.ts)
+		bts, err := parseQty(fetches[blk-1].blk.Timestamp)
+		if err != nil {
+			return err
+		}
+		if bts.Uint64() < f.ts {
+			// boundary beyond block `to`: the fork never labels a block of
+			// this export (ranged export, or the chain hasn't reached the
+			// boundary yet) — exclude it from the activation spec/labels
+			fmt.Fprintf(os.Stderr, "chainexport: %s boundary %d not reached by block %d (ts %d) — not active in export range\n",
+				f.name, f.ts, blk, bts.Uint64())
+			continue
+		}
 		activations = append(activations, activation{f.name, f.ts, blk})
 		want := (f.ts - rollup.Genesis.L2Time + rollup.BlockTime - 1) / rollup.BlockTime
 		if blk != want {
@@ -843,7 +965,7 @@ func run(rpcURL, rollupPath, outDir, poststate string, workers, dumpWorkers int,
 		}
 	}
 
-	// per-block hardfork (segment = last activation with act.block <= n).
+	// per-block hardfork (segment = last activation with act.block <= num).
 	// Delta is a devnet-local rollup-table fork with NO EL-level behavior at
 	// this pin (geth chainconfig carries no delta time; attributes.go has no
 	// Delta injection branch — Task 1 定案 2/3), and the vector contract admits
@@ -876,15 +998,19 @@ func run(rpcURL, rollupPath, outDir, poststate string, workers, dumpWorkers int,
 		parts = append(parts, fmt.Sprintf("%d:%s", a.block, a.name))
 	}
 	specDigest := sha256.Sum256([]byte(strings.Join(parts, ",")))
-	stem := fmt.Sprintf("devnet_%d_%s", n, hex.EncodeToString(specDigest[:])[:8])
+	stemBase := fmt.Sprintf("%d", n)
+	if ranged {
+		stemBase = fmt.Sprintf("%d-%d", from, to)
+	}
+	stem := fmt.Sprintf("devnet_%s_%s", stemBase, hex.EncodeToString(specDigest[:])[:8])
 
 	// ---- per-block assembly ---------------------------------------------------
-	doc := &chainDoc{Blocks: make([]blockOutput, n)}
-	progEvery := progressEvery(n)
+	doc := &chainDoc{Blocks: make([]blockOutput, count)}
+	progEvery := progressEvery(count)
 	var txCount uint64
 	forkCounts := make(map[string]uint64)
-	for i := uint64(0); i < n; i++ {
-		bf := fetches[i]
+	for i := uint64(0); i < count; i++ {
+		bf := fetches[from-1+i] // doc index i ↔ block from+i
 		num := bf.num
 		hf := hardforkOf(num)
 		blk, err := assembleBlock(bf, hf, forkNames, hf == "jovian")
@@ -894,105 +1020,129 @@ func run(rpcURL, rollupPath, outDir, poststate string, workers, dumpWorkers int,
 		doc.Blocks[i] = *blk
 		txCount += uint64(len(bf.blk.Transactions))
 		forkCounts[hf]++
-		if (i+1)%progEvery == 0 || i+1 == n {
-			fmt.Fprintf(os.Stderr, "chainexport: EXPORT %d/%d blocks (receipts ok, state pages 0)\n", i+1, n)
+		if (i+1)%progEvery == 0 || i+1 == count {
+			fmt.Fprintf(os.Stderr, "chainexport: EXPORT %d/%d blocks (receipts ok, state pages 0)\n", i+1, count)
 		}
 	}
-	// description strings need n; fill here (assembleBlock wrote a placeholder)
-	for i := uint64(0); i < n; i++ {
-		doc.Blocks[i].Info.Description = fmt.Sprintf("devnet chain of %d blocks (%s), block %d/%d",
-			n, strings.Join(forkNames, "->"), i+1, n)
+	// description strings need the range/count; fill here (assembleBlock wrote a
+	// placeholder). Full exports keep the historical wording byte-for-byte.
+	for i := uint64(0); i < count; i++ {
+		if ranged {
+			doc.Blocks[i].Info.Description = fmt.Sprintf("devnet chain blocks %d-%d (%s), block %d/%d",
+				from, to, strings.Join(forkNames, "->"), from+i, to)
+		} else {
+			doc.Blocks[i].Info.Description = fmt.Sprintf("devnet chain of %d blocks (%s), block %d/%d",
+				n, strings.Join(forkNames, "->"), i+1, n)
+		}
 	}
 
 	// ---- postState sampling ----------------------------------------------------
-	var sampledIdxs []int
-	if full {
-		for i := 0; i < int(n); i++ {
-			sampledIdxs = append(sampledIdxs, i)
-		}
-	} else {
+	// Indices are doc-relative (0-based into the exported range); activation ±1
+	// indices outside the range are dropped by add()'s bounds guard.
+	// boundarySamples() is a closure so the size guard's full→boundary downgrade
+	// (write section) recomputes the exact same set without re-fetching dumps.
+	boundarySamples := func() []int {
 		inSample := make(map[int]bool)
 		add := func(i int) {
-			if i >= 0 && int64(i) < int64(n) {
+			if i >= 0 && int64(i) < int64(count) {
 				inSample[i] = true
 			}
 		}
 		add(0)
-		add(int(n) - 1)
-		for i := 0; i < int(n); i += 100 {
+		add(int(count) - 1)
+		for i := 0; i < int(count); i += 100 {
 			add(i)
 		}
 		for _, a := range activations {
-			idx := int(a.block) - 1 // 0-based index of the activation block
+			idx := int(a.block) - int(from) // 0-based doc index of the activation block
 			add(idx - 1)
 			add(idx)
 			add(idx + 1)
 		}
+		out := make([]int, 0, len(inSample))
 		for i := range inSample {
+			out = append(out, i)
+		}
+		sort.Ints(out)
+		return out
+	}
+	var sampledIdxs []int
+	if full {
+		for i := 0; i < int(count); i++ {
 			sampledIdxs = append(sampledIdxs, i)
 		}
-		sort.Ints(sampledIdxs)
+	} else {
+		sampledIdxs = boundarySamples()
 		doc.SampledBlocks = sampledIdxs
 	}
 
-	// ---- pre: full genesis state (block 0 dump) -------------------------------
+	// ---- pre: state dump at from-1 (genesis alloc when from=1) ----------------
 	join, err := loadStateJoin(genesisPath)
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(os.Stderr, "chainexport: dumping pre (genesis state)...\n")
-	preDump, err := dumpState(client, 0, join)
+	if ranged {
+		fmt.Fprintf(os.Stderr, "chainexport: dumping pre (state at block %d, the first exported block's parent)...\n", from-1)
+	} else {
+		fmt.Fprintf(os.Stderr, "chainexport: dumping pre (genesis state)...\n")
+	}
+	preDump, err := dumpState(client, from-1, join)
 	if err != nil {
-		return fmt.Errorf("genesis state dump (pre): %w (devnet geth must run --state.scheme hash --gcmode archive)", err)
+		return fmt.Errorf("state dump at block %d (pre): %w (devnet geth must run --state.scheme hash --gcmode archive)", from-1, err)
 	}
-	// Genesis self-check: the block-0 dump (all accounts, preimage-less ones
-	// resolved via this very alloc) must reproduce the alloc's non-empty
-	// account set field-for-field. A mismatch means --genesis is not the
-	// genesis the running chain was inited with — refuse to emit a vector
-	// whose `pre` silently misrepresents reality.
-	if len(preDump) != len(join.alloc) {
-		return fmt.Errorf("genesis self-check: dump accounts %d != alloc accounts %d (--genesis mismatch?)", len(preDump), len(join.alloc))
-	}
-	var missing, extra []string
-	for addr := range join.alloc {
-		if _, ok := preDump[addr]; !ok {
-			missing = append(missing, addr)
+	// Genesis self-check (full exports only): the block-0 dump (all accounts,
+	// preimage-less ones resolved via this very alloc) must reproduce the
+	// alloc's non-empty account set field-for-field. A mismatch means
+	// --genesis is not the genesis the running chain was inited with — refuse
+	// to emit a vector whose `pre` silently misrepresents reality. Ranged
+	// exports dump a mid-chain state (block from-1) where execution-touched
+	// accounts legitimately differ from the alloc, so the account-set check
+	// does not apply; the preimage-resolution join above still does.
+	if from == 1 {
+		if len(preDump) != len(join.alloc) {
+			return fmt.Errorf("genesis self-check: dump accounts %d != alloc accounts %d (--genesis mismatch?)", len(preDump), len(join.alloc))
 		}
-	}
-	for addr := range preDump {
-		if _, ok := join.alloc[addr]; !ok {
-			extra = append(extra, addr)
+		var missing, extra []string
+		for addr := range join.alloc {
+			if _, ok := preDump[addr]; !ok {
+				missing = append(missing, addr)
+			}
 		}
-	}
-	if len(missing) > 0 || len(extra) > 0 {
-		return fmt.Errorf("genesis self-check: alloc accounts missing from dump %v; dump keys not in alloc %v (--genesis mismatch?)", missing, extra)
-	}
-	for addr, want := range join.alloc {
-		got, ok := preDump[addr]
-		if !ok {
-			return fmt.Errorf("genesis self-check: alloc account %s missing from dump", addr)
+		for addr := range preDump {
+			if _, ok := join.alloc[addr]; !ok {
+				extra = append(extra, addr)
+			}
 		}
-		if got.Balance != want.Balance || got.Nonce != want.Nonce || got.Code != want.Code {
-			return fmt.Errorf("genesis self-check: account %s fields differ from alloc (bal %s/%s nonce %s/%s code %d/%d bytes)",
-				addr, got.Balance, want.Balance, got.Nonce, want.Nonce, len(got.Code), len(want.Code))
+		if len(missing) > 0 || len(extra) > 0 {
+			return fmt.Errorf("genesis self-check: alloc accounts missing from dump %v; dump keys not in alloc %v (--genesis mismatch?)", missing, extra)
 		}
-		for slot, wantVal := range want.Storage {
-			gotVal, ok := got.Storage[slot]
+		for addr, want := range join.alloc {
+			got, ok := preDump[addr]
 			if !ok {
-				return fmt.Errorf("genesis self-check: account %s slot %s missing from dump join", addr, slot)
+				return fmt.Errorf("genesis self-check: alloc account %s missing from dump", addr)
 			}
-			gn, _ := parseQty(gotVal)
-			wn, _ := parseQty(wantVal)
-			if gn.Cmp(wn) != 0 {
-				return fmt.Errorf("genesis self-check: account %s slot %s value %s != alloc %s", addr, slot, gotVal, wantVal)
+			if got.Balance != want.Balance || got.Nonce != want.Nonce || got.Code != want.Code {
+				return fmt.Errorf("genesis self-check: account %s fields differ from alloc (bal %s/%s nonce %s/%s code %d/%d bytes)",
+					addr, got.Balance, want.Balance, want.Nonce, got.Nonce, len(got.Code), len(want.Code))
+			}
+			for slot, wantVal := range want.Storage {
+				gotVal, ok := got.Storage[slot]
+				if !ok {
+					return fmt.Errorf("genesis self-check: account %s slot %s missing from dump join", addr, slot)
+				}
+				gn, _ := parseQty(gotVal)
+				wn, _ := parseQty(wantVal)
+				if gn.Cmp(wn) != 0 {
+					return fmt.Errorf("genesis self-check: account %s slot %s value %s != alloc %s", addr, slot, gotVal, wantVal)
+				}
 			}
 		}
+		fmt.Fprintf(os.Stderr, "chainexport: genesis self-check OK (%d accounts, storage join verified)\n", len(preDump))
 	}
-	fmt.Fprintf(os.Stderr, "chainexport: genesis self-check OK (%d accounts, storage join verified)\n", len(preDump))
 	doc.Blocks[0].Pre = preFromDump(preDump)
 
 	// ---- postState dumps -------------------------------------------------------
-	fmt.Fprintf(os.Stderr, "chainexport: dumping %d/%d postStates (%s)...\n", len(sampledIdxs), n, poststate)
+	fmt.Fprintf(os.Stderr, "chainexport: dumping %d/%d postStates (%s)...\n", len(sampledIdxs), count, poststate)
 	dsem := make(chan struct{}, dumpWorkers)
 	var dwg sync.WaitGroup
 	var dmu sync.Mutex
@@ -1004,17 +1154,17 @@ func run(rpcURL, rollupPath, outDir, poststate string, workers, dumpWorkers int,
 			defer dwg.Done()
 			dsem <- struct{}{}
 			defer func() { <-dsem }()
-			st, err := dumpState(client, uint64(blockNum+1), join) // state AFTER 0-based block idx = state at block idx+1
+			st, err := dumpState(client, uint64(int(from)+blockNum), join) // state AFTER 0-based doc index blockNum = state at block from+blockNum
 			dmu.Lock()
 			defer dmu.Unlock()
 			if err != nil && dumpErr == nil {
-				dumpErr = fmt.Errorf("postState dump at block %d: %w", blockNum+1, err)
+				dumpErr = fmt.Errorf("postState dump at block %d: %w", int(from)+blockNum, err)
 				return
 			}
 			doc.Blocks[blockNum].PostState = st
 			done := atomic.AddUint64(&dumped, 1)
 			if done%progEvery == 0 || done == uint64(len(sampledIdxs)) {
-				fmt.Fprintf(os.Stderr, "chainexport: EXPORT %d/%d blocks (receipts ok, state pages %d)\n", n, n, done)
+				fmt.Fprintf(os.Stderr, "chainexport: EXPORT %d/%d blocks (receipts ok, state pages %d)\n", count, count, done)
 			}
 		}(idx)
 	}
@@ -1031,7 +1181,7 @@ func run(rpcURL, rollupPath, outDir, poststate string, workers, dumpWorkers int,
 		Version         string `json:"version"`
 		Generator       string `json:"generator"`
 		GeneratorCommit string `json:"generator_commit"`
-	}{fmt.Sprintf("%d-block", n), "chainexport", gethCommit})
+	}{fmt.Sprintf("%d-block", count), "chainexport", gethCommit})
 	if err != nil {
 		return err
 	}
@@ -1048,6 +1198,42 @@ func run(rpcURL, rollupPath, outDir, poststate string, workers, dumpWorkers int,
 		return err
 	}
 	outBytes = append(outBytes, '\n')
+	// ---- size guard (P5): the registered artifact must stay pushable ----------
+	// A full-postState serialization over maxOutputBytes is auto-downgraded to
+	// boundary sampling (the dumps are already in memory: drop the non-sampled
+	// postStates, write sampledBlocks, re-serialize) — no re-fetch, same stem
+	// (the digest covers only the activation spec, never the poststate mode).
+	if len(outBytes) > maxOutputBytes && full {
+		fmt.Fprintf(os.Stderr, "chainexport: SIZE GUARD: full-postState output %d bytes > %d MiB ceiling — full 超限，已自动降级为 boundary 采样并重新序列化\n",
+			len(outBytes), maxOutputBytes>>20)
+		full = false
+		poststate = "boundary"
+		sampledIdxs = boundarySamples()
+		doc.SampledBlocks = sampledIdxs
+		sampled := make(map[int]bool, len(sampledIdxs))
+		for _, i := range sampledIdxs {
+			sampled[i] = true
+		}
+		for i := range doc.Blocks {
+			if !sampled[i] {
+				doc.Blocks[i].PostState = nil
+			}
+		}
+		out[stem], err = json.Marshal(doc)
+		if err != nil {
+			return err
+		}
+		outBytes, err = json.MarshalIndent(out, "", "  ")
+		if err != nil {
+			return err
+		}
+		outBytes = append(outBytes, '\n')
+		fmt.Println("DOWNGRADED full->boundary")
+	}
+	if len(outBytes) > maxOutputBytes {
+		fmt.Fprintf(os.Stderr, "chainexport: WARNING: %s serializes to %d bytes, over the %d MiB ceiling even with boundary sampling — do NOT register/push this file as-is\n",
+			stem+".json", len(outBytes), maxOutputBytes>>20)
+	}
 	file := outDir + "/" + stem + ".json"
 	// Refuse to silently clobber a previous export (robustness hardening): the
 	// stem embeds the head height + activation spec, so an existing file is
@@ -1072,7 +1258,7 @@ func run(rpcURL, rollupPath, outDir, poststate string, workers, dumpWorkers int,
 		segParts = append(segParts, fmt.Sprintf("%s=%d", f, forkCounts[f]))
 	}
 	fmt.Fprintf(os.Stderr, "chainexport: SUMMARY blocks=%d txs=%d postState blocks=%d/%d elapsed=%s\n",
-		n, txCount, len(sampledIdxs), n, time.Since(start).Round(time.Second))
+		count, txCount, len(sampledIdxs), count, time.Since(start).Round(time.Second))
 	fmt.Fprintf(os.Stderr, "chainexport: fork segment blocks: %s\n", strings.Join(segParts, " "))
 	return nil
 }
@@ -1091,6 +1277,21 @@ func sortSearchBlock(fetches []*blockFetch, ts uint64) uint64 {
 		}
 	}
 	return lo
+}
+
+// fetchHeader light-fetches a block header (no tx bodies/receipts/traces).
+// Used for blocks before --from-block: fork activation detection needs
+// chain-authoritative timestamps for the whole 1..to prefix, but nothing
+// before the range is ever assembled or dumped.
+func fetchHeader(client *rpcClient, num uint64) (*blockFetch, error) {
+	bf := &blockFetch{num: num, raws: map[int]string{}}
+	if err := client.call(&bf.blk, "eth_getBlockByNumber", hexQtyU64(num), false); err != nil {
+		return nil, err
+	}
+	if bf.blk == nil {
+		return nil, fmt.Errorf("block not found")
+	}
+	return bf, nil
 }
 
 func fetchBlock(client *rpcClient, num uint64) (*blockFetch, error) {
@@ -1719,10 +1920,10 @@ func receiptToExpected(r *rpcReceipt, tx *rpcTx, output string, isJovian bool) (
 // ----------------------------------------------------------------------------
 
 type dumpAccount struct {
-	Balance string            `json:"balance"`           // DECIMAL string
-	Nonce   json.Number       `json:"nonce"`             // number
-	Code    string            `json:"code"`              // "0x..." (may be absent)
-	Storage map[string]string `json:"storage"`           // "0x<slot>" → hex WITHOUT 0x prefix
+	Balance string            `json:"balance"` // DECIMAL string
+	Nonce   json.Number       `json:"nonce"`   // number
+	Code    string            `json:"code"`    // "0x..." (may be absent)
+	Storage map[string]string `json:"storage"` // "0x<slot>" → hex WITHOUT 0x prefix
 	// AddressHash (dump.go sets it for EVERY account, addressed or not). Used
 	// as the pagination seek position: resuming from the dump's own `next`
 	// cursor loses the account AT the cursor (tr.Iterator.Next() advances past
@@ -1825,7 +2026,7 @@ func loadStateJoin(path string) (*stateJoin, error) {
 			}
 			pa.Storage = st
 		}
-		join.alloc["0x" + ks] = pa
+		join.alloc["0x"+ks] = pa
 	}
 	return join, nil
 }
@@ -1838,7 +2039,8 @@ func loadStateJoin(path string) (*stateJoin, error) {
 func dumpState(client *rpcClient, num uint64, join *stateJoin) (map[string]postAccount, error) {
 	out := map[string]postAccount{}
 	start := "0x"
-	dropPrev := "" // the address expected to be re-emitted at the next page head
+	lastKey, lastAddr := "", "" // page's max AddressHash + its resolved address
+	dropPrev := ""              // the address expected to be re-emitted at the next page head
 	for page := 0; ; page++ {
 		var res dumpResult
 		// nocode=false, nostorage=false, incompletes=true (→
@@ -1865,6 +2067,15 @@ func dumpState(client *rpcClient, num uint64, join *stateJoin) (map[string]postA
 					return nil, fmt.Errorf("dump key %q: %w", key, err)
 				}
 				addr = a
+			}
+			// Track the page's max AddressHash account TOGETHER with its resolved
+			// address: dropPrev below needs the ADDRESS, and execution-created
+			// accounts (bcos-testing funding EOA / deployed contracts) have no
+			// genesis-alloc preimage — resolving them through addrByTrieKey
+			// silently yields "" and the re-emitted boundary account then
+			// duplicates across pages (hard error at the dup check).
+			if acc.Key > lastKey {
+				lastKey, lastAddr = acc.Key, addr
 			}
 			if addr == dropPrev {
 				dropPrev = "" // expected boundary re-emission; drop once
@@ -1927,17 +2138,13 @@ func dumpState(client *rpcClient, num uint64, join *stateJoin) (map[string]postA
 			break
 		}
 		// Pagination resume: seek to the last EMITTED account's trie key (the
-		// max AddressHash on this page — Accounts is an unordered JSON map).
-		// Empirics (this pin): a nodeIterator seek positions BEFORE the seek
-		// key, so the next page RE-EMITS that key; drop it (dropPrev) instead
-		// of erroring. Resuming from res.Next instead loses the account AT the
-		// cursor (tr.Iterator.Next() advances past the seek node).
-		lastKey := ""
-		for k := range res.Accounts {
-			if kk := res.Accounts[k].Key; kk > lastKey {
-				lastKey = kk
-			}
-		}
+		// max AddressHash on this page — Accounts is an unordered JSON map),
+		// carrying its already-resolved address as the expected page-head
+		// re-emission. Empirics (this pin): a nodeIterator seek positions
+		// BEFORE the seek key, so the next page RE-EMITS that key; drop it
+		// (dropPrev) instead of erroring. Resuming from res.Next instead loses
+		// the account AT the cursor (tr.Iterator.Next() advances past the seek
+		// node).
 		if lastKey == "" {
 			return nil, fmt.Errorf("dump: page %d has no address hashes for pagination", page)
 		}
@@ -1946,7 +2153,7 @@ func dumpState(client *rpcClient, num uint64, join *stateJoin) (map[string]postA
 			return nil, fmt.Errorf("dump: page %d bad last address hash %q: %w", page, lastKey, err)
 		}
 		start = lh
-		dropPrev, _ = join.addrByTrieKey[common.HexToHash(lh)]
+		dropPrev = lastAddr
 		if page > 1_000_000 {
 			return nil, fmt.Errorf("dump: pagination did not terminate")
 		}

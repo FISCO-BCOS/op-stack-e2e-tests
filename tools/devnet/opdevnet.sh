@@ -23,6 +23,23 @@
 #   ./opdevnet.sh status  组件进程/端口 + L2 块高 + 所在 fork 段 + safe/unsafe 差
 #   ./opdevnet.sh down    反序 kill + 清理（产物 artifacts/ 与日志 logs/ 默认保留）
 #   ./opdevnet.sh clean   down 后连运行时目录一起删除
+#   ./opdevnet.sh export [chainexport 参数…]
+#                         薄分发：调 chainexport/chainexport.bin 把运行中的链导出为 t8n 差分
+#                         向量；参数（--from-block/--to-block 块范围、--poststate 等）见
+#                         `opdevnet.sh export -h`。二进制不存在 → 提示按 chainexport/build.sh 重建。
+#   ./opdevnet.sh check activations|distribution [参数…]
+#                         薄分发：activations = 激活块升级交易计数检查（--min-user-txs 阈值等
+#                         参数见 `opdevnet.sh check activations -h`）；distribution = 用户交易
+#                         跨 fork 段分布检查（参数见 `opdevnet.sh check distribution -h`）。
+#   ./opdevnet.sh txsource [run.sh 参数…]
+#                         薄分发：调 txsource/run.sh 可插拔交易源执行器（参数见
+#                         `opdevnet.sh txsource -h`）。up/status/down/clean 行为不变。
+#   ./opdevnet.sh snapshot [--out-dir D] [chainexport 参数…]
+#                         导出 + 自动注册一条龙（P5）：chainexport 导出（缺省 boundary
+#                         采样；full 序列化超 95MiB 由其体积守卫自动降级）→ stem 命名 →
+#                         写入 vectors/ → 替换旧 devnet 注册（旧文件 git rm + manifest/
+#                         SHA256SUMS 整块 upsert，注册面只留最新一枚）→ out-dir 暂存区
+#                         滚动保留最近 2 个导出 → git add -f 例外文件。提交仍手动。
 #
 # 全部参数来自 devnet.toml + versions.lock，工具不复现实验、不发明参数。
 #
@@ -96,7 +113,7 @@ die()  {
 stage() { # $1=k(1..6) $2=label —— up 六阶段标记（anvil→deployer→geth init→geth start→op-node→batcher）
   log "[stage $1/6] $2"
 }
-usage() { sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+usage() { sed -n '2,43p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
 
 # ---------- 配置解析（仅支持本仓库 devnet.toml 的平面格式） ----------
 toml_get() { # $1=section $2=key -> value（去掉引号）
@@ -1229,11 +1246,248 @@ cmd_clean() {
   log "cleaned entire runtime dir $RUNTIME"
 }
 
+# ---------- 薄分发层：收编 chainexport / check_* / txsource（P4） ----------
+# 原则：只归一入口（一处记住全部工具入口），不复制被调工具的任何逻辑/默认值；
+# 参数原样透传、退出码经 exec 直通。各子命令参数的唯一权威 = 被调工具自己的 -h。
+
+CHAINEXPORT_BIN="${OPDEVNET_CHAINEXPORT:-$DIR/chainexport/chainexport.bin}"
+
+cmd_export() { # opdevnet.sh export [chainexport 参数…]
+  if [ ! -x "$CHAINEXPORT_BIN" ]; then
+    STEP="export"
+    die "chainexport binary missing: $CHAINEXPORT_BIN —— rebuild it first: bash $DIR/chainexport/build.sh"
+  fi
+  exec "$CHAINEXPORT_BIN" "$@"
+}
+
+check_usage() { # opdevnet.sh check [-h] —— 两个检查目标的一行说明
+  cat <<'EOF'
+usage: opdevnet.sh check activations|distribution [参数…]
+
+  activations   激活块升级交易计数检查（6/3/8/5 等；--min-user-txs 阈值可调，
+                参数明细: opdevnet.sh check activations -h）
+  distribution  用户（非 L1-attributes）交易跨 fork 段分布检查
+                （参数明细: opdevnet.sh check distribution -h）
+EOF
+  exit 2
+}
+
+cmd_check() { # opdevnet.sh check activations|distribution [参数…]
+  local sub="${1:-}"
+  case "$sub" in
+    -h|--help|help|"") check_usage ;;
+    activations)  shift; exec "$DIR/check_activations.py" "$@" ;;
+    distribution) shift; exec "$DIR/txsource/check_distribution.py" "$@" ;;
+    *) echo "unknown check target: $sub (known: activations, distribution)" >&2; check_usage ;;
+  esac
+}
+
+cmd_txsource() { # opdevnet.sh txsource [run.sh 参数…]
+  exec bash "$DIR/txsource/run.sh" "$@"
+}
+
+# ---------- snapshot：chainexport 导出 + vectors/ 自动注册（P5） ----------
+# 把「导出 → stem 命名（既有 digest 规则）→ 写入 vectors/ → 替换旧 devnet 快照 →
+# manifest/SHA256SUMS upsert → git add 例外文件」收口为一条命令（Task 6 手工步骤固化）。
+# 注册面硬约束（都是既有事实的机制化，不是新政策）：
+#   - 体积上限 SNAPSHOT_MAX_BYTES（95MiB，= chainexport --poststate full 自动降级阈值）：
+#     GitHub 拒收 >=100MiB 的 push blob，超限文件拒绝注册——推不上去的入库物没有意义；
+#   - vectors/ 只注册最新一枚 devnet 快照：DIVERGENCES.md 的 ALLOWLIST 行绑定单一 stem，
+#     旧 stem 快照若留在注册面而登记行已重钉到新 stem = stale exemption，直接把 FISCO
+#     重放门打红；被替换的旧文件由 git rm 删除（315MB full 模式旧快照即在此被替换）；
+#   - 滚动保留最近 SNAPSHOT_KEEP(2) 个导出文件在 --out-dir 暂存区（vectors/ 注册面之外）。
+CORPUS_ROOT="$(cd "$DIR/../.." && pwd)"
+VECTORS_DIR="$CORPUS_ROOT/opstack-executor/tests/t8n/vectors"
+SNAPSHOT_MAX_BYTES=$((95 * 1024 * 1024))
+SNAPSHOT_KEEP=2
+
+snapshot_file_size() { stat -f%z "$1" 2>/dev/null || stat -c%s "$1"; }
+
+# run_export [chainexport 参数…] —— 跑一次导出并把 stdout 机读行解到 X_* 变量
+#   X_STEM/X_FILE/X_SHA/X_SIZE/X_DOWN；rc≠0 或机读行缺失 = die。不做体积判断。
+run_export() {
+  local tmpout rc=0
+  tmpout="$(mktemp /tmp/opdevnet-snapshot.XXXXXX)"
+  # --force：out-dir 是 snapshot 自己的暂存区（重跑同 stem 覆盖重导），非用户数据
+  "$CHAINEXPORT_BIN" --out-dir "$out_dir" --force "$@" >"$tmpout" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    cat "$tmpout" >&2; rm -f "$tmpout"
+    die "chainexport failed (rc=$rc)"
+  fi
+  X_STEM="$(sed -n 's/^DEVNET-STEM //p' "$tmpout" | tail -1)"
+  X_FILE="$(sed -n 's/^WROTE //p' "$tmpout" | tail -1)"
+  X_SHA="$(sed -n 's/^SHA256 //p' "$tmpout" | tail -1)"
+  if grep -q '^DOWNGRADED full->boundary$' "$tmpout"; then X_DOWN=1; else X_DOWN=""; fi
+  rm -f "$tmpout"
+  [ -n "$X_STEM" ] && [ -n "$X_FILE" ] && [ -n "$X_SHA" ] || \
+    die "chainexport stdout missing DEVNET-STEM/WROTE/SHA256 machine lines (rc=0 but unparseable)"
+  X_SIZE="$(snapshot_file_size "$X_FILE")" || die "cannot stat $X_FILE"
+}
+
+cmd_snapshot() { # opdevnet.sh snapshot [--out-dir D] [chainexport 参数…]
+  STEP="snapshot"
+  local out_dir="" args=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --out-dir)   out_dir="${2:-}"; shift 2 ;;
+      --out-dir=*) out_dir="${1#--out-dir=}"; shift ;;
+      --from-block|--to-block) die "snapshot 自动管理导出范围（自动合规），请勿手工传 $1；范围导出请用 opdevnet.sh export" ;;
+      *) args+=("$1"); shift ;;
+    esac
+  done
+  if [ ! -x "$CHAINEXPORT_BIN" ]; then
+    die "chainexport binary missing: $CHAINEXPORT_BIN —— rebuild it first: bash $DIR/chainexport/build.sh"
+  fi
+  [ -f "$VECTORS_DIR/manifest.txt" ] && [ -f "$VECTORS_DIR/SHA256SUMS" ] || \
+    die "vectors registry missing under $VECTORS_DIR (run inside the corpus checkout)"
+  if [ -z "$out_dir" ]; then
+    out_dir="/tmp/opdevnet-snapshots"
+  fi
+  mkdir -p "$out_dir"
+
+  # 1) 全链导出（--poststate 缺省 boundary；显式传 full 由 chainexport 体积守卫自动降级）
+  log "chainexport: exporting full chain (out-dir=$out_dir${args[*]:+ args=${args[*]}})…"
+  run_export ${args[@]+"${args[@]}"}
+  local stem=$X_STEM file=$X_FILE sha=$X_SHA size=$X_SIZE
+  [ -n "$X_DOWN" ] && log "SIZE GUARD: full 超限，已自动降级为 boundary 采样（chainexport 已重序列化）"
+
+  # 1b) 自动合规第二级：boundary 全链仍超限（状态 dump ≈9.4MB/个 × 采样数——8 fork 链
+  #     的激活±1 三元组就 24 个 dump ≈226MB，数学上不可能全链入限）→ 自动二分「最大
+  #     可注册尾窗 [W, to]」：stem 按既有 ranged 规则带范围（devnet_<from>-<to>_<digest8>），
+  #     采样规则一字不改；尾窗优先保住晚期段的 bcos-testing create 交易（登记命中）。
+  #     每轮 campaign 自动滑到最新窗口 = 快照持续更新且永远可注册可推送。
+  if [ "$size" -gt "$SNAPSHOT_MAX_BYTES" ]; then
+    log "SIZE GUARD: boundary 全链导出 $size bytes > $SNAPSHOT_MAX_BYTES —— auto-fit：二分最大可注册尾窗"
+    local initial_file="$file"
+    local rpc="http://127.0.0.1:9545" i prev=""
+    # 从透传参数里取 --rpc（形如 --rpc URL / --rpc=URL），供 eth_blockNumber 用
+    for i in ${args[@]+"${args[@]}"}; do
+      case "$i" in
+        --rpc) prev="--rpc" ;;
+        --rpc=*) rpc="${i#--rpc=}" ;;
+        *) if [ "$prev" = "--rpc" ]; then rpc="$i"; prev=""; fi ;;
+      esac
+    done
+    local head_hex to
+    head_hex="$(curl -fsS -X POST -H 'Content-Type: application/json' \
+      --data '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}' "$rpc" \
+      | sed -n 's/.*"result":[[:space:]]*"0x\([0-9a-fA-F]*\)".*/\1/p')" \
+      || die "eth_blockNumber at $rpc failed（auto-fit 需要链头）"
+    [ -n "$head_hex" ] || die "cannot parse eth_blockNumber reply from $rpc"
+    to="$(printf '%d' "0x$head_hex")"
+    log "auto-fit: chain head = ${to}（窗口右端冻结于此）"
+
+    local span=199 w fit_span=0 fail_span=0
+    fit_stem=""; fit_file=""; fit_sha=""; fit_size=""
+    while [ $((to - span)) -ge 2 ]; do
+      w=$((to - span))
+      log "auto-fit: probing window [$w, $to] …"
+      run_export --from-block "$w" --to-block "$to" ${args[@]+"${args[@]}"}
+      if [ "$X_SIZE" -le "$SNAPSHOT_MAX_BYTES" ]; then
+        # 放行：更宽的窗被尝试前，窄窗文件先让位
+        [ -n "$fit_file" ] && rm -f "$fit_file"
+        [ -n "$initial_file" ] && rm -f "$initial_file" && initial_file=""
+        fit_span=$span; fit_stem=$X_STEM; fit_file=$X_FILE; fit_sha=$X_SHA; fit_size=$X_SIZE
+        log "auto-fit: window fits ($X_SIZE bytes)"
+        span=$((span * 2 + 1))
+      else
+        fail_span=$span
+        rm -f "$X_FILE"
+        log "auto-fit: window over ceiling ($X_SIZE bytes) — narrowing"
+        break
+      fi
+    done
+    if [ "$fit_span" -eq 0 ]; then
+      die "auto-fit: 连最小窗（[2, $to]）也找不到可用拟合起点——链状态异常，拒绝注册"
+    fi
+    if [ "$fail_span" -gt 0 ]; then
+      # 在 (fit_span 放行, fail_span 超限) 间二分，窗宽分辨率 100 块（采样点粒度）
+      while [ $((fail_span - fit_span)) -gt 100 ]; do
+        span=$(( (fit_span + fail_span) / 2 ))
+        w=$((to - span))
+        log "auto-fit: bisect window [$w, $to] …"
+        run_export --from-block "$w" --to-block "$to" ${args[@]+"${args[@]}"}
+        if [ "$X_SIZE" -le "$SNAPSHOT_MAX_BYTES" ]; then
+          [ -n "$fit_file" ] && rm -f "$fit_file"
+          [ -n "$initial_file" ] && rm -f "$initial_file" && initial_file=""
+          fit_span=$span; fit_stem=$X_STEM; fit_file=$X_FILE; fit_sha=$X_SHA; fit_size=$X_SIZE
+        else
+          fail_span=$span; rm -f "$X_FILE"
+        fi
+      done
+    fi
+    stem=$fit_stem file=$fit_file sha=$fit_sha size=$fit_size
+    log "auto-fit: chosen window [$((to - fit_span)), $to] → $stem.json ($size bytes)"
+  fi
+
+  local stem_base
+  stem_base="$(printf '%s' "$stem" | sed -E 's/^devnet_(.+)_[0-9a-f]{8}$/\1/')"
+  [ "$size" -le "$SNAPSHOT_MAX_BYTES" ] || \
+    die "export $stem.json = $size bytes > $SNAPSHOT_MAX_BYTES register ceiling —— 拒绝注册（推不上 GitHub 的文件不入库）"
+
+  # 2) 注册：写入 vectors/ + manifest/SHA256SUMS 整块 upsert
+  local vec="$VECTORS_DIR/$stem.json"
+  local manifest="$VECTORS_DIR/manifest.txt" sums="$VECTORS_DIR/SHA256SUMS"
+  cp -f "$file" "$vec"
+  # manifest：旧 devnet 注册块（注释缓冲 + devnet_*.json 文件名行）整块删除，其余原样
+  awk '
+    /^[ \t]*#/           { buf = buf $0 "\n"; next }
+    /^devnet_.*\.json$/  { buf = ""; next }
+    { if (buf != "") { printf "%s", buf; buf = "" } print }
+    END { if (buf != "") printf "%s", buf }
+  ' "$manifest" > "$manifest.tmp"
+  cat >> "$manifest.tmp" <<EOF
+
+# Real-derivation devnet snapshot (P3-2; auto-registered by tools/devnet/opdevnet.sh
+# snapshot): $stem_base-block chainexport export of a real campaign devnet chain (stem rule
+# devnet_<blocks>_<digest8>, digest8 = sha256 over the actual-header activation spec --
+# single source of truth in chainexport/main.go, same convention as the ladder stem).
+# Not a regen.sh product: regen.sh registers it read-only from the vectors/ glob and
+# never regenerates it. Its bytes are pinned in vectors/SHA256SUMS; the create-output
+# divergences registered in DIVERGENCES.md (P3-1b) bind to this stem.
+$stem.json
+EOF
+  mv "$manifest.tmp" "$manifest"
+  grep -v '  devnet_.*\.json$' "$sums" > "$sums.tmp"
+  printf '%s  %s.json\n' "$sha" "$stem" >> "$sums.tmp"
+  mv "$sums.tmp" "$sums"
+
+  # 3) 替换旧 devnet 快照：vectors/ 只留新注册的这枚
+  local old
+  for old in "$VECTORS_DIR"/devnet_*.json; do
+    [ -e "$old" ] || continue
+    [ "$old" = "$vec" ] && continue
+    ( cd "$CORPUS_ROOT" && git rm -q -f -- "opstack-executor/tests/t8n/vectors/$(basename "$old")" ) || rm -f "$old"
+    log "replaced old devnet snapshot: $(basename "$old")（vectors/ 只注册最新一枚，ALLOWLIST 绑定单一 stem）"
+  done
+
+  # 4) 滚动保留：--out-dir 暂存区只留最近 SNAPSHOT_KEEP 个导出
+  local keep=$SNAPSHOT_KEEP f
+  while IFS= read -r f; do
+    [ -z "$f" ] && continue
+    if [ "$keep" -gt 0 ]; then keep=$((keep - 1)); continue; fi
+    rm -f "$f"
+    log "rolling retention: pruned staging export $(basename "$f")（out-dir 保留最近 $SNAPSHOT_KEEP 个）"
+  done < <(ls -t "$out_dir"/devnet_*.json 2>/dev/null)
+
+  # 5) git add 例外文件（.gitignore ! 规则已放行 devnet_*.json / SHA256SUMS）
+  ( cd "$CORPUS_ROOT" && git add -f \
+      "opstack-executor/tests/t8n/vectors/$stem.json" \
+      "opstack-executor/tests/t8n/vectors/manifest.txt" \
+      "opstack-executor/tests/t8n/vectors/SHA256SUMS" ) || die "git add failed"
+  log "REGISTERED $stem.json ($size bytes, sha256 $sha) —— manifest/SHA256SUMS 已 upsert、暂存待提交"
+  log "next: FISCO 重放将报未登记 DIVERGE → 用其 want/got 重钉 DIVERGENCES.md ALLOWLIST 行到 $stem 后重跑"
+}
+
 case "${1:-}" in
-  up)     shift; cmd_up "$@" ;;
-  status) shift; cmd_status "$@" ;;
-  down)   shift; cmd_down "$@" ;;
-  clean)  shift; cmd_clean "$@" ;;
+  up)       shift; cmd_up "$@" ;;
+  status)   shift; cmd_status "$@" ;;
+  down)     shift; cmd_down "$@" ;;
+  clean)    shift; cmd_clean "$@" ;;
+  export)   shift; cmd_export "$@" ;;
+  check)    shift; cmd_check "$@" ;;
+  txsource) shift; cmd_txsource "$@" ;;
+  snapshot) shift; cmd_snapshot "$@" ;;
   -h|--help|help|"") usage ;;
   *) echo "unknown command: $1" >&2; usage ;;
 esac
