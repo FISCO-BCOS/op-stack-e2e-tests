@@ -813,6 +813,16 @@ func legacyTransferTx(key byte, nonce uint64, to common.Address, value *big.Int,
 // L2ToL1MessagePasser always on record per plan Step 2).
 func caseFrame(fork, name, desc string, fp feeParams, gasLimit uint64) inputCase {
 	jovianCfg := fork == "jovian"
+	// EIP1559Denominator 50 is the OP-mainnet preset and MATCHES the legacy default the
+	// FISCO engine priced with before its [op_eip1559] channel landed (FISCO-BCOS
+	// 483031396). Consequence: the corpus canNOT catch a wrong-denominator divergence —
+	// corpus and implementation shared the preset and agreed with each other. The guard for
+	// that lives in the engine suite instead (PreCanyonBaseFeeUsesTheChainsEip1559Denominator).
+	// Golden values for a NON-default denominator, produced by op-geth at pin e8800cffe
+	// (eip1559.CalcBaseFee, parent gasLimit 30M / gasUsed 20M / baseFee 1e9, elasticity 6,
+	// child pre-Canyon): denominator 8 -> 1_375_000_000, 50 -> 1_060_000_000, 250 ->
+	// 1_012_000_000. Wiring a non-default denominator into new cases changes their goldens
+	// and requires the regen ceremony (generator/regen.sh).
 	knobs := genesisKnobs{
 		Timestamp:          math.HexOrDecimal64(1000),
 		GasLimit:           math.HexOrDecimal64(gasLimit),
