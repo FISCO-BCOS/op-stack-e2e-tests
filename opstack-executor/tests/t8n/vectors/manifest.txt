@@ -237,3 +237,6 @@ invalid_jovian_transfer_basic_static_3.json
 # never regenerates it. Its bytes are pinned in vectors/SHA256SUMS; the create-output
 # divergences registered in DIVERGENCES.md (P3-1b) bind to this stem.
 devnet_1875-2274_c38db356.json
+
+# Phase-3 enhanced corpus (Task 6): corrupt 12 + static 10 + invalid-tx 18 + chain 6 + legacy 2 = 48 vectors (idempotent; §4c item 3/12 excluded — loader 不可表达)
+regolith_eip1559_denominator8_basefee_step.json
