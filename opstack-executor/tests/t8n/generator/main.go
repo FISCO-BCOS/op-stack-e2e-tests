@@ -233,6 +233,20 @@ type caseInfo struct {
 	// buildChainConfig(hardfork). omitempty keeps the pre-existing 33 case
 	// files byte-stable under regeneration.
 	Activations map[string]uint64 `json:"activations,omitempty"`
+	// Eip1559 declares the chain's own EIP-1559 parameters (Task 12 anchor, P0):
+	// the authoritative source the replayer must price with. Emitted only on cases
+	// that opt in; omitempty keeps the pre-existing 136 vectors byte-stable. Values
+	// are filled from the built chain config (cfg.Optimism), not from the case's
+	// knobs, so the vector always mirrors what the reference implementation priced
+	// with -- a knob/config drift fails the build instead of producing a lying vector.
+	Eip1559 *eip1559Triple `json:"eip1559,omitempty"`
+}
+
+// eip1559Triple mirrors params.OptimismConfig's three fee parameters.
+type eip1559Triple struct {
+	Elasticity        uint64 `json:"elasticity"`
+	Denominator       uint64 `json:"denominator"`
+	DenominatorCanyon uint64 `json:"denominatorCanyon"`
 }
 
 // genesisKnobs are the ONLY environment inputs (plan decision record 7):
@@ -323,6 +337,17 @@ type outputEnv struct {
 	CurrentRandom         string `json:"currentRandom"`
 	ParentBeaconBlockRoot string `json:"parentBeaconBlockRoot"`
 	ParentHash            string `json:"parentHash"`
+	// ParentGasLimit/ParentGasUsed/ParentBaseFee are the PARENT header's numbers.
+	// Emitted only for EIP-1559-anchor cases (Task 12), where the replayer recomputes
+	// the child base fee from them instead of trusting CurrentBaseFee -- so the vector
+	// carries the parent explicitly rather than making the replayer rely on the
+	// generator's "parent is genesis" invariant. This is a CONTROLLED AMENDMENT to
+	// decision record 7 ("env is a derivation of the generated header, not an input"):
+	// three parent-side input slots are added, everything else stays derived. Absent on
+	// every pre-existing vector.
+	ParentGasLimit string `json:"parentGasLimit,omitempty"`
+	ParentGasUsed  string `json:"parentGasUsed,omitempty"`
+	ParentBaseFee  string `json:"parentBaseFee,omitempty"`
 }
 
 type outputDepositTx struct {
@@ -799,10 +824,45 @@ func uint64Ptr(v uint64) *uint64 { return &v }
 // coupling is enforced by the case constructor (genesis timestamp = T-5,
 // blockTime = genesis+10 = T+5), not here.
 func buildConfigForCase(in *inputCase) (*params.ChainConfig, error) {
+	var (
+		cfg *params.ChainConfig
+		err error
+	)
 	if len(in.Info.Activations) > 0 {
-		return buildChainConfigSpec(chainConfigSpec{base: in.Info.Hardfork, activations: in.Info.Activations})
+		cfg, err = buildChainConfigSpec(chainConfigSpec{base: in.Info.Hardfork, activations: in.Info.Activations})
+	} else {
+		cfg, err = buildChainConfig(in.Info.Hardfork)
 	}
-	return buildChainConfig(in.Info.Hardfork)
+	if err != nil {
+		return nil, err
+	}
+	// Task 12 (P0) anchor cases opt in by declaring _info.eip1559. For them the case's
+	// genesis knobs become the CHAIN's fee parameters (cfg.Optimism) -- the reference
+	// implementation prices with the chain config, not with the extra-data knobs, so a
+	// denom-8 vector needs this alignment or it would silently stay priced at the preset
+	// 6/50/250. Opt-in only: every pre-existing case keeps the preset, byte-stable.
+	if in.Info.Eip1559 != nil {
+		if cfg.Optimism == nil {
+			return nil, fmt.Errorf("case declares _info.eip1559 but the built chain config has no Optimism section")
+		}
+		cfg.Optimism.EIP1559Elasticity = uint64(in.Genesis.EIP1559Elasticity)
+		cfg.Optimism.EIP1559Denominator = uint64(in.Genesis.EIP1559Denominator)
+		if cfg.Optimism.EIP1559DenominatorCanyon == nil {
+			return nil, fmt.Errorf("case declares _info.eip1559 but the chain config has no canyon denominator")
+		}
+		// The declared triple must equal what we are about to price with -- otherwise the
+		// vector would hand the replayer parameters the reference implementation never used.
+		declared := *in.Info.Eip1559
+		actual := eip1559Triple{
+			Elasticity:        cfg.Optimism.EIP1559Elasticity,
+			Denominator:       cfg.Optimism.EIP1559Denominator,
+			DenominatorCanyon: *cfg.Optimism.EIP1559DenominatorCanyon,
+		}
+		if declared != actual {
+			return nil, fmt.Errorf("declared _info.eip1559 %+v != chain config %+v", declared, actual)
+		}
+	}
+	return cfg, nil
 }
 
 // probeChainConfigSpec is a self-contained dev probe (--probe-spec) that
@@ -1443,8 +1503,32 @@ func assembleOutput(in *inputCase, cfg *params.ChainConfig, signer types.Signer,
 	if header.MixDigest != (common.Hash{}) {
 		return outputVector{}, nil, fmt.Errorf("generated header MixDigest expected zero, got %s", header.MixDigest)
 	}
+	info := in.Info
+	parentGasLimit, parentGasUsed, parentBaseFee := "", "", ""
+	if info.Eip1559 != nil {
+		// The triple the reference implementation actually priced with (see
+		// buildConfigForCase): copied here so a knob/config drift cannot produce a
+		// vector that lies about its own chain.
+		if cfg.Optimism == nil || cfg.Optimism.EIP1559DenominatorCanyon == nil {
+			return outputVector{}, nil, fmt.Errorf("eip1559 anchor case without a canyon denominator in the chain config")
+		}
+		info.Eip1559 = &eip1559Triple{
+			Elasticity:        cfg.Optimism.EIP1559Elasticity,
+			Denominator:       cfg.Optimism.EIP1559Denominator,
+			DenominatorCanyon: *cfg.Optimism.EIP1559DenominatorCanyon,
+		}
+		// Single-block vectors are built on genesis (makeHeader: blockTime = genesis+10),
+		// so the parent numbers are the genesis ones: gasLimit = the block's (chain_makers
+		// keeps it constant), gasUsed = 0, baseFee = the genesis base fee.
+		parentGasLimit = hexutil.EncodeUint64(header.GasLimit)
+		parentGasUsed = hexutil.EncodeUint64(0)
+		if genesis.BaseFee == nil {
+			return outputVector{}, nil, fmt.Errorf("eip1559 anchor case without a genesis base fee")
+		}
+		parentBaseFee = hexutil.EncodeBig(genesis.BaseFee)
+	}
 	out := outputVector{
-		Info: in.Info,
+		Info: info,
 		Env: outputEnv{
 			CurrentCoinbase:       strings.ToLower(header.Coinbase.Hex()),
 			CurrentNumber:         hexutil.EncodeUint64(header.Number.Uint64()),
@@ -1457,6 +1541,9 @@ func assembleOutput(in *inputCase, cfg *params.ChainConfig, signer types.Signer,
 			// it below Cancun.
 			ParentBeaconBlockRoot: parentBeaconRootOrZero(header.ParentBeaconRoot),
 			ParentHash:            header.ParentHash.Hex(),
+			ParentGasLimit:        parentGasLimit,
+			ParentGasUsed:         parentGasUsed,
+			ParentBaseFee:         parentBaseFee,
 		},
 		Pre:       emitPre(in.Pre),
 		Block:     outputBlock{Transactions: outTxs},

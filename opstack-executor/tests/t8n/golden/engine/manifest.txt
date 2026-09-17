@@ -137,3 +137,6 @@ regolith_deposit_mint.golden.json
 regolith_deposit_only.golden.json
 regolith_l1fee_edge.golden.json
 regolith_transfer_basic.golden.json
+
+# Appended by generator/regen.sh (append-only bookkeeping, F-COV-1): goldens from batches after the original 63-set (precompile matrix, fork boundary/activation cells, observers, legacy/l1block/withdraw, 7702 skips, ...). Same set as cases/*.in.json, exactly like the 63-set above.
+regolith_eip1559_denominator8_basefee_step.golden.json

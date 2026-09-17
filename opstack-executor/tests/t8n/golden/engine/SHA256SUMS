@@ -183,3 +183,6 @@ c4340030a2e0c71e31591cc2001aab07493c07777fc9101b80dba593cad1d2f3  chained/scalar
 933ac28ff8358791d544affad0048ed1777d8a16cc1a62a46fa3786db69ff3dc  chained/scalarChangeB.pre.json
 a21bd434b0a0a02e1982f7f04c4932167ba44f88739ab978e5baa3bb9e97ce0b  canyon_boundary_ecotone_activation.golden.json
 31b291329f309acda7d78f3eb1a02ee59c28fc9c0abb259f1f23c7c5a73b57ed  regolith_boundary_regolith_last.golden.json
+
+# Appended by generator/regen.sh (append-only bookkeeping, F-COV-1): golden files generated but not previously summed. Existing lines are never rewritten -- a genuine regeneration refreshes them by hand in the same commit.
+9ed3dea64bc47a3ad5ecb9bea7cea6f2f229c5a40bea73124920acd1e84a8c87  regolith_eip1559_denominator8_basefee_step.golden.json

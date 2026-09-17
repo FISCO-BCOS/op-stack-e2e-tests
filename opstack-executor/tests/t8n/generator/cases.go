@@ -1135,6 +1135,25 @@ var caseSpecs = []caseSpec{
 		return c
 	}},
 
+	{"eip1559_denominator8_basefee_step", []string{"regolith"}, func(fork string) inputCase {
+		// Task 12 (P0) anchor: the chain declares its OWN EIP-1559 denominator (8, not the
+		// legacy preset 50). The single block's parent is genesis (gasUsed 0, gasLimit =
+		// the block's, baseFee 1 gwei), so the base-fee step is non-zero and the
+		// denominator is observable: op-geth prices 875_000_000 here, while the legacy 50
+		// would give 980_000_000. The vector carries the triple (_info.eip1559) plus the
+		// explicit parent numbers (env.parent*) so the replayer MUST compute the child base
+		// fee from the chain's parameters instead of reading env.currentBaseFee -- which is
+		// what makes this case a guard for the parameter channel rather than for a literal.
+		c := caseFrame(fork, "eip1559_denominator8_basefee_step",
+			"chain-declared EIP-1559 denominator 8: base-fee step observable from the genesis parent",
+			defaultFeeParams(), 10_000_000)
+		c.Genesis.EIP1559Denominator = math.HexOrDecimal64(8)
+		c.Info.Eip1559 = &eip1559Triple{Elasticity: 6, Denominator: 8, DenominatorCanyon: 250}
+		fund(&c, 1, eth(100))
+		c.Transactions = append(c.Transactions, transferTx(1, 0, recA, eth(1), 21_000, nil))
+		return c
+	}},
+
 	{"transfer_multi", bothForks, func(fork string) inputCase {
 		c := caseFrame(fork, "transfer_multi",
 			"attributes + five transfers from three senders with interleaved nonces",
