@@ -323,6 +323,8 @@ if step_run 4; then
 ; OP lane: Isthmus is the baseline and needs no entry; Jovian active from genesis. The EVM
 ; revision is derived from this schedule (Isthmus/Jovian = Prague), so executor.evm_revision
 ; must not be set on this lane.
+[op_fork_schedule]
+    canonical=0:jovian
 [op_fork_timestamps]
     jovian_time=0
 ; The chain's own EIP-1559 parameters, matching intent.toml (denominator 8, elasticity 2).
