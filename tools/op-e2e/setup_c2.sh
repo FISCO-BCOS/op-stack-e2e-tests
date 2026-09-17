@@ -323,8 +323,18 @@ if step_run 4; then
 ; OP lane: Isthmus is the baseline and needs no entry; Jovian active from genesis. The EVM
 ; revision is derived from this schedule (Isthmus/Jovian = Prague), so executor.evm_revision
 ; must not be set on this lane.
+[op_fork_schedule]
+    canonical=0:jovian
 [op_fork_timestamps]
     jovian_time=0
+; The chain's own EIP-1559 parameters, matching intent.toml (denominator 8, elasticity 2).
+; Isthmus/Jovian are active from genesis, so this does not change how any block is priced
+; today; it is the CORRECT declaration for this chain (elasticity 2 differs from the legacy
+; default 6), and it makes the e2e exercise the [op_eip1559] parse/validate/pin path.
+[op_eip1559]
+    elasticity=2
+    denominator=8
+    denominator_canyon=250
 [features]
     feature_l2_ethereum_compat=true
 $(cat "$C2/eth_genesis_header.ini")
