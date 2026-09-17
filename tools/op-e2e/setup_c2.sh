@@ -76,6 +76,14 @@ OP_NODE_EPOCH_POLL="${OP_NODE_EPOCH_POLL:-5s}"
 # compressing further: max(ext*2, ext+PREIMAGE_CHALLENGE_SECONDS) <=
 # FAULT_GAME_MAX_CLOCK.
 ANVIL_BLOCK_TIME="${ANVIL_BLOCK_TIME:-2}"
+# Jovian mid-chain activation offset (seconds, relative to rollup genesis.l2_time).
+# Empty = Jovian active from genesis (current behavior). When set, the offset goes
+# into the intent's [globalDeployOverrides] (hexutil wants a HEX STRING), and after
+# apply the absolute time is read back from rollup.json (single source of truth) and
+# written consistently into the FISCO config.genesis schedule. Isthmus is this lane's
+# baseline and cannot be activated late (the engine's -38005 gate only admits
+# Isthmus+ payloads), so only Jovian (and later Karst) can be late.
+L2_JOVIAN_OFFSET="${L2_JOVIAN_OFFSET:-}"
 PROOF_MATURITY_SECONDS="${PROOF_MATURITY_SECONDS:-12}"
 DISPUTE_FINALITY_SECONDS="${DISPUTE_FINALITY_SECONDS:-6}"
 FAULT_GAME_MAX_CLOCK="${FAULT_GAME_MAX_CLOCK:-45}"
@@ -131,7 +139,12 @@ if step_run 2; then
   rm -f "$C2/state.json"
   "$C2/op-deployer" init --l1-chain-id $ANVIL_CHAIN --l2-chain-ids $L2_CHAIN \
     --workdir "$C2" --intent-type custom || die "op-deployer init 失败"
-  cat > "$C2/intent.toml" <<EOF
+  # hexutil wants a hex string for l2GenesisJovianTimeOffset; empty var => no line.
+L2_JOVIAN_OFFSET_LINE=""
+if [ -n "$L2_JOVIAN_OFFSET" ]; then
+  L2_JOVIAN_OFFSET_LINE=$(printf 'l2GenesisJovianTimeOffset = "0x%x"' "$L2_JOVIAN_OFFSET")
+fi
+cat > "$C2/intent.toml" <<EOF
 configType = "custom"
 opDeployerVersion = "v0.0.0-dev"
 l1ChainID = $ANVIL_CHAIN
@@ -196,6 +209,7 @@ faultGameClockExtension = 1
 faultGameMaxClockDuration = $FAULT_GAME_MAX_CLOCK
 faultGameWithdrawalDelay = $WETH_UNLOCK_SECONDS
 dangerouslyAllowCustomDisputeParameters = true
+${L2_JOVIAN_OFFSET_LINE}
 EOF
   "$C2/op-deployer" --log.level info apply \
     --l1-rpc-url http://127.0.0.1:$ANVIL_PORT \
@@ -203,6 +217,10 @@ EOF
     --workdir "$C2" || die "op-deployer apply 失败"
   "$C2/op-deployer" inspect rollup $L2_CHAIN --workdir "$C2" > "$C2/rollup.json" 2>/dev/null || \
     die "inspect rollup 失败"
+  # Absolute Jovian activation time, read back from the derived rollup.json — the
+  # single source of truth the FISCO schedule aligns to (three-site consistency:
+  # intent offset -> rollup.json -> config.genesis).
+  L2_JOVIAN_ABS="$(jq -r '.jovian_time // empty' "$C2/rollup.json" 2>/dev/null || true)"
   # ── 根因 F 固化（2026-08-23 C2 重建踩坑重现）────────────────────────────
   # op-deployer custom-intent 部署后 L1 SystemConfig.eip1559Params 为全零
   # （intent.toml 的 eip1559Denominator=8 并不会落到链上）。零参数下 op-node 的
@@ -323,10 +341,11 @@ if step_run 4; then
 ; OP lane: Isthmus is the baseline and needs no entry; Jovian active from genesis. The EVM
 ; revision is derived from this schedule (Isthmus/Jovian = Prague), so executor.evm_revision
 ; must not be set on this lane.
-[op_fork_schedule]
-    canonical=0:jovian
-[op_fork_timestamps]
-    jovian_time=0
+$(if [ -n "$L2_JOVIAN_OFFSET" ] && [ -n "$L2_JOVIAN_ABS" ]; then
+  printf '[op_fork_schedule]\n    canonical=0:isthmus,%s:jovian\n[op_fork_timestamps]\n    jovian_time=%s' "$L2_JOVIAN_ABS" "$L2_JOVIAN_ABS"
+else
+  printf '[op_fork_schedule]\n    canonical=0:jovian\n[op_fork_timestamps]\n    jovian_time=0'
+fi)
 ; The chain's own EIP-1559 parameters, matching intent.toml (denominator 8, elasticity 2).
 ; Isthmus/Jovian are active from genesis, so this does not change how any block is priced
 ; today; it is the CORRECT declaration for this chain (elasticity 2 differs from the legacy

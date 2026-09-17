@@ -141,9 +141,22 @@ bf = head.get("baseFeePerGas")
 check("baseFeePerGas", isinstance(bf, str) and int(bf, 16) > 0,
       f"{bf} (OP headers always carry baseFee; PBFT never writes it)")
 ed = head.get("extraData", "0x")
-check("extraData-1559-params", len(ed) == 2 + 17 * 2 and ed[2:4] in ("00", "01"),
-      f"{ed[:24]}… ({(len(ed)-2)//2}B, version byte {ed[2:4]} — OP EIP-1559/DA-params "
-      "encoding, not a PBFT extraData)")
+# Fork-aware: with a late Jovian activation the head may still be pre-Jovian, where
+# the shape is the 9-byte Holocene form (version 0x00) rather than the 17-byte Jovian
+# one. Both are valid OP EIP-1559/DA-params encodings; a PBFT extraData is neither.
+ed_byts = (len(ed) - 2) // 2
+jovian_abs = rollup.get("jovian_time")
+head_time = int(head.get("timestamp", "0x0"), 16)
+exp_jovian = ed_byts == 17 and ed[2:4] == "01"
+exp_holocene = ed_byts == 9 and ed[2:4] == "00"
+era_ok = True
+if isinstance(jovian_abs, int) and head_time < jovian_abs:
+    era_ok = exp_holocene  # pre-activation head must carry the Holocene form
+else:
+    era_ok = exp_jovian    # at/after activation (or always-on) must carry Jovian
+check("extraData-1559-params", era_ok,
+      f"{ed[:24]}… ({ed_byts}B, version byte {ed[2:4]}, head_time {head_time} vs "
+      f"jovian_time {jovian_abs} — OP EIP-1559/DA-params encoding, not a PBFT extraData)")
 for back in range(6):
     n = int(head["number"], 16) - back
     if n < 1:
@@ -247,3 +260,15 @@ print(f"[eph] post-claim: unsafe {a['unsafe_l2']['number']}->{b['unsafe_l2']['nu
 PY
 
 log "e2e green in $(( $(date +%s) - START_TS ))s (budget: <=600s)"
+
+# Late-fork boundary assertions (op-e2e batch-2 S1/S8-S9): only when a Jovian
+# offset was requested. By now the withdraw leg has run for minutes, so the head
+# is well past the activation point and the full boundary is observable.
+if [ -n "${L2_JOVIAN_OFFSET:-}" ]; then
+  if ! python3 "$HERE/check_late_fork.py" --rpc "http://127.0.0.1:${EPH_WEB3}" \
+      --rollup "$WORKSPACE/rollup.json"; then
+    log "late-fork boundary assertions FAILED"
+    exit 1
+  fi
+  log "late-fork boundary assertions OK"
+fi
