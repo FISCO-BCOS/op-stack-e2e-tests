@@ -12,6 +12,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -60,6 +61,159 @@ func l1BlockCodeFor(fork string) []byte {
 		return l1BlockRuntimeCodeBedrock
 	}
 	return l1BlockRuntimeCode
+}
+
+// l1BlockRuntimeCodeCombined is the FOUR-way selector dispatch L1Block runtime
+// for phase A″'s cross-family ladder: one chain crossing the Bedrock/Ecotone
+// layout boundary needs a SINGLE genesis L1Block account able to execute the
+// attributes deposit of every fork on the ladder. Neither existing family
+// runtime can: l1BlockRuntimeCodeBedrock knows only 0x015d8eb9, and
+// l1BlockRuntimeCode carries no 0x440a5e20 arm (so the 164B Ecotone-family
+// calldata REVERTS there). This runtime dispatches on all four selectors from
+// op-geth core/types/rollup_cost.go:59-65 to the family-appropriate write path,
+// each composed byte-for-byte from the existing family bodies (see
+// buildCombinedL1BlockRuntime):
+//
+//	0x015d8eb9 Bedrock  -> bedrockBody = slot1 (l1BaseFee [68:100]), slot5
+//	                       (overhead [196:228]), slot6 (scalar [228:260]),
+//	                       identical to l1BlockRuntimeCodeBedrock's body.
+//	0x440a5e20 Ecotone  -> slot1 (l1BaseFee [36:68]), slot3 (baseFeeScalar
+//	                       [4:8] << 96 | blobBaseFeeScalar [8:12] << 64), slot7
+//	                       (blobBaseFee [68:100]). The 164B layout has NO
+//	                       operator-fee/DA segment, so slot8 is never written --
+//	                       exactly l1BlockStorage("ecotone")'s slot set
+//	                       {1,3,7}. (The body is the Isthmus/Jovian body with
+//	                       its slot8 segment swapped for a bare RETURN.)
+//	0x098999be Isthmus  -> ijBody = slot3, slot1, slot7, slot8, identical to
+//	                       l1BlockRuntimeCode's shared body.
+//	0x3db6be2b Jovian   -> ijBody (the same body packs the DA scalar from
+//	                       calldata[176:178]; CALLDATALOAD past the Isthmus
+//	                       176B form reads 0, so one body serves both).
+//
+// calldatasize<4 and unknown selectors revert, matching both existing runtimes.
+// The two existing runtimes and l1BlockCodeFor are deliberately untouched:
+// this constant is referenced ONLY by l1BlockCodeForLadder, so every existing
+// vector stays byte-identical.
+var l1BlockRuntimeCodeCombined = buildCombinedL1BlockRuntime()
+
+// l1BlockCodeForLadder returns the combined four-way L1Block runtime for A2's
+// cross-family ladder. It is a separate helper (NOT a branch inside
+// l1BlockCodeFor) so the existing per-fork vectors keep their exact bytecode;
+// A2 opts in explicitly.
+func l1BlockCodeForLadder() []byte { return l1BlockRuntimeCodeCombined }
+
+// buildCombinedL1BlockRuntime assembles the combined runtime from the two
+// existing family runtimes' bodies plus a four-way dispatch prefix. Every body
+// byte is sliced out of l1BlockRuntimeCodeBedrock / l1BlockRuntimeCode, never
+// retyped, so the per-family write paths cannot drift from the runtimes the
+// differential gate already pins.
+//
+// Body offsets (verified by cases_l1block_test.go's composition assertions):
+//
+//	l1BlockRuntimeCodeBedrock (52B): [0:28) dispatch, [28:52) = bedrockBody
+//	  JUMPDEST; slot1; slot5; slot6; PUSH1 0 PUSH1 0 RETURN
+//	l1BlockRuntimeCode (146B):        [0:43) dispatch, [43:146) = ijBody
+//	  [43]     JUMPDEST
+//	  [44:80)  slot3 pack   (… OR PUSH1 3 SSTORE POP)
+//	  [80:86)  slot1        (PUSH1 0x24 CALLDATALOAD PUSH1 1 SSTORE)
+//	  [86:92)  slot7        (PUSH1 0x44 CALLDATALOAD PUSH1 7 SSTORE)
+//	  [92:141) slot8 pack + SSTORE(8)
+//	  [141:146) PUSH1 0 PUSH1 0 RETURN
+//
+// The combined pc layout is: dispatch prefix (52B), revert block (6B),
+// bedrockBody (24B), ecotoneBody (54B), ijBody (103B) -- every JUMPI target is
+// a one-byte PUSH1 immediate, so the whole runtime is 239B.
+func buildCombinedL1BlockRuntime() []byte {
+	// Bodies lifted verbatim from the two existing runtimes.
+	bedrockBody := l1BlockRuntimeCodeBedrock[28:]
+	ijBody := l1BlockRuntimeCode[43:]
+	if len(bedrockBody) != 24 || len(ijBody) != 103 {
+		panic(fmt.Sprintf("combined L1Block runtime: family body sizes changed (bedrock %d, ij %d)",
+			len(bedrockBody), len(ijBody)))
+	}
+	ijSlot3 := ijBody[1:37]    // slot3 pack: calldata[4:8]<<96 | calldata[8:12]<<64
+	ijSlot1 := ijBody[37:43]   // slot1 = calldata[36:68]
+	ijSlot7 := ijBody[43:49]   // slot7 = calldata[68:100]
+	ijReturn := ijBody[98:103] // PUSH1 0 PUSH1 0 RETURN
+	if !bytes.Equal(ijReturn, []byte{0x60, 0x00, 0x60, 0x00, 0xf3}) {
+		panic("combined L1Block runtime: 146B body's RETURN sequence moved")
+	}
+	// Ecotone body: JUMPDEST + slot3 + slot1 + slot7 + RETURN -- the
+	// Isthmus/Jovian body with the slot8 (operator-fee/DA) segment dropped, so
+	// the written slot set is exactly l1BlockStorage("ecotone")'s {1,3,7}.
+	ecotoneBody := make([]byte, 0, 1+len(ijSlot3)+len(ijSlot1)+len(ijSlot7)+len(ijReturn))
+	ecotoneBody = append(ecotoneBody, 0x5b) // JUMPDEST
+	ecotoneBody = append(ecotoneBody, ijSlot3...)
+	ecotoneBody = append(ecotoneBody, ijSlot1...)
+	ecotoneBody = append(ecotoneBody, ijSlot7...)
+	ecotoneBody = append(ecotoneBody, ijReturn...)
+
+	// revertBlock is byte-identical to both existing runtimes' revert block.
+	revertBlock := []byte{0x5b, 0x60, 0x00, 0x60, 0x00, 0xfd} // JUMPDEST PUSH1 0 PUSH1 0 REVERT
+
+	type jumpPatch struct {
+		pos   int
+		label string
+	}
+	var (
+		code    []byte
+		patches []jumpPatch
+	)
+	emit := func(b ...byte) { code = append(code, b...) }
+	push1Target := func(label string) {
+		patches = append(patches, jumpPatch{pos: len(code) + 1, label: label})
+		emit(0x60, 0x00) // PUSH1 <patched>
+	}
+	selectorCheck := func(selector []byte, label string) {
+		emit(0x80) // DUP1: keep the selector for the next comparison
+		emit(0x63) // PUSH4
+		emit(selector...)
+		emit(0x14) // EQ
+		push1Target(label)
+		emit(0x57) // JUMPI
+	}
+
+	// Guard: calldatasize < 4 -> revert (same shape as both existing runtimes).
+	emit(0x60, 0x04) // PUSH1 4
+	emit(0x36)       // CALLDATASIZE
+	emit(0x10)       // LT
+	push1Target("revert")
+	emit(0x57) // JUMPI
+	// selector = calldata[0:4] (SHR 224 leaves the top 4 bytes).
+	emit(0x60, 0x00) // PUSH1 0
+	emit(0x35)       // CALLDATALOAD
+	emit(0x60, 0xe0) // PUSH1 224
+	emit(0x1c)       // SHR
+	// Four-way dispatch; the types.*Selector vars keep the immediates in sync
+	// with op-geth core/types/rollup_cost.go:59-65.
+	selectorCheck(types.BedrockL1AttributesSelector, "bedrock")
+	selectorCheck(types.EcotoneL1AttributesSelector, "ecotone")
+	selectorCheck(types.IsthmusL1AttributesSelector, "ij")
+	// Last check needs no DUP1: nothing reads the selector afterwards. On no
+	// match this JUMPI falls through into the revert block.
+	emit(0x63) // PUSH4
+	emit(types.JovianL1AttributesSelector...)
+	emit(0x14) // EQ
+	push1Target("ij")
+	emit(0x57) // JUMPI
+
+	labels := map[string]int{}
+	labels["revert"] = len(code)
+	code = append(code, revertBlock...)
+	labels["bedrock"] = len(code)
+	code = append(code, bedrockBody...)
+	labels["ecotone"] = len(code)
+	code = append(code, ecotoneBody...)
+	labels["ij"] = len(code)
+	code = append(code, ijBody...)
+	for _, p := range patches {
+		target := labels[p.label]
+		if target > 0xff {
+			panic(fmt.Sprintf("combined L1Block runtime: jump target %s=%d exceeds PUSH1", p.label, target))
+		}
+		code[p.pos] = byte(target)
+	}
+	return code
 }
 
 // ---------------------------------------------------------------------
@@ -524,6 +678,61 @@ func (fp feeParams) l1BlockStorage(fork string) map[common.Hash]common.Hash {
 	return st
 }
 
+// l1BlockGenesisSeeds builds the genesis L1Block seeds for a LADDER (A2):
+// the layout of the fork active AT GENESIS, i.e. the first activated fork.
+//
+// A2's brief proposed unioning EVERY activated layout instead, because a single
+// genesis account must satisfy the Pre-slot mirror for blocks in different
+// families (Bedrock reads 1/5/6, Ecotone-family reads 1/3/7/8) and the old
+// top-fork-only seeding left Bedrock's 5/6 unseeded -- which is indeed why
+// block 0 failed. A full union is NOT usable, though (probe evidence, A2
+// report): pre-seeding the Ecotone slots makes the Ecotone ACTIVATION block
+// (Bedrock 260B calldata, Ecotone config) see an already-configured Ecotone
+// state, so op-geth's state-based NewL1CostFunc picks the Ecotone cost function
+// while deriveOPStackFields extracts Bedrock gasParams from the still-Bedrock
+// calldata. The two disagree and crossCheckVaults (main.go:4761) rejects the
+// vector: "l1 fee cross-check: vault delta ... != sum of per-tx L1 fees ...".
+//
+// The faithful genesis state is therefore the genesis fork's layout only:
+// parseLadderFlag forces the first activation to be 0:regolith, so genesis is
+// always the Bedrock layout (slots 1/5/6, DA/operator-fee/scalars unset). Each
+// later fork's slots are introduced by the block whose attributes deposit first
+// writes them; assertL1BlockConsistencyAt carries the narrow transition
+// exemptions for those blocks. Forks is accepted (canonical order) so the
+// helper documents which layout is chosen and so a future non-regolith genesis
+// fork keeps working.
+func (fp feeParams) l1BlockGenesisSeeds(forks []string) map[common.Hash]common.Hash {
+	if len(forks) == 0 {
+		panic("l1BlockGenesisSeeds: no activated forks")
+	}
+	return fp.l1BlockStorage(forks[0])
+}
+
+// l1BlockWrittenSlots returns the L1Block slots the attributes deposit of a
+// layout writes. A ladder must declare these per block as extra_storage: on the
+// first block of a fork the slots are NOT yet in the Pre state (the deposit is
+// what introduces them), and emitPostState hard-fails on any written slot
+// outside the declared (Pre ++ extra_storage) set. Values are irrelevant here
+// -- only the slot keys feed the declaration set -- so this mirrors the
+// dispatch arms of the combined runtime:
+//
+//	Bedrock  260B -> 1,5,6
+//	Ecotone  164B -> 1,3,7 (no operator-fee/DA segment)
+//	Isthmus  176B -> 1,3,7,8
+//	Jovian   178B -> 1,3,7,8 (same body packs the DA scalar into slot8[18:20])
+func l1BlockWrittenSlots(fork string) []common.Hash {
+	switch forkLayout(fork) {
+	case layoutBedrock:
+		return []common.Hash{types.L1BaseFeeSlot, types.OverheadSlot, types.ScalarSlot}
+	case layoutEcotone:
+		return []common.Hash{types.L1BaseFeeSlot, types.L1FeeScalarsSlot, types.L1BlobBaseFeeSlot}
+	case layoutIsthmus, layoutJovian:
+		return []common.Hash{types.L1BaseFeeSlot, types.L1FeeScalarsSlot, types.L1BlobBaseFeeSlot, types.OperatorFeeParamsSlot}
+	default:
+		panic(fmt.Sprintf("l1BlockWrittenSlots: unhandled layout for %q", fork))
+	}
+}
+
 func (fp feeParams) attributesTx(label string, fork string) inputTx {
 	to := l1BlockAddr
 	return inputTx{
@@ -696,6 +905,51 @@ func upgradeFrame(baseFork, name, desc string, fp feeParams, gasLimit uint64, ac
 	return c
 }
 
+// activationBlockFrame assembles the fork-ACTIVATION-block skeleton (S7): genesis
+// in baseFork, a single block (timestamp = genesis+10 = 1010) crossing into
+// activationFork at activationT (1000 < T <= 1010). Unlike upgradeFrame, it does
+// NOT rebuild the L1-attributes calldata / L1Block state under the activation
+// fork: the activation block itself still carries the PREVIOUS fork's form. The
+// canonical instance is the Ecotone activation block, which MUST still call the
+// pre-Ecotone setL1BlockValues (Bedrock 260B 0x015d8eb9) because the L1Block
+// upgrade lands later in the same block
+// (specs/protocol/ecotone/l1-attributes.md:15-20, :112-119); only the NEXT block
+// uses setL1BlockValuesEcotone. op-geth recognises the form both by calldata
+// selector (core/types/rollup_cost.go:426-431) and, for the execution-side cost
+// function, by the Ecotone slots still being unset
+// (rollup_cost.go:174-179 firstEcotoneBlock), which is exactly what the
+// Bedrock-form slot seeding produces.
+//
+// _info.hardfork carries the BLOCK-TIME fork (the activation target), matching
+// upgradeFrame's metadata contract: the C++ differential replayer selects its
+// chain config from _info.hardfork ONLY, so the block must replay under the
+// activation fork's config. buildConfigForCase derives the same config as
+// (baseFork + activations) would.
+func activationBlockFrame(baseFork, name, desc string, fp feeParams, gasLimit uint64, activationFork string, activationT uint64) inputCase {
+	c := caseFrame(baseFork, name, desc, fp, gasLimit) // base-fork attributes + L1Block stay untouched
+	c.Info.Activations = map[string]uint64{}
+	started := false
+	for _, f := range opForkOrder {
+		if !started {
+			if f == baseFork {
+				started = true
+			}
+			continue
+		}
+		c.Info.Activations[f] = activationT
+		if f == activationFork {
+			break
+		}
+	}
+	if activationFork == "jovian" {
+		// EncodeOptimismExtraData panics on nil minBaseFee for Jovian BLOCKS;
+		// kept for parity with upgradeFrame (no Jovian caller today).
+		c.Genesis.MinBaseFee = hd64(0)
+	}
+	c.Info.Hardfork = activationFork
+	return c
+}
+
 func fund(c *inputCase, key byte, amount *big.Int) {
 	c.Pre[addrOfKey(key)] = types.Account{Balance: amount}
 }
@@ -709,14 +963,40 @@ func fund(c *inputCase, key byte, amount *big.Int) {
 // gas >= RequiredGas(cap-sized input) so the call reaches the precompile's own
 // cap check instead of OOG-ing first); value defaults to 0.
 func precompileCallTx(addr []byte, data []byte, gas uint64, value uint64) inputTx {
-	k := privKey(1)
+	return precompileCallTxNonce(1, 0, addr, data, gas, value)
+}
+
+// precompileCallTxNonce is precompileCallTx with an explicit sender-nonce, for
+// chained multi-tx frames (the ladder recipe issues several key-1 txs per
+// block). Same field shape/semantics otherwise.
+func precompileCallTxNonce(key byte, nonce uint64, addr []byte, data []byte, gas uint64, value uint64) inputTx {
+	k := privKey(key)
 	to := common.BytesToAddress(addr)
 	return inputTx{
 		OpType:               "eip1559",
 		ChainID:              hd256(chainID),
-		Nonce:                hd64(0),
+		Nonce:                hd64(nonce),
 		To:                   &to,
 		Value:                hd256(new(big.Int).SetUint64(value)),
+		Gas:                  hd64(gas),
+		MaxFeePerGas:         hdu(2_000_000_000), // 2 gwei
+		MaxPriorityFeePerGas: hdu(100_000_000),   // 0.1 gwei
+		Data:                 data,
+		SecretKey:            &k,
+	}
+}
+
+// createTx mirrors transferTx but leaves To nil (EIP-1559 contract creation):
+// buildTx's eip1559 arm passes To straight through to types.DynamicFeeTx, where
+// nil is the create marker. Used by the ladder CREATE probe.
+func createTx(key byte, nonce uint64, gas uint64, data hexutil.Bytes) inputTx {
+	k := privKey(key)
+	return inputTx{
+		OpType:               "eip1559",
+		ChainID:              hd256(chainID),
+		Nonce:                hd64(nonce),
+		To:                   nil,
+		Value:                hd256(big.NewInt(0)),
 		Gas:                  hd64(gas),
 		MaxFeePerGas:         hdu(2_000_000_000), // 2 gwei
 		MaxPriorityFeePerGas: hdu(100_000_000),   // 0.1 gwei
@@ -1603,6 +1883,26 @@ var caseSpecs = []caseSpec{
 	// _info.activations. buildConfigForCase routes those through
 	// buildChainConfigSpec; the block itself executes under the genesis fork.
 
+	{"boundary_regolith_last", []string{"regolith"}, func(fork string) inputCase {
+		// Regolith fork-period block: genesis Regolith, CanyonTime=2000 > block
+		// time 1010 -- London EVM, Bedrock attributes (260B 0x015d8eb9) and the
+		// Regolith-corrected Bedrock L1 formula (isRegolith=true; rollup_cost.go
+		// :295/:467 adds Ones*16 rather than (Ones+68)*16). The "last Regolith
+		// block" semantic: the next fork is scheduled but has not fired yet, so
+		// the L2 block-timestamp activation rule (specs/protocol/regolith/
+		// overview.md:36-37) leaves the block in the Regolith period. The
+		// pre-Regolith (Bedrock) side of the boundary is not representable to
+		// the replayer (no bedrock _info.hardfork / fork-at-0 config), so the
+		// corpus pins the Regolith side, matching boundary_canyon_last /
+		// boundary_ecotone_last.
+		fp := defaultFeeParams()
+		c := caseFrame(fork, "boundary_regolith_last",
+			"Regolith last-block boundary: genesis Regolith, CanyonTime=2000 in the future (block 1010 < 2000) -- London + Bedrock attributes, Regolith L1 cost correction active",
+			fp, 10_000_000)
+		c.Info.Activations = map[string]uint64{"canyon": 2000}
+		return c
+	}},
+
 	{"boundary_canyon_last", []string{"canyon"}, func(fork string) inputCase {
 		// Canyon fork-period block: genesis Canyon, EcotoneTime=2000 > block
 		// time 1010 -- Shanghai EVM, Bedrock attributes (260B 0x015d8eb9) and
@@ -1639,6 +1939,37 @@ var caseSpecs = []caseSpec{
 			"Ecotone last-block boundary: genesis Ecotone, FjordTime=2000 in the future (block 1010 < 2000) -- calldataGas formula still governs before FastLZ",
 			fp, 10_000_000)
 		c.Info.Activations = map[string]uint64{"fjord": 2000}
+		return c
+	}},
+
+	{"boundary_ecotone_activation", []string{"canyon"}, func(fork string) inputCase {
+		// SPEC ACTIVATION BLOCK (S7; closes the S4 "spec activation-block shape
+		// is S7" deferral): genesis Canyon, the single block crosses
+		// EcotoneTime=1005, and the L1 attributes deposit STILL uses the
+		// pre-Ecotone setL1BlockValues form (Bedrock 260B 0x015d8eb9, slots
+		// 1/5/6) -- the L1Block upgrade lands later in that block, so
+		// setL1BlockValuesEcotone does not exist yet
+		// (specs/protocol/ecotone/l1-attributes.md:15-20, :112-119). The paired
+		// steady-state block (164B 0x440a5e20, slots 3/7 non-zero) is
+		// boundary_ecotone_synth above; this is its activation-block sibling.
+		// activationBlockFrame keeps the base-fork attributes/L1Block state;
+		// only _info.hardfork / activations name the block-time fork (ecotone).
+		//
+		// A non-deposit transfer is appended so the receipt derivation exercises
+		// the pre-Ecotone path: extractL1GasParams falls through on the Bedrock
+		// selector (rollup_cost.go:426-431) -> legacy FeeScalar + Bedrock cost
+		// func, and NewL1CostFunc's firstEcotoneBlock detection (zero Ecotone
+		// slots, rollup_cost.go:174-179) selects the same Bedrock func. Without
+		// a non-deposit tx op-geth's deriveOPStackFields early-returns on the
+		// trailing deposit (receipt_opstack.go:13) and the shape is unobservable.
+		// (The real activation block sets noTxPool; the EL does not enforce that
+		// CL rule, so the transfer is a deliberate differential-gate device.)
+		fp := defaultFeeParams()
+		c := activationBlockFrame("canyon", "boundary_ecotone_activation",
+			"Ecotone activation block: genesis Canyon, single block crosses EcotoneTime; L1 attributes still use pre-Ecotone setL1BlockValues (Bedrock 260B 0x015d8eb9, slots 1/5/6), the Ecotone L1Block upgrade landing later in-block",
+			fp, 10_000_000, "ecotone", 1005)
+		fund(&c, 1, eth(100))
+		c.Transactions = append(c.Transactions, transferTx(1, 0, recA, eth(1), 100_000, junkData("ecotone_activation", 128)))
 		return c
 	}},
 

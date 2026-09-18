@@ -57,12 +57,12 @@
     },
     "_op_expected": {
       "reject": {
-        "op_geth": "DA footprint (blobGasUsed) exceeds the block gas limit",
+        "op_geth": "invalid DA footprint in blobGasUsed field",
         "fisco": {
           "consumer": "engine",
           "classification": "INVALID",
           "latest_valid_hash": null,
-          "validation_error_contains": "DA footprint (blobGasUsed) exceeds the block gas limit"
+          "validation_error_contains": "invalid DA footprint in blobGasUsed field"
         }
       }
     }

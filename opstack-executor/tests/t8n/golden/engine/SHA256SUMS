@@ -30,6 +30,12 @@
 #   cd opstack-executor/tests/t8n/golden/engine
 #   { for f in $(ls *.golden.json | sort); do shasum -a 256 "$f"; done; \
 #     for f in $(ls chained/*.json | sort); do shasum -a 256 "$f"; done; }
+# As of F-COV-1 this listing is APPEND-ONLY maintained by the generator: a
+# newly generated golden with no line here gets one appended (regen.sh 判据 5),
+# so "we added goldens and forgot the sums" can no longer reach the tripwire.
+# An EXISTING line is never rewritten -- the incantation above is now only for a
+# deliberate byte refresh of an already-summed golden, which stays a hand-made,
+# same-commit act (that is the half the tripwire is supposed to catch).
 # Standard format: verifiable from a shell with
 #   grep -v '^#' SHA256SUMS | shasum -a 256 -c
 #
@@ -43,6 +49,10 @@
 #   opstack-executor/tests/OpGoldenCorpusProvenanceTest.cpp (the original
 #   EngineNewPayloadGateTest.cpp was not carried over by the 4c9f240b4 move).
 #   New anchor: the commit carrying this refresh.
+# 2026-09-13 (F-COV-1): no byte refresh -- the bookkeeping was made mechanical.
+#   WI-E3/E11's two boundary goldens were summed by hand and the gap was caught
+#   by the FISCO-side tripwire rather than here; regen.sh 判据 5 now appends what
+#   is missing (append-only) and warns about stale/vanished entries.
 2761e2acfc84e5d41b87c4c0eb4e074e98f46c5afef29004546dd62125ce165d  canyon_boundary_canyon_last.golden.json
 0e9fc6cd99d90b3458342752683e010277b658e2501fa21d98d128180978e5d7  canyon_boundary_ecotone_synth.golden.json
 bd6851dbee39b4d57e3aa35120aaa82901757cf7fc3d9a13740c63988ec7bd79  canyon_deposit_mint.golden.json
@@ -171,3 +181,5 @@ d6dd981c7306d92e9ef5d1ddf8f6d0cc88c6c08bbb34b5731d30ed9ee366be91  chained/scalar
 69d75a5981afcd34b5b4507aa2b0ee2967f3da8f50ead131048b59a4e5faba89  chained/scalarChangeB.golden.json
 c4340030a2e0c71e31591cc2001aab07493c07777fc9101b80dba593cad1d2f3  chained/scalarChangeB.post.json
 933ac28ff8358791d544affad0048ed1777d8a16cc1a62a46fa3786db69ff3dc  chained/scalarChangeB.pre.json
+a21bd434b0a0a02e1982f7f04c4932167ba44f88739ab978e5baa3bb9e97ce0b  canyon_boundary_ecotone_activation.golden.json
+31b291329f309acda7d78f3eb1a02ee59c28fc9c0abb259f1f23c7c5a73b57ed  regolith_boundary_regolith_last.golden.json

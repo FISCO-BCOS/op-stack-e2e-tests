@@ -6,6 +6,11 @@
 # encodedHeaderHex. vectors/*.json themselves are byte-for-byte untouched
 # (git diff --stat -- ../../vectors/ is empty by construction: golden output
 # and vector regeneration write to disjoint paths, see README.md ritual log).
+# The 63/63 above was the original Task-2 scope. Later batches are appended
+# below by the generator's bookkeeping step (regen.sh 判据 5) -- append-only,
+# never reordered -- which also keeps this index set-equal to cases/*.in.json.
+# The 49 goldens that had accumulated without a line here are exactly the
+# drift that step closes (F-COV-1).
 isthmus_deposit_only.golden.json
 jovian_deposit_only.golden.json
 isthmus_transfer_basic.golden.json
@@ -81,3 +86,54 @@ jovian_precompile_bls_pairing_overcap.golden.json
 jovian_precompile_bn256pair_overcap.golden.json
 jovian_precompile_wrap_value_overcap.golden.json
 jovian_precompile_wrap_value_revert.golden.json
+
+# Appended by generator/regen.sh (append-only bookkeeping, F-COV-1): goldens from batches after the original 63-set (precompile matrix, fork boundary/activation cells, observers, legacy/l1block/withdraw, 7702 skips, ...). Same set as cases/*.in.json, exactly like the 63-set above.
+canyon_boundary_canyon_last.golden.json
+canyon_boundary_ecotone_activation.golden.json
+canyon_boundary_ecotone_synth.golden.json
+canyon_deposit_mint.golden.json
+canyon_deposit_only.golden.json
+canyon_l1fee_edge.golden.json
+canyon_transfer_basic.golden.json
+ecotone_boundary_ecotone_last.golden.json
+ecotone_contract_create.golden.json
+ecotone_deposit_mint.golden.json
+ecotone_deposit_only.golden.json
+ecotone_l1fee_edge.golden.json
+ecotone_precompile_p256_noop.golden.json
+ecotone_transfer_basic.golden.json
+ecotone_upgrade_fjord_activation.golden.json
+fjord_contract_create.golden.json
+fjord_deposit_mint.golden.json
+fjord_deposit_only.golden.json
+fjord_l1fee_edge.golden.json
+fjord_precompile_bls_noop.golden.json
+fjord_precompile_bn256pair_large_success.golden.json
+fjord_precompile_p256_invalid.golden.json
+fjord_precompile_p256_valid.golden.json
+fjord_precompile_p256_wronglen.golden.json
+fjord_transfer_basic.golden.json
+fjord_upgrade_isthmus_activation.golden.json
+granite_deposit_mint.golden.json
+granite_deposit_only.golden.json
+granite_precompile_bn256pair_overcap.golden.json
+holocene_deposit_mint.golden.json
+holocene_deposit_only.golden.json
+holocene_l1fee_edge.golden.json
+holocene_transfer_basic.golden.json
+isthmus_deposit_basefee_observer.golden.json
+isthmus_gaslimit_observer.golden.json
+isthmus_l1block_deposit_slots.golden.json
+isthmus_legacy_transfer.golden.json
+isthmus_message_passer_withdraw.golden.json
+isthmus_upgrade_jovian_activation.golden.json
+jovian_deposit_basefee_observer.golden.json
+jovian_gaslimit_observer.golden.json
+jovian_l1block_deposit_slots.golden.json
+jovian_legacy_transfer.golden.json
+jovian_message_passer_withdraw.golden.json
+regolith_boundary_regolith_last.golden.json
+regolith_deposit_mint.golden.json
+regolith_deposit_only.golden.json
+regolith_l1fee_edge.golden.json
+regolith_transfer_basic.golden.json

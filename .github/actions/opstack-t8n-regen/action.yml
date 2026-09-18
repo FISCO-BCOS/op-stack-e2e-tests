@@ -11,9 +11,10 @@ description: >-
 runs:
   using: composite
   steps:
-    - name: Resolve op-geth pin
-      # Single source of truth is regen.sh's PIN= line; this just surfaces it for the
-      # cache key below (and passes it through so ensure-vectors.sh can't drift).
+    - name: Resolve pins
+      # Single source of truth is regen.sh's PIN=/OP_NODE_PIN= lines; this just surfaces
+      # them for the cache keys below (and passes them through so ensure-vectors.sh can't
+      # drift). The CL (optimism) tree is needed by the P1 matrix dumpers.
       id: pin
       shell: bash
       run: |
@@ -24,7 +25,13 @@ runs:
           echo "::error::failed to extract PIN from regen.sh"
           exit 1
         fi
+        OP_NODE_PIN="$(sed -nE 's/^OP_NODE_PIN="\$\{OP_NODE_PIN:-([0-9a-f]{40})\}".*/\1/p' "$REGEN")"
+        if [ -z "$OP_NODE_PIN" ]; then
+          echo "::error::failed to extract OP_NODE_PIN from regen.sh"
+          exit 1
+        fi
         echo "pin=${PIN}" >> "$GITHUB_OUTPUT"
+        echo "op_node_pin=${OP_NODE_PIN}" >> "$GITHUB_OUTPUT"
 
     - name: Set up Go
       # regen.sh builds the generator inside the op-geth module (go.mod: go 1.24.0 at the
@@ -44,10 +51,20 @@ runs:
         path: ${{ runner.temp }}/op-geth
         key: op-geth-${{ runner.os }}-${{ steps.pin.outputs.pin }}
 
+    - name: Cache pinned optimism tree
+      # Same treatment as op-geth: the op-node window dumper builds inside this tree, and
+      # the monorepo clone is large.
+      id: opnodecache
+      uses: actions/cache@v4
+      with:
+        path: ${{ runner.temp }}/optimism
+        key: optimism-${{ runner.os }}-${{ steps.pin.outputs.op_node_pin }}
+
     - name: Regenerate t8n vectors
       shell: bash
       env:
         OPGETH: ${{ runner.temp }}/op-geth
+        OP_NODE_REPO: ${{ runner.temp }}/optimism
       run: |
         set -euo pipefail
         bash "$GITHUB_WORKSPACE/opstack-executor/tests/t8n/generator/ensure-vectors.sh"

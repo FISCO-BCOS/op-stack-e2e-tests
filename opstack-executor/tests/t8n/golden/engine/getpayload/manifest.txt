@@ -1,0 +1,62 @@
+# P2 Task 1 engine_getPayload golden manifest.
+#
+# One <fork>_v<version>.json per LEGAL (fork, getPayload-version) pair -- 9
+# cells, not 36. The authority for the mapping is op-node's own selection as
+# dumped into matrix/engine_api_windows.json; each fork exposes exactly one
+# getPayload version at its activation window:
+#
+#   V2  regolith (forkchoiceUpdatedV1), canyon
+#   V3  ecotone, fjord, granite, holocene
+#   V4  isthmus, jovian
+#   V5  karst   <- registered FISCO-side deviation: the pinned op-node emits
+#                  V4 for karst, but the corpus op-geth pin implements
+#                  GetPayloadV5 gated on the Osaka EL ruleset that Karst
+#                  activates (params/config.go:519 KarstTime, api.go:497).
+#                  See matrix/known_deviations.json.
+#
+# Each file is the raw engine.ExecutionPayloadEnvelope JSON returned by
+# GetPayloadV<version>, produced through the real engine path (not
+# GenerateChainWithGenesis / --golden-output):
+#
+#   eth.New -> catalyst.ForkchoiceUpdatedV<fcu>(attrs) -> GetPayloadV<version>
+#
+# using opstack-executor/tests/t8n/generator/main.go's --engine-getpayload
+# against the corpus op-geth pin e8800cffe53d459cde8a07c8e8f1de9d86e79e07
+# (v1.101702.2). Source case per cell (all under ../cases/):
+#
+#   regolith_v2  regolith_transfer_basic
+#   canyon_v2    canyon_transfer_basic
+#   ecotone_v3   ecotone_transfer_basic
+#   fjord_v3     fjord_transfer_basic
+#   granite_v3   granite_deposit_mint      (no granite transfer_basic case)
+#   holocene_v3  holocene_transfer_basic
+#   isthmus_v4   isthmus_transfer_basic
+#   jovian_v4    jovian_transfer_basic
+#   karst_v5     jovian_transfer_basic + --engine-fork karst
+#                (there is no karst case in the corpus; the karst cell reuses
+#                the jovian body, whose 17-byte Jovian extraData + minBaseFee
+#                shape is what Karst also encodes)
+#
+# DETERMINISM (why there is no normalization step): NoTxPool=true makes the
+# miner build synchronously from attrs.Transactions (no background recommit,
+# no txpool ordering); timestamp is the case's genesis+10; prevRandao is the
+# zero hash; the hash-derived payloadID never appears in the dumped envelope.
+# Two consecutive generations are byte-for-byte identical for all 9 cells.
+# Caveat recorded as data, not hidden: karst_v5.json is byte-identical to
+# jovian_v4.json for this input -- Osaka does not change a plain-transfer
+# payload, and the V5-only BlobsBundleV2 difference needs blobs, which OP
+# chains do not use. The cell still pins the V5 code path and its envelope
+# shape (executionRequests: [] vs the V3 arm's explicit null).
+#
+# Generated goldens are gitignored (*.json under this directory); this
+# manifest and SHA256SUMS are the tracked contract. Regeneration is Task 4's
+# regen.sh wiring, not this manifest's job.
+regolith_v2.json
+canyon_v2.json
+ecotone_v3.json
+fjord_v3.json
+granite_v3.json
+holocene_v3.json
+isthmus_v4.json
+jovian_v4.json
+karst_v5.json
