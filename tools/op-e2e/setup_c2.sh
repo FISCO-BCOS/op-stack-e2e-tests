@@ -354,8 +354,6 @@ fi)
     elasticity=2
     denominator=8
     denominator_canyon=250
-[features]
-    feature_l2_ethereum_compat=true
 $(cat "$C2/eth_genesis_header.ini")
 [web3]
     chain_id=$L2_CHAIN

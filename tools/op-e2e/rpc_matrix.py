@@ -202,7 +202,7 @@ def a2_chain(rpc):
             check("eth_config.current.precompiles includes ECREC",
                   isinstance(pcs, dict) and "ECREC" in pcs, str(list(pcs)[:6]))
             scs = cur.get("systemContracts") or {}
-            # The C2 devnet is an OP L2 (feature_l2_ethereum_compat): beacon roots + history.
+            # The C2 devnet is an OP L2 (executor_version = 3): beacon roots + history.
             check("eth_config.current.systemContracts includes BEACON_ROOTS_ADDRESS",
                   isinstance(scs, dict) and "BEACON_ROOTS_ADDRESS" in scs, str(scs))
         check("eth_config.next is null", isinstance(cfg, dict) and cfg.get("next") is None, "")
