@@ -28,7 +28,7 @@
 #     与 a1_active 套件配合)
 #   - 注意:旧分支 worktree-op-alignment 上两者可共存且必须开 true——那是旧线
 #     行为,在旧线的 84b3be0d 回归修复有记录;两条分支的配置契约不同
-#   - [eth_genesis_header] 22 字段必须存在(feature_l2_ethereum_compat 强制,
+#   - [eth_genesis_header] 22 字段必须存在(executor_version >= 2 的 lane 强制,
 #     state_root 必须是合并 allocs 的真实 MPT 根——--allocs 链路)
 #   - B3a produce_empty_blocks=false(a1_active FCU 秒级 timestamp 竞态)
 #   - SENDER genesis 余额 10^24 wei(chain_driver/b3_contracts 依赖)
@@ -260,8 +260,6 @@ if step_run 5; then
 ; 因此该车道禁止设置 executor.evm_revision / evm_revision_forks。
 [op_fork_timestamps]
     jovian_time=$JOVIAN_TIME
-[features]
-    feature_l2_ethereum_compat=true
 $(cat "$ETH_HEADER")
 [web3]
     chain_id=$CHAIN_ID
