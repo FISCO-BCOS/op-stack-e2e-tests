@@ -3,8 +3,12 @@
 
 # C2 chain config: real op-deployer base allocs (l2genesis.json from anvil L1 deploy).
 # OP predeploys come from the base; only FISCO self-written predeploys are overlaid.
-# FISCO governance contracts use 0x1000+ (outside the OP reserved 0x0000-0x7FF namespace,
-# which is reserved for future OP predeploys even when specific slots are currently free).
+# FISCO self-written predeploys live under the 0x43... prefix, the address the FISCO node
+# reads them from (bcos-framework/ledger/L2ConfigLoader.h: SystemConfig at 0x43...00C0).
+# 0x4200...0000-07FF is OP's reserved predeploy namespace (reserved for future OP predeploys
+# even where a slot is currently free), so no FISCO contract goes anywhere under 0x4200....
+# Implementations take 0xc3d3...<suffix>, one prefix up from OP's reserved 0xc0d3... code
+# namespace; build-allocs.py rejects both reserved ranges.
 
 proxy_admin: "0x4200000000000000000000000000000000000018"   # OP ProxyAdmin (base)
 governance_owner: "0x70997970C51812dc3A010C7d01b50e0d17dc79C8"  # dev1 — config/validator authority
@@ -13,15 +17,33 @@ proxy_code_source: "0x4200000000000000000000000000000000000015"  # L1Block proxy
 predeploys:
   # --- FISCO-BCOS self-written predeploys (proxied: proxy + implementation) ---
   - name: SystemConfig
-    address: "0x4200000000000000000000000000000000001000"
+    address: "0x43000000000000000000000000000000000000C0"
     sol_file: SystemConfig.sol
     proxy:
-      implementation: "0x4200000000000000000000000000000000001002"
+      implementation: "0xc3d3c3d3c3d3c3d3c3d3c3d3c3d3c3d3c3d300c0"
+    # Genesis-seeded SystemConfig entries (packed Entry slots, enableNumber = 0).
+    # chain_id = the harness L2 chain id (setup_c2.sh L2_CHAIN, withdraw_e2e_ephemeral.sh
+    # CHAIN_ID); gas_limit = the op-deployer intent gasLimit (setup_c2.sh), which is the
+    # L2 genesis header's gasLimit (0x1c9c380).
+    system_config:
+      chain_id: 914901
+      gas_limit: 30000000
+      # feature_flags MUST equal the node's Features::toFlagsNumber() for the C2
+      # config.genesis ([version] compatibility_version=3.18.0, consensus_type=pbft,
+      # [features] feature_l2_ethereum_compat=true): the node verifies this slot at first
+      # start (Ledger.cpp verifyL2FeatureFlagsSlot) and refuses to build genesis on any
+      # mismatch. Derived from fisco-bcos 3.18.0 @ 086c194d5 (feat/op-el-integration):
+      # bits 0-38 (3.18.0 bugfix defaults) + 57 feature_l2_ethereum_compat
+      # + 59 bugfix_nonce_ordering + 61 bugfix_eip161_1052_account_semantics.
+      # RE-DERIVE whenever the node's default feature set changes (e.g. FISCO-BCOS PR #5647
+      # removes feature_l2_ethereum_compat, which changes this value). Recipe: set a wrong
+      # value here, run the C2 smoke, and copy `expected=0x...` from the node's boot error.
+      feature_flags: 0x2a00007fffffffff
   - name: L2ValidatorSet
-    address: "0x4200000000000000000000000000000000001001"
+    address: "0x43000000000000000000000000000000000000C1"
     sol_file: L2ValidatorSet.sol
     proxy:
-      implementation: "0x4200000000000000000000000000000000001003"
+      implementation: "0xc3d3c3d3c3d3c3d3c3d3c3d3c3d3c3d3c3d300c1"
 
 expected_predeploys:
   # --- OP predeploys (must exist in the base allocs from op-deployer) ---
