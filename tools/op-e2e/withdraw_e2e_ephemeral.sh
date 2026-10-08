@@ -221,6 +221,27 @@ if [ "${CONTEST:-1}" = "1" ]; then
   python3 "$HERE/withdraw_claim.py" "$TX" --wait-finalized 0 --contest dishonest
 fi
 
+# ── phase 3.6 (optional): kona native fault-proof replay ───────────────────
+# After the contest leg has created a dispute game, run kona-host in native mode
+# to re-derive the L2 chain from genesis and assert kona's independent (revm)
+# derivation reproduces the on-chain FaultDisputeGame's claimed output root.
+# This is the first proof that FISCO's execution result is reproducible by a
+# fully independent implementation — no cannon/MIPS involved yet.
+#
+# KONA_VERIFY / KONA_HOST / KONA_VERIFY_SCRIPT are passed in by the caller
+# (tools/.ci/c2-e2e.sh in the FISCO-BCOS repo); KONA_VERIFY defaults to 0 here
+# so a standalone harness run does not require kona binaries.
+if [ "${KONA_VERIFY:-0}" = "1" ]; then
+  log "running kona native fault-proof replay verification"
+  C2_L1_RPC="$C2_L1_RPC" \
+  C2_L2_WEB3="$C2_L2_WEB3" \
+  C2_OP_NODE="$C2_OP_NODE" \
+  C2_STATE="$C2_STATE" \
+  C2_ROLLUP="$WORKSPACE/rollup.json" \
+  KONA_HOST="${KONA_HOST:-kona-host}" \
+    python3 "${KONA_VERIFY_SCRIPT:-$HERE/kona_verify.py}"
+fi
+
 # ── phase 3.5 (optional): XDM L2->L1 relay leg ──────────────────────────────
 if [ "${XDM:-0}" = "1" ]; then
   log "running the XDM L2->L1 relay leg"
