@@ -1,12 +1,25 @@
 # Copyright (c) FISCO-BCOS, Apache-2.0
 # chain-config template for build-allocs.py (L2 / OP-Stack genesis).
 # Copy this file, fill in the values, then:
-#   make allocs CONFIG=chain-config.yaml BASE=final-allocs.json
+#   python3 tools/opstack-genesis/build-allocs.py --config chain-config.yaml \
+#       --base-allocs final-allocs.json ...   (no Makefile target exists in-tree)
 # or:
 #   python3 build-allocs.py --config chain-config.yaml \
 #       --contracts ../../bcos-l2-contracts \
 #       --base-allocs final-allocs.json --out allocs.ini
-
+#
+# Karst alloc pin: --base-allocs MUST be the op-deployer terminal alloc JSON generated
+# from bcos-l2-contracts/op-fork-pin.toml [karst_pin] (op-contracts/v7.0.0 +
+# op-deployer/v0.7.1). Mirror [karst_pin].base_allocs_sha256 into base_allocs_sha256
+# below once the artifact is frozen.
+#
+# Fork activation is NOT a YAML field here — it lives in config.ini / genesis
+# [op_fork_schedule] canonical=. Do not enable Karst without K2 (Osaka + EIP-7825
+# deposit exemption) and K3 (getPayload V5 / -38005) shipping together:
+#   Sepolia-style new chain: 0:jovian,1781712001:karst
+#   Mainnet-style:           0:isthmus,1764691201:jovian,1783526401:karst
+# karstTime: 1783526401
+#
 # The op-deployer-generated Karst terminal alloc JSON (--base-allocs) is the
 # ONLY source for the OP-Stack side of genesis: every 0x42... predeploy
 # proxy, every 0xc0d3... implementation, ProxyAdmin ownership, prefunded
@@ -115,11 +128,3 @@ expected_predeploys:
     address: "0x4200000000000000000000000000000000000012"
   - name: OperatorFeeVault
     address: "0x420000000000000000000000000000000000001B"
-  # EIP-4788 beacon-roots system contract (Cancun/Ecotone+): system_call_block_start
-  # writes the parent beacon block root here every block; silently no-op at the EVM
-  # level if missing, but a genesis without it diverges from every OP reference client.
-  - name: BeaconBlockRoot
-    address: "0x000F3DF6D732807Ef1319FB7B8bB8522d0Beac02"
-  # EIP-2935 historical block hashes (Prague/Isthmus-era op-deployer output includes it).
-  - name: HistoryStorage
-    address: "0x0000F90827F1C53A10CB7A02335B175320002935"

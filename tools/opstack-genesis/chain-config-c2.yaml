@@ -1,3 +1,6 @@
+# Copyright (c) FISCO-BCOS, Apache-2.0
+# SPDX-License-Identifier: Apache-2.0
+
 # C2 chain config: real op-deployer base allocs (l2genesis.json from anvil L1 deploy).
 # OP predeploys come from the base; only FISCO self-written predeploys are overlaid.
 # FISCO governance contracts use 0x1000+ (outside the OP reserved 0x0000-0x7FF namespace,
@@ -45,4 +48,13 @@ expected_predeploys:
   - name: L1FeeVault
     address: "0x420000000000000000000000000000000000001A"
 
+# op-fork-base-allocs.json was removed from the karst branch (2026-09-16): it is
+# regenerable via setup_c2.sh (anvil L1 → op-deployer → inspect genesis).
+# This pin retains the SHA of the last committed frozen artifact for provenance.
+# CAVEAT (verified at the harness ref): setup_c2.sh rewrites this line to the fresh
+# l2genesis.json's sha256 (sed s/base_allocs_sha256:.*/...) right before build-allocs,
+# so in the C2 lane verify_base_provenance attests SELF-CONSISTENCY only — it cannot
+# detect a drifted --base-allocs there. The committed value below is the authority
+# for manual/non-C2 runs; making the C2 flow assert instead of rewrite is a harness
+# (op-stack-e2e-tests) change.
 base_allocs_sha256: "9b33b2433446f67d0efa7e9f2da8e59366ccf9b6ceb4e98f9351f9c8c6da57f8"

@@ -1,14 +1,16 @@
 # Copyright (c) FISCO-BCOS, Apache-2.0
 """Unit tests for gen_rollup_config.py: the emitted rollup.json must carry every
-field op-node v1.19.3 rollup.Config.Check() validates, with all fork times 0
-(post-Karst genesis) and a non-empty chain_op_config."""
+field a karst-aware op-node's rollup.Config.Check() validates, with all fork times
+0 (post-Karst genesis) and a non-empty chain_op_config. The K0 artifact carries
+karst_time, which the pinned op-node (no KarstTime, DisallowUnknownFields) rejects
+at decode; that limitation is disclosed, not a v1.19.3-compatibility claim (U7-F3)."""
 import importlib.util
 import json
 from pathlib import Path
 
 import pytest
 
-# Load by file path (same as test_build_allocs.py): tools/opstack-genesis/ is not a
+# Load by file path (same as test_mpt_state_root.py): tools/opstack-genesis/ is not a
 # package, so a plain `import gen_rollup_config` only works under pytest's default
 # rootdir sys.path insertion — path loading keeps the test import-mode independent.
 _SPEC = importlib.util.spec_from_file_location(
@@ -55,6 +57,19 @@ def test_all_fork_times_zero_through_karst():
         assert config[key] == 0, key
     assert "karst_time" in gen.FORK_TIME_KEYS
     assert gen.FORK_TIME_KEYS[-1] == "karst_time"
+
+
+def test_module_discloses_pinned_opnode_rejects_karst_time():
+    """U7-F3: K0 emits karst_time unconditionally. The op-node revision pinned by
+    this branch (optimism@76e4fad5) has no KarstTime and decodes rollup.json with
+    DisallowUnknownFields, so it rejects these artifacts at decode
+    (`json: unknown field "karst_time"`). That is a disclosed limitation, not a
+    v1.19.3-compatibility claim; pin the disclosure so it cannot be quietly
+    reverted. test_all_fork_times_zero_through_karst remains the intended K0
+    behaviour: do not delete or invert it."""
+    doc = gen.__doc__ or ""
+    assert "karst_time" in doc
+    assert "DisallowUnknownFields" in doc
 
 
 def test_chain_op_config_non_empty():
