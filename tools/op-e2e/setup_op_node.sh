@@ -250,7 +250,7 @@ if step_run 5; then
 [version]
     compatibility_version=3.18.0
 [tx]
-    gas_limit=3000000000
+    gas_limit=30000000
 [executor]
     is_auth_check=false
     is_serial_execute=true
