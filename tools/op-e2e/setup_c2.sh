@@ -369,6 +369,9 @@ $(cat "$C2/eth_genesis_header.ini")
     ; op-batcher's DA-throttle handshake (miner_setMaxDASize) is opt-in; the devnet's L2
     ; listener is bound to loopback, which is the only place it should be enabled.
     enable_miner_api=true
+    ; the fault-proof preimage oracle (kona-host) reads the geth debug namespace
+    ; (debug_dbGet / debug_getRawHeader) off THIS listener; opt-in per listener.
+    enable_debug_api=true
 [op_engine_rpc]
     enable=true
     listen_ip=127.0.0.1
