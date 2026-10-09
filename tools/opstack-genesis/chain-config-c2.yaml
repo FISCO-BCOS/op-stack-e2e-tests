@@ -29,16 +29,17 @@ predeploys:
       chain_id: 914901
       gas_limit: 30000000
       # feature_flags MUST equal the node's Features::toFlagsNumber() for the C2
-      # config.genesis ([version] compatibility_version=3.18.0, consensus_type=pbft,
-      # [features] feature_l2_ethereum_compat=true): the node verifies this slot at first
-      # start (Ledger.cpp verifyL2FeatureFlagsSlot) and refuses to build genesis on any
-      # mismatch. Derived from fisco-bcos 3.18.0 @ 086c194d5 (feat/op-el-integration):
-      # bits 0-38 (3.18.0 bugfix defaults) + 57 feature_l2_ethereum_compat
-      # + 59 bugfix_nonce_ordering + 61 bugfix_eip161_1052_account_semantics.
-      # RE-DERIVE whenever the node's default feature set changes (e.g. FISCO-BCOS PR #5647
-      # removes feature_l2_ethereum_compat, which changes this value). Recipe: set a wrong
+      # config.genesis ([version] compatibility_version=3.18.0, consensus_type=pbft, no
+      # [features] section): the node verifies this slot at first start
+      # (Ledger.cpp verifyL2FeatureFlagsSlot) and refuses to build genesis on any mismatch.
+      # Derived from fisco-bcos 3.18.0's version-gated defaults only (setGenesisFeatures):
+      # bugfix defaults up to V3_18 + bugfix_nonce_ordering (59) +
+      # bugfix_eip161_1052_account_semantics (61). Bit 57 (the removed
+      # feature_l2_ethereum_compat, now a reserved tombstone) is NOT set — the lane is
+      # decided by executor_version alone. RE-DERIVE whenever the node's default feature
+      # set changes (a removed/renumbered flag changes this value). Recipe: set a wrong
       # value here, run the C2 smoke, and copy `expected=0x...` from the node's boot error.
-      feature_flags: 0x2a00007fffffffff
+      feature_flags: 0x2800007fffffffff
   - name: L2ValidatorSet
     address: "0x43000000000000000000000000000000000000C1"
     sol_file: L2ValidatorSet.sol
