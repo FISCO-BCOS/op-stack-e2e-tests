@@ -34,10 +34,10 @@ L1_BLOCK = "0x4200000000000000000000000000000000000015"
 MESSAGE_PASSER = "0x4200000000000000000000000000000000000016"
 MESSENGER = "0x4200000000000000000000000000000000000007"
 BRIDGE = "0x4200000000000000000000000000000000000010"
-# FISCO self-written SystemConfig predeploy (chain-config-c2.yaml overlay at 0x1000+,
-# outside the OP reserved 0x0000-0x7FF namespace). The legacy 0xC0 address was the
-# self-written path of the pre-op-deployer B3 config and is no longer populated.
-SYSTEM_CONFIG = "0x4200000000000000000000000000000000001000"
+# FISCO self-written SystemConfig predeploy (chain-config-c2.yaml overlay), at the address
+# the FISCO node reads it from (L2ConfigLoader.h: 0x43...00C0), outside OP's reserved
+# 0x4200...0000-07FF predeploy namespace.
+SYSTEM_CONFIG = "0x43000000000000000000000000000000000000C0"
 
 # Task 4:最小 ERC20 部署 init bytecode(solc 0.8.15 + optimizer 200 编译,1939B)。
 # 有 balanceOf(0x70a08231)/mint(0x40c10f19)/approve(0x095ea7b3)/transferFrom(0x23b872dd)/
@@ -535,7 +535,7 @@ def main():
               f"DIVERGENCE: event unverified (bridge reverts); logs={len(r2.get('logs', []))}")
 
     # ═══ SystemConfig group (Task 5) ═══
-    # FISCO self-written SystemConfig (chain-config-c2.yaml 0x1000 overlay):
+    # FISCO self-written SystemConfig (chain-config-c2.yaml 0x43...00C0 overlay):
     # getValueByKey(string) selector 0x1258a93a;未 set 前读默认 (0, 0)。
     # ⚠️ 返回 uint192 value | uint64 enable 两词(0x + 128 hex);out[2:66]=value,out[66:130]=enable。
     out = rpc.eth("eth_call",

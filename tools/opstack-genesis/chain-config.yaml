@@ -22,7 +22,8 @@
 # predeploys at 0x…C0/C1 — a slot inside the OP reserved 0x4200…0000-07FF
 # predeploy namespace. That is the LEGACY devnet layout this template predates;
 # the C2 deployment follows the stricter rule documented in chain-config-c2.yaml
-# (FISCO contracts at 0x1000+, outside the reserved namespace). Do not copy these
+# (FISCO contracts under the 0x43... prefix the node reads, outside the reserved
+# namespace). Do not copy these
 # addresses into a C2-era config; changing them here changes the genesis hash.
 predeploys:
   # --- FISCO-BCOS self-written predeploys ---
