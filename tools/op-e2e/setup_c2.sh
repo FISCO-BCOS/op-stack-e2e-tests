@@ -256,12 +256,15 @@ if step_run 3; then
   step 3 "allocs.ini + eth_genesis_header"
   python3 -c "import yaml" 2>/dev/null || die "pyyaml 未安装"
   NEW_HASH=$(sha256sum "$C2/l2genesis.json" | awk '{print $1}')
-  # GNU sed takes `-i` suffix-less; BSD sed requires an explicit '' — branch like the
-  # rest of the repo (tools/engine_integration_test.sh) so the Linux e2e path works.
-  if [ "$(uname)" = "Darwin" ]; then
-    sed -i '' "s/base_allocs_sha256:.*/base_allocs_sha256: \"$NEW_HASH\"/" "$OPGEN/chain-config-c2.yaml"
-  else
-    sed -i "s/base_allocs_sha256:.*/base_allocs_sha256: \"$NEW_HASH\"/" "$OPGEN/chain-config-c2.yaml"
+  # Provenance ASSERT, not rewrite: the committed pin is the authority for what the C2
+  # base allocs were built from. Rewriting it here made verify_base_provenance a
+  # tautology (the pin always self-matched). When the freshly generated l2genesis
+  # legitimately changes (op-deployer bump, chain-config change), update the committed
+  # pin in THIS repo as an explicit act — the mismatch error names exactly that.
+  COMMITTED_HASH=$(grep -oE 'base_allocs_sha256: "[0-9a-f]{64}"' "$OPGEN/chain-config-c2.yaml" |
+    grep -oE '[0-9a-f]{64}')
+  if [ "$NEW_HASH" != "$COMMITTED_HASH" ]; then
+    die "C2 l2genesis sha256 $NEW_HASH differs from the committed base_allocs_sha256 pin $COMMITTED_HASH in tools/opstack-genesis/chain-config-c2.yaml — if the change is intended (op-deployer bump / chain-config change), update the committed pin in that file as an explicit commit; otherwise fix whatever drifted in step 2"
   fi
   python3 "$OPGEN/build-allocs.py" \
     --config "$OPGEN/chain-config-c2.yaml" \
