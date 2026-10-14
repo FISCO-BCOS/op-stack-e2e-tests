@@ -2,9 +2,9 @@
 
 Merges FISCO's self-written predeploy overlay onto **op-deployer terminal
 allocs** and emits FISCO-BCOS genesis `[alloc.N]` INI fragments for L2 mode.
-L2 mode is enabled by the `feature_l2_ethereum_compat` flag in `[features]`
-(there is no `chain_mode`); allocs require the flag and the flag requires
-allocs (`validateL2Invariants`).
+L2 mode is `version = 3` in the `[executor]` section of `config.genesis` (the
+OP lane; there is no mode key and no feature flag); allocs require
+`executor.version >= 2` and the OP lane requires allocs (`validateL2Invariants`).
 
 ## Input authority split
 
@@ -57,22 +57,15 @@ elided — trie-equivalent — and addresses are lowercased).
 
 Dependencies: Python 3 stdlib + `pyyaml`. Tests also need `pytest`.
 
-## Fork activation: genesis feature flag (OP Stack divergence)
+## Fork activation: `[op_fork_timestamps]`
 
-OP Stack activates forks by L2 block timestamp (e.g. `chain.jovian_time`).
-FISCO selects the OP fork at **genesis time** via the `[features]` section
-instead — there is no timestamp-based activation mechanism in FISCO.
-
-- **Isthmus** is the OP-mode baseline (default when `executor_version >= 3`).
-- `feature_op_jovian=true` in `[features]` enables Jovian semantics
-  (DA footprint, operator fee ×100, minBaseFee, new calldata selector).
-- The fork is fixed at node start: **no mid-chain Isthmus→Jovian transition
-  is possible**.
-
-For new chains (genesis-activated Jovian), this is equivalent to the OP
-spec. For chains that need to upgrade from Isthmus to Jovian mid-life, this
-is a known limitation — a timestamp-based activation mechanism would be
-required.
+As in OP Stack, OP forks activate by L2 block timestamp: `[op_fork_timestamps]`
+in `config.genesis` carries `isthmus_time` / `jovian_time` / `karst_time`
+(seconds, from rollup.json). Isthmus is the OP-lane baseline and needs no
+entry; any other absent key is a fork that never activates. A mid-chain
+activation is a timestamp after genesis (`setup_c2.sh` `L2_JOVIAN_OFFSET`
+writes the rollup.json `jovian_time` there). `[features]` is not read on
+`executor.version >= 2`.
 
 ## chain-config.yaml fields
 

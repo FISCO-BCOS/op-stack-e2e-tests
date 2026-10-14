@@ -325,12 +325,6 @@ if step_run 4; then
     block_tx_count_limit=1000
     leader_period=1
     node.0=$NODE_ID
-    enable_single_node_consensus=false
-    block_interval=1000
-    produce_empty_blocks=false
-    fee_recipient=0x4200000000000000000000000000000000000011
-[version]
-    compatibility_version=3.18.0
 [tx]
     gas_limit=30000000
 [executor]
@@ -338,14 +332,10 @@ if step_run 4; then
     is_serial_execute=true
     version=3
     auth_admin_account=$AUTH_ADMIN
-; OP lane: Isthmus is the baseline and needs no entry; Jovian active from genesis. The EVM
-; revision is derived from this schedule (Isthmus/Jovian = Prague), so executor.evm_revision
-; must not be set on this lane.
-$(if [ -n "$L2_JOVIAN_OFFSET" ] && [ -n "$L2_JOVIAN_ABS" ]; then
-  printf '[op_fork_schedule]\n    canonical=0:isthmus,%s:jovian\n[op_fork_timestamps]\n    jovian_time=%s' "$L2_JOVIAN_ABS" "$L2_JOVIAN_ABS"
-else
-  printf '[op_fork_schedule]\n    canonical=0:jovian\n[op_fork_timestamps]\n    jovian_time=0'
-fi)
+; OP lane: Isthmus is the baseline and needs no entry; Jovian activates at jovian_time (0 =
+; from genesis). The EVM revision follows these timestamps (Isthmus/Jovian = Prague).
+[op_fork_timestamps]
+    jovian_time=$(if [ -n "$L2_JOVIAN_OFFSET" ] && [ -n "$L2_JOVIAN_ABS" ]; then echo "$L2_JOVIAN_ABS"; else echo 0; fi)
 ; The chain's own EIP-1559 parameters, matching intent.toml (denominator 8, elasticity 2).
 ; Isthmus/Jovian are active from genesis, so this does not change how any block is priced
 ; today; it is the CORRECT declaration for this chain (elasticity 2 differs from the legacy
@@ -355,8 +345,9 @@ fi)
     denominator=8
     denominator_canyon=250
 $(cat "$C2/eth_genesis_header.ini")
-[web3]
-    chain_id=$L2_CHAIN
+$(cat "$C2/allocs-new.ini")
+EOF
+  cat > "$C2/fisco/config.ini" <<EOF
 [service]
     without_tars_framework=true
 [rpc]
@@ -372,8 +363,7 @@ $(cat "$C2/eth_genesis_header.ini")
     ; the fault-proof preimage oracle (kona-host) reads the geth debug namespace
     ; (debug_dbGet / debug_getRawHeader) off THIS listener; opt-in per listener.
     enable_debug_api=true
-[op_engine_rpc]
-    enable=true
+[engine_rpc]
     listen_ip=127.0.0.1
     listen_port=$FISCO_ENGINE
     jwt_secret_file=jwt.hex
@@ -395,16 +385,15 @@ $(cat "$C2/eth_genesis_header.ini")
     enable=true
     log_path=./log
     level=info
-$(cat "$C2/allocs-new.ini")
 EOF
-  log "config.genesis 就绪($(wc -l < "$C2/fisco/config.genesis") 行)"
+  log "config.genesis($(wc -l < "$C2/fisco/config.genesis") 行)+ config.ini 就绪"
 
   # 启动 FISCO(ulimit 解除 RocksDB 栈溢出)
   kill "$(cat "$C2/fisco/node.pid" 2>/dev/null)" 2>/dev/null || true
   sleep 1
   ulimit -s 65520
   pushd "$C2/fisco" > /dev/null
-  nohup "$FISCO_BIN" -c config.genesis -g config.genesis > nohup.out 2>&1 &
+  nohup "$FISCO_BIN" -c config.ini -g config.genesis > nohup.out 2>&1 &
   echo $! > "$C2/fisco/node.pid"
   popd > /dev/null
   sleep 5
@@ -418,7 +407,7 @@ EOF
     rm -rf "$C2/fisco/data"
     ulimit -s 65520
     pushd "$C2/fisco" > /dev/null
-  nohup "$FISCO_BIN" -c config.genesis -g config.genesis > nohup.out 2>&1 &
+  nohup "$FISCO_BIN" -c config.ini -g config.genesis > nohup.out 2>&1 &
   echo $! > "$C2/fisco/node.pid"
   popd > /dev/null
     sleep 5

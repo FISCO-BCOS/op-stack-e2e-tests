@@ -91,7 +91,7 @@ start_op_node() {
 }
 start_fisco() {
   ulimit -s 65520
-  ( cd "$C2/fisco" && nohup "$FISCO_BIN" -c config.genesis -g config.genesis \
+  ( cd "$C2/fisco" && nohup "$FISCO_BIN" -c config.ini -g config.genesis \
       < /dev/null > nohup.out 2>&1 & echo $! > "$C2/fisco/node.pid" )
 }
 
