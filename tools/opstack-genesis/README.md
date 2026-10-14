@@ -18,8 +18,9 @@ state: proxy account (canonical Proxy runtime bytecode copied from a
 designated base-alloc proxy, `proxy_code_source`) + EIP-1967 slots,
 implementation account (bcos-l2-contracts forge bytecode, `_initialized=255`),
 and the proxy contract storage (`_initialized=1`, `Ownable.owner`, packed
-SystemConfig entries / L2ValidatorSet records — including the `feature_flags`
-entry, which the C++ genesis path later VERIFIES rather than injects).
+SystemConfig entries / L2ValidatorSet records). `system_config` must not carry
+`feature_flags`: the node no longer reads a feature-bitmap slot, and the build
+rejects the entry.
 
 Provenance: pin the frozen base allocs' sha256 as `base_allocs_sha256` in the
 chain-config YAML (mirroring `bcos-l2-contracts/op-fork-pin.toml`
@@ -80,7 +81,7 @@ required.
 | `base_allocs_sha256` | expected sha256 of the frozen op-deployer base allocs (provenance pin) |
 | `proxy_code_source` | base-alloc address whose Proxy runtime bytecode the overlay copies |
 | `proxy_admin` / `governance_owner` | the two-authority split: EIP-1967 admin vs `Ownable.owner` (must differ) |
-| `predeploys` | FISCO overlay predeploys: `{name, address, sol_file}`; the SystemConfig entry carries the `system_config` values (chain_id, gas_limit, feature_flags, …), the L2ValidatorSet entry carries `validators` records |
+| `predeploys` | FISCO overlay predeploys: `{name, address, sol_file}`; the SystemConfig entry carries the `system_config` values (chain_id, gas_limit, …; `feature_flags` is rejected), the L2ValidatorSet entry carries `validators` records |
 | `expected_predeploys` | existence checklist: each address must be present in the base allocs WITH code, else the build fails (guards against wrong/incomplete op-deployer output) |
 
 ## Safety rules (enforced by the build)
