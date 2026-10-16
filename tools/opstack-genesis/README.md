@@ -2,9 +2,9 @@
 
 Merges FISCO's self-written predeploy overlay onto **op-deployer terminal
 allocs** and emits FISCO-BCOS genesis `[alloc.N]` INI fragments for L2 mode.
-L2 mode is enabled by the `feature_l2_ethereum_compat` flag in `[features]`
-(there is no `chain_mode`); allocs require the flag and the flag requires
-allocs (`validateL2Invariants`).
+L2 mode is `version = 3` in the `[executor]` section of `config.genesis` (the
+OP lane; there is no mode key and no feature flag); allocs require
+`executor.version >= 2` and the OP lane requires allocs (`validateL2Invariants`).
 
 ## Input authority split
 
@@ -18,8 +18,9 @@ state: proxy account (canonical Proxy runtime bytecode copied from a
 designated base-alloc proxy, `proxy_code_source`) + EIP-1967 slots,
 implementation account (bcos-l2-contracts forge bytecode, `_initialized=255`),
 and the proxy contract storage (`_initialized=1`, `Ownable.owner`, packed
-SystemConfig entries / L2ValidatorSet records — including the `feature_flags`
-entry, which the C++ genesis path later VERIFIES rather than injects).
+SystemConfig entries / L2ValidatorSet records). `system_config` must not carry
+`feature_flags`: the node no longer reads a feature-bitmap slot, and the build
+rejects the entry.
 
 Provenance: pin the frozen base allocs' sha256 as `base_allocs_sha256` in the
 chain-config YAML (mirroring `bcos-l2-contracts/op-fork-pin.toml`
@@ -56,22 +57,15 @@ elided — trie-equivalent — and addresses are lowercased).
 
 Dependencies: Python 3 stdlib + `pyyaml`. Tests also need `pytest`.
 
-## Fork activation: genesis feature flag (OP Stack divergence)
+## Fork activation: `[op_fork_timestamps]`
 
-OP Stack activates forks by L2 block timestamp (e.g. `chain.jovian_time`).
-FISCO selects the OP fork at **genesis time** via the `[features]` section
-instead — there is no timestamp-based activation mechanism in FISCO.
-
-- **Isthmus** is the OP-mode baseline (default when `executor_version >= 3`).
-- `feature_op_jovian=true` in `[features]` enables Jovian semantics
-  (DA footprint, operator fee ×100, minBaseFee, new calldata selector).
-- The fork is fixed at node start: **no mid-chain Isthmus→Jovian transition
-  is possible**.
-
-For new chains (genesis-activated Jovian), this is equivalent to the OP
-spec. For chains that need to upgrade from Isthmus to Jovian mid-life, this
-is a known limitation — a timestamp-based activation mechanism would be
-required.
+As in OP Stack, OP forks activate by L2 block timestamp: `[op_fork_timestamps]`
+in `config.genesis` carries `isthmus_time` / `jovian_time` / `karst_time`
+(seconds, from rollup.json). Isthmus is the OP-lane baseline and needs no
+entry; any other absent key is a fork that never activates. A mid-chain
+activation is a timestamp after genesis (`setup_c2.sh` `L2_JOVIAN_OFFSET`
+writes the rollup.json `jovian_time` there). `[features]` is not read on
+`executor.version >= 2`.
 
 ## chain-config.yaml fields
 
@@ -80,7 +74,7 @@ required.
 | `base_allocs_sha256` | expected sha256 of the frozen op-deployer base allocs (provenance pin) |
 | `proxy_code_source` | base-alloc address whose Proxy runtime bytecode the overlay copies |
 | `proxy_admin` / `governance_owner` | the two-authority split: EIP-1967 admin vs `Ownable.owner` (must differ) |
-| `predeploys` | FISCO overlay predeploys: `{name, address, sol_file}`; the SystemConfig entry carries the `system_config` values (chain_id, gas_limit, feature_flags, …), the L2ValidatorSet entry carries `validators` records |
+| `predeploys` | FISCO overlay predeploys: `{name, address, sol_file}`; the SystemConfig entry carries the `system_config` values (chain_id, gas_limit, …; `feature_flags` is rejected), the L2ValidatorSet entry carries `validators` records |
 | `expected_predeploys` | existence checklist: each address must be present in the base allocs WITH code, else the build fails (guards against wrong/incomplete op-deployer output) |
 
 ## Safety rules (enforced by the build)

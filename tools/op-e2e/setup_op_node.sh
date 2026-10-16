@@ -2,7 +2,7 @@
 # setup_op_node.sh — 一键搭建 OP 模式 B3/B3a 节点 + 跑 op-e2e 套件
 #
 # 2026-08-17 重建验证:run_all.sh ALL OP-E2E GREEN(118 断言)。本脚本把整条链路
-# (genesis 预部署 bytecode → 节点密钥/certs → 合并 config.genesis → B3a 克隆 →
+# (genesis 预部署 bytecode → 节点密钥/certs → config.genesis + config.ini → B3a 克隆 →
 # sign_secp → 启动 → 跑套件)封装为幂等脚本。每步可单独重跑(-s/-e 指定范围),
 # 已完成的步骤不会重做。
 #
@@ -15,22 +15,21 @@
 #       clang(编 sign_secp,链接 vcpkg secp256k1)/ 网络(github.com,仅 OP-fork 步骤需要)
 #
 # 关键配置事实(踩坑后固化,见 memory op-e2e-node-rebuilt-config-blueprint):
-#   - 单一合并 config.genesis 同时当 -c 和 -g(restart_b3.sh / start.sh 都是
-#     `-c config.genesis -g config.genesis`)
-#   - [executor] version=3(不是 executor_version);OP 车道禁止 executor.evm_revision,revision
-#     由 [op_fork_timestamps] 推导
+#   - config.genesis(链参数/allocs/header)与 config.ini(监听/证书/日志)分开写,
+#     restart_b3.sh / start.sh 都是 `-c config.ini -g config.genesis`;config.ini 里有
+#     [chain] 会被节点报 "this key has no effect"(compat>=3.1 只读 config.genesis 的 [chain])
+#   - [executor] version=3(不是 executor_version);EVM revision 由 [op_fork_timestamps] 推导,
+#     不写 executor.evm_revision(OP 车道不读,写了只换来一条 "this key has no effect" WARN)
 #   - [rpc] listen_port(不是 rpc_listen_port)
-#   - [web3] chain_id 决定 eth_chainId;套件签名用 CHAIN_ID=11155111
+#   - [chain] chain_id(十进制)决定 eth_chainId;executor.version>=2 不读 [web3] chain_id;
+#     套件签名用 CHAIN_ID=11155111
 #   - without_tars_framework=true 需要 conf/tars_proxy.ini 存在
-#   - B3 (passive): enable_single_node_consensus=false + op_engine_rpc.enable=true
-#     executor v3 拒绝内置 SingleNodeConsensus;B3 仅提供 genesis RPC(被动,tier-1)
-#   - B3a (active): 同 B3 但 produce_empty_blocks=false + 端口 8563/8564(FCU 驱动,
-#     与 a1_active 套件配合)
-#   - 注意:旧分支 worktree-op-alignment 上两者可共存且必须开 true——那是旧线
-#     行为,在旧线的 84b3be0d 回归修复有记录;两条分支的配置契约不同
+#   - executor v3 的出块只由 Engine API(op-node / FCU)驱动,节点不自产块;
+#     [engine_rpc] 没有 enable 键,executor.version>=2 始终监听
+#   - B3 (passive): 无人驱动,只提供 genesis 状态上的 RPC(被动,tier-1)
+#   - B3a (active): 同 B3 但端口 8563/8564(FCU 驱动,与 a1_active 套件配合)
 #   - [eth_genesis_header] 22 字段必须存在(executor_version >= 2 的 lane 强制,
 #     state_root 必须是合并 allocs 的真实 MPT 根——--allocs 链路)
-#   - B3a produce_empty_blocks=false(a1_active FCU 秒级 timestamp 竞态)
 #   - SENDER genesis 余额 10^24 wei(chain_driver/b3_contracts 依赖)
 set -u
 
@@ -63,7 +62,6 @@ JOVIAN_TIME="${JOVIAN_TIME:-4102444800}"                     # 2100-01-01,实操
 SENDER="${SENDER:-0x6afa9580383E6627dA926B6f6ed9Ab2B9c8cC693}"
 SENDER_BAL="${SENDER_BAL:-1000000000000000000000000}"          # 10^24 wei
 AUTH_ADMIN="${AUTH_ADMIN:-0x3443d6866e757893e6862f451f5d1b7976c54594}"
-FEE_RECIPIENT="${FEE_RECIPIENT:-0x4200000000000000000000000000000000000011}"
 # 端口(套件硬编码目标,勿改):B3 = rpc/web3/engine/p2p
 B3_RPC=20211; B3_WEB3=8553; B3_ENGINE=8554; B3_P2P=31301
 B3A_RPC=20212; B3A_WEB3=8563; B3A_ENGINE=8564; B3A_P2P=31302
@@ -176,7 +174,7 @@ if step_run 4; then
   fi
 fi
 
-# ---------- 5. B3 装配:node.pem + certs + nodes.json + jwt + 合并 config.genesis ----------
+# ---------- 5. B3 装配:node.pem + certs + nodes.json + jwt + config.genesis/config.ini ----------
 if step_run 5; then
   step 5 "B3 节点密钥/certs/配置装配"
   NODE_BASE="$WORK/b3"
@@ -232,7 +230,7 @@ if step_run 5; then
   printf '{"nodes":["127.0.0.1:%d"]}' "$B3_P2P" > "$NODE_BASE/nodes.json"
   [ -f "$NODE_BASE/jwt.hex" ] || "$OPENSSL" rand -hex 32 > "$NODE_BASE/jwt.hex"
 
-  # 5.4 合并 config.genesis —— 同时当 -c 和 -g
+  # 5.4 config.genesis(-g)+ config.ini(-c)
   cat > "$NODE_BASE/config.genesis" <<EOF
 [chain]
     sm_crypto=false
@@ -243,12 +241,6 @@ if step_run 5; then
     block_tx_count_limit=1000
     leader_period=1
     node.0=$NODE_ID
-    enable_single_node_consensus=false
-    block_interval=1000
-    produce_empty_blocks=true
-    fee_recipient=$FEE_RECIPIENT
-[version]
-    compatibility_version=3.18.0
 [tx]
     gas_limit=30000000
 [executor]
@@ -256,13 +248,19 @@ if step_run 5; then
     is_serial_execute=true
     version=3
     auth_admin_account=$AUTH_ADMIN
-; OP 车道:Isthmus 为基线无需配置项,EVMC revision 由调度推导(Isthmus/Jovian = Prague),
-; 因此该车道禁止设置 executor.evm_revision / evm_revision_forks。
+; OP 车道:Isthmus 为基线无需配置项,EVMC revision 由下面的时间戳推导(Isthmus/Jovian = Prague),
+; 该车道不读 executor.evm_revision / evm_revision_forks。
 [op_fork_timestamps]
     jovian_time=$JOVIAN_TIME
 $(cat "$ETH_HEADER")
-[web3]
-    chain_id=$CHAIN_ID
+$(cat "$WORK/allocs.ini")
+[alloc.$(grep -cE '^\[alloc\.[0-9]+\]$' "$WORK/allocs.ini")]
+address=$SENDER
+balance=$SENDER_BAL
+nonce=0
+code=
+EOF
+  cat > "$NODE_BASE/config.ini" <<EOF
 [service]
     without_tars_framework=true
 [rpc]
@@ -272,8 +270,7 @@ $(cat "$ETH_HEADER")
     enable=true
     listen_ip=127.0.0.1
     listen_port=$B3_WEB3
-[op_engine_rpc]
-    enable=true
+[engine_rpc]
     listen_ip=127.0.0.1
     listen_port=$B3_ENGINE
     jwt_secret_file=jwt.hex
@@ -295,33 +292,26 @@ $(cat "$ETH_HEADER")
     enable=true
     log_path=./log
     level=info
-$(cat "$WORK/allocs.ini")
-[alloc.$(grep -cE '^\[alloc\.[0-9]+\]$' "$WORK/allocs.ini")]
-address=$SENDER
-balance=$SENDER_BAL
-nonce=0
-code=
 EOF
-  log "B3 config.genesis 就绪(node.0=$NODE_ID)"
+  log "B3 config.genesis + config.ini 就绪(node.0=$NODE_ID)"
 fi
 
-# ---------- 6. B3a 克隆:端口替换 + produce_empty_blocks=false + start.sh ----------
+# ---------- 6. B3a 克隆:端口替换 + start.sh ----------
 if step_run 6; then
   step 6 "B3a 克隆(空链,端口 8563/8564)"
   NODE_BASE="$WORK/b3"; B3A="$WORK/b3a"
-  [ -f "$NODE_BASE/config.genesis" ] || die "先跑第 5 步生成 B3 config"
+  [ -f "$NODE_BASE/config.ini" ] || die "先跑第 5 步生成 B3 config"
   mkdir -p "$B3A"
   cp -r "$NODE_BASE/conf" "$B3A/conf"
   cp "$NODE_BASE/node.pem" "$B3A/"
-  cp "$NODE_BASE/config.genesis" "$B3A/"
+  cp "$NODE_BASE/config.genesis" "$NODE_BASE/config.ini" "$B3A/"
   sed -i.bak \
       -e "s/listen_port=$B3_RPC/listen_port=$B3A_RPC/" \
       -e "s/listen_port=$B3_WEB3/listen_port=$B3A_WEB3/" \
       -e "s/listen_port=$B3_ENGINE/listen_port=$B3A_ENGINE/" \
       -e "s/listen_port=$B3_P2P/listen_port=$B3A_P2P/" \
-      -e "s/produce_empty_blocks=true/produce_empty_blocks=false/" \
-      "$B3A/config.genesis"
-  rm -f "$B3A/config.genesis.bak"
+      "$B3A/config.ini"
+  rm -f "$B3A/config.ini.bak"
   printf '{"nodes":["127.0.0.1:%d"]}' "$B3A_P2P" > "$B3A/nodes.json"
   cp "$NODE_BASE/jwt.hex" "$B3A/jwt.hex"
   cat > "$B3A/start.sh" <<'EOF'
@@ -334,7 +324,7 @@ BINARY=${BINARY:-@BINARY@}
 ulimit -s 65520 2>/dev/null || ulimit -s unlimited 2>/dev/null || true
 [ -f node.pid ] && kill "$(cat node.pid)" 2>/dev/null
 sleep 2
-nohup "$BINARY" -c config.genesis -g config.genesis > nohup.out 2>&1 &
+nohup "$BINARY" -c config.ini -g config.genesis > nohup.out 2>&1 &
 echo $! > node.pid
 sleep 8
 kill -0 "$(cat node.pid)" 2>/dev/null && echo "B3a RUNNING" || { echo "B3a EXITED"; tail -5 nohup.out; exit 1; }

@@ -23,7 +23,7 @@ except ImportError:
 
 
 def _jwt(secret_hex):
-    """Engine-API JWT (HS256) for the op_engine_rpc endpoint, per the Engine API auth spec."""
+    """Engine-API JWT (HS256) for the [engine_rpc] endpoint, per the Engine API auth spec."""
     def b64url(d):
         return base64.urlsafe_b64encode(d).rstrip(b"=").decode()
     header = b64url(json.dumps({"alg": "HS256", "typ": "JWT"}).encode())
@@ -122,9 +122,9 @@ def _known_error_check(name, e):
           False, str(e)[:80])
 
 
-# ---- A.1 engine_* (needs a separate node with enable_single_node_consensus=false for the
-#      active-mode FCU/getPayload loops; here we assert the version-gate/capabilities surface
-#      reachable on the B3 node) ----
+# ---- A.1 engine_* (the active-mode FCU/getPayload loops need a separate node that nothing
+#      else drives, B3a; here we assert the version-gate/capabilities surface reachable on the
+#      B3 node) ----
 
 
 def a1_engine_surface(erpc):
@@ -443,7 +443,7 @@ def main():
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=int(os.environ.get("B3_ETH_PORT", 8553)))
     ap.add_argument("--engine-port", type=int, default=int(os.environ.get("B3_ENGINE_PORT", 8564)),
-                    help="Engine RPC port (B3a has op_engine_rpc; B3 has consensus-only)")
+                    help="Engine RPC port (default: B3a's [engine_rpc] listener)")
     ap.add_argument("--jwt-secret", default=os.environ.get("B3A_JWT", "/tmp/op-spike/b3a/jwt.hex"))
     ap.add_argument("--only", default=None, help="a1|a2|a3")
     ap.add_argument("--sender",

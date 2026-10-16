@@ -36,12 +36,10 @@ Two-authority split: the EIP-1967 admin slot (upgrade authority) is
 ProxyAdmin, while `Ownable.owner` (config/validator write authority) is the
 governance entity — two independent slots, never the same entity (enforced).
 
-The `feature_flags` SystemConfig entry is a REQUIRED input for the
-SystemConfig predeploy: it must equal the node's
-Features::toFlagsNumber() at genesis, it is written here as a packed Entry
-slot like every other config key, and the C++ genesis path VERIFIES it
-(no longer injects it) — so the genesis state root, the op-reth alloc JSON
-and FISCO's readable state all commit the same slot.
+`system_config` must not carry `feature_flags`: the node no longer reads or
+verifies a feature-bitmap slot (feature flags are persisted by name only), so
+such an entry would only put a meaningless slot into the genesis state root.
+The build rejects it.
 
 If a self-written implementation artifact still carries immutableReferences
 (unfilled immutables), the build aborts naming the contract.
@@ -158,12 +156,6 @@ _OP_CODE_NAMESPACE_BASE = 0xC0D3C0D3C0D3C0D3C0D3C0D3C0D3C0D3C0D30000
 # forever; unlike the zero address it slips past a non-zero check — reject it
 # explicitly.
 PLACEHOLDER_ADDRESS = 0xDEAD
-
-# The FISCO SystemConfig predeploy (0x43...00C0). Its alloc MUST carry the
-# feature_flags Entry slot: the C++ genesis path verifies (and no longer
-# injects) that slot, so omitting it here would leave the genesis state root
-# not committing the feature set the node actually runs with.
-SYSTEM_CONFIG_PREDEPLOY = 0x43000000000000000000000000000000000000C0
 
 # OP ProxyAdmin storage layout: the contract is plain OZ `Ownable`, so its
 # `_owner` lives at slot 0. The upgrade authority of every proxied predeploy
@@ -548,13 +540,12 @@ def build_proxied_allocs(predeploy, config, contracts_dir, base_accounts):
     proxy_code = source_account["code"]
 
     system_config = predeploy.get("system_config", {}) or {}
-    if proxy_address == SYSTEM_CONFIG_PREDEPLOY and "feature_flags" not in system_config:
+    if "feature_flags" in system_config:
         raise ValueError(
-            f"{name}: system_config must carry feature_flags (= the node's "
-            f"Features::toFlagsNumber() at genesis). The C++ genesis path "
-            f"verifies this slot instead of injecting it, so omitting it "
-            f"would leave the genesis state root not committing the feature "
-            f"set the chain runs with")
+            f"{name}: system_config must not carry feature_flags — the node "
+            f"no longer reads a feature-bitmap slot (flags are persisted by "
+            f"name), so the entry would only add a meaningless slot to the "
+            f"genesis state root. Remove it from the chain config")
 
     storage = {
         OZ_INITIALIZED_SLOT: INITIALIZED_RAN,

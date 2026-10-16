@@ -21,7 +21,7 @@ cd "$WORK"
 # Large OP genesis (4k+ allocs) needs a bigger stack during first init.
 ulimit -s 65520 2>/dev/null || ulimit -s unlimited 2>/dev/null || true
 rm -f nohup.out
-nohup "$BINARY" -c config.genesis -g config.genesis > nohup.out 2>&1 &
+nohup "$BINARY" -c config.ini -g config.genesis > nohup.out 2>&1 &
 echo $! > node.pid
 sleep 8
 kill -0 "$(cat node.pid)" 2>/dev/null && echo "RUNNING (storage preserved)" || echo "EXITED"

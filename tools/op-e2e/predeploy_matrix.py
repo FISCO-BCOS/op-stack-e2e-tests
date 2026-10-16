@@ -309,7 +309,7 @@ def main():
     # 注意:两次都以 latest tag 读,即使节点修复 deposit 对齐,两次 latest 也同块同值,
     # 故本步在 B3 现实下只能走 DIVERGENCE 分支(见 brief Step 4 说明)。
     b0 = rpc.eth("eth_getBlockByNumber", ["latest", False])
-    time.sleep(1.2)   # 等空块自动生产(PBFT,block_interval=1000ms)
+    time.sleep(1.2)   # B3 无 op-node 驱动、不自产块,两次 latest 读同一块
     b1 = rpc.eth("eth_getBlockByNumber", ["latest", False])
     seq0 = rpc.eth("eth_call", [{"to": L1_BLOCK, "data": "0x64ca23ef"}, "latest"])
     seq1 = rpc.eth("eth_call", [{"to": L1_BLOCK, "data": "0x64ca23ef"}, "latest"])
