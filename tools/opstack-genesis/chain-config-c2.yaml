@@ -32,14 +32,21 @@ predeploys:
       # config.genesis ([version] compatibility_version=3.18.0, consensus_type=pbft, no
       # [features] section): the node verifies this slot at first start
       # (Ledger.cpp verifyL2FeatureFlagsSlot) and refuses to build genesis on any mismatch.
-      # Derived from fisco-bcos 3.18.0's version-gated defaults only (setGenesisFeatures):
-      # bugfix defaults up to V3_18 + bugfix_nonce_ordering (59) +
-      # bugfix_eip161_1052_account_semantics (61). Bit 57 (the removed
-      # feature_l2_ethereum_compat, now a reserved tombstone) is NOT set — the lane is
-      # decided by executor_version alone. RE-DERIVE whenever the node's default feature
-      # set changes (a removed/renumbered flag changes this value). Recipe: set a wrong
-      # value here, run the C2 smoke, and copy `expected=0x...` from the node's boot error.
-      feature_flags: 0x2800007fffffffff
+      # Derived from the node's version-gated defaults (setGenesisFeatures): bugfix defaults
+      # up to V3_18 + bugfix_nonce_ordering (59) + bugfix_eip161_1052_account_semantics (61)
+      # + the four V3_18 default flags numbered 64..67 by the evmone 0.24 / EVMC ABI 19 line
+      # (bugfix_dmc_create_address_rule, bugfix_v2_status_mapper_ordinary_failures,
+      # bugfix_internal_create_seq, bugfix_precompiled_node_fault_rethrow). Bits 57 and 63 are
+      # reserved tombstones (removed l2_ethereum_compat / retired pairing gate) and are NOT
+      # set. RE-DERIVE whenever the node's default feature set changes (a removed, renumbered
+      # or newly defaulted flag changes this value). Recipe: set a wrong value here, run the
+      # C2 smoke, and copy `expected=0x...` from the node's boot error.
+      #
+      # Keep this file on the pin lineage that matches the node branch: the release-3.18.0
+      # line without bits 64..67 expects 0x2800007fffffffff; the evmone-0.24 PR line expects
+      # 0x0f2800007fffffffff, because that PR puts those four bugfixes into the V3_18 default
+      # set. Node CI pins the harness by SHA, so each line pins the matching commit.
+      feature_flags: 0x0f2800007fffffffff
   - name: L2ValidatorSet
     address: "0x43000000000000000000000000000000000000C1"
     sol_file: L2ValidatorSet.sol
