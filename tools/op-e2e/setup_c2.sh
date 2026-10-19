@@ -411,8 +411,10 @@ EOF
   if ! curl -s -o /dev/null -X POST http://127.0.0.1:$FISCO_WEB3 \
        -H 'Content-Type: application/json' \
        -d '{"jsonrpc":"2.0","method":"eth_chainId","params":[],"id":1}'; then
-    # genesis 与已存 data 不一致(op-deployer 重新部署后哈希变化)→ 清 data 重来
-    log "genesis hash 与 data 不一致,清 data 重启"
+    # 首次 5s 内 RPC 不可达。这既可能是已存 data 的 genesis 哈希变了
+    # (op-deployer 重新部署),也可能是节点自己启动失败(genesis 校验、配置拒绝、
+    # 崩溃)。先按前者的唯一补救动作清 data 重试。
+    log "首次启动 5s 内 RPC 不可达,清 data 重启(已存 data 的 genesis 可能已变)"
     kill "$(cat "$C2/fisco/node.pid")" 2>/dev/null || true
     sleep 1
     rm -rf "$C2/fisco/data"
@@ -422,10 +424,15 @@ EOF
   echo $! > "$C2/fisco/node.pid"
   popd > /dev/null
     sleep 5
-    curl -s -o /dev/null -X POST http://127.0.0.1:$FISCO_WEB3 \
-      -H 'Content-Type: application/json' \
-      -d '{"jsonrpc":"2.0","method":"eth_chainId","params":[],"id":1}' || \
-      die "FISCO 启动失败(见 nohup.out)"
+    if ! curl -s -o /dev/null -X POST http://127.0.0.1:$FISCO_WEB3 \
+         -H 'Content-Type: application/json' \
+         -d '{"jsonrpc":"2.0","method":"eth_chainId","params":[],"id":1}'; then
+      # 把节点自己的报错带进 CI 日志:harness 只观测到"RPC 没起来",真因在 nohup.out。
+      echo "  ---- $C2/fisco/nohup.out (tail) ----" >&2
+      tail -n 40 "$C2/fisco/nohup.out" >&2 2>/dev/null || true
+      echo "  -----------------------------------" >&2
+      die "FISCO 启动失败(真因见上方 nohup.out 尾部)"
+    fi
   fi
   log "FISCO 运行中(PID $(cat "$C2/fisco/node.pid"),web3 $FISCO_WEB3 / engine $FISCO_ENGINE)"
 fi
